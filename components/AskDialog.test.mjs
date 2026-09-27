@@ -241,30 +241,26 @@ test("Escape while the 'Other' input is focused blurs it instead of canceling th
   assert.notEqual(document.activeElement, otherInput);
 });
 
-test("a single non-multi question with no Review tab submits immediately on click", async () => {
+test("a single question never submits on pick: click or Enter moves to Review, Submit sends", async () => {
   const user = userEvent.setup();
   let response;
   renderAsk(
     [{ id: "q1", question: "Pick one", options: [{ label: "A" }, { label: "B" }] }],
     (_request, result) => { response = result; },
   );
-  assert.equal(screen.queryByRole("tab", { name: "Review" }), null);
 
   await user.click(screen.getByRole("radio", { name: "A" }));
-  assert.deepEqual(response, { results: [{ id: "q1", selectedOptions: ["A"] }] });
-});
+  assert.equal(response, undefined);
+  assert.equal(screen.getByRole("tab", { name: "Review" }).getAttribute("aria-selected"), "true");
 
-test("a single non-multi question with no Review tab submits immediately on Enter", async () => {
-  const user = userEvent.setup();
-  let response;
-  renderAsk(
-    [{ id: "q1", question: "Pick one", options: [{ label: "A" }, { label: "B" }] }],
-    (_request, result) => { response = result; },
-  );
-
+  await user.click(screen.getByRole("tab", { name: /Pick one/ }));
   screen.getByRole("dialog").focus();
-  await user.keyboard("{Enter}");
-  assert.deepEqual(response, { results: [{ id: "q1", selectedOptions: ["A"] }] });
+  await user.keyboard("{ArrowDown}{Enter}");
+  assert.equal(response, undefined);
+  assert.match(screen.getByRole("tabpanel").textContent, /Pick one:\s*B/);
+
+  await user.click(screen.getByRole("button", { name: "Submit" }));
+  assert.deepEqual(response, { results: [{ id: "q1", selectedOptions: ["B"] }] });
 });
 
 test("Review shows an unanswered warning and per-question unanswered labels", async () => {

@@ -190,10 +190,11 @@ export function AskDialog({
     };
   }, [request.id, request.expiresAt, request.timeout]);
 
-  const hasReviewTab = questions.length > 1 || questions.some((question) => question.multi);
+  // Every dialog ends in a Review tab, even a single question: picking an
+  // option only advances, so one stray click can never submit.
   const reviewTabIndex = questions.length;
-  const totalTabs = hasReviewTab ? questions.length + 1 : Math.max(1, questions.length);
-  const isReviewTab = hasReviewTab && activeTab === reviewTabIndex;
+  const totalTabs = questions.length + 1;
+  const isReviewTab = activeTab === reviewTabIndex;
   const currentIndex = Math.min(activeTab, Math.max(0, questions.length - 1));
   const currentQuestion = !isReviewTab ? questions[currentIndex] : undefined;
   const currentState = !isReviewTab ? states[currentIndex] : undefined;
@@ -246,11 +247,7 @@ export function AskDialog({
     return () => window.cancelAnimationFrame(frame);
   }, [attached, panelRef, request.id]);
 
-  const advanceAfterQuestion = (qIndex: number, statesOverride?: QuestionState[]) => {
-    if (!hasReviewTab) {
-      submit(statesOverride);
-      return;
-    }
+  const advanceAfterQuestion = (qIndex: number) => {
     setActiveTab(qIndex + 1 < questions.length ? qIndex + 1 : questions.length);
   };
 
@@ -287,13 +284,12 @@ export function AskDialog({
       }));
       return;
     }
-    const nextStates = states.map((state, index) => (
+    setStates((prev) => prev.map((state, index) => (
       index === qIndex
         ? { ...state, selectedOptions: new Set([option.label]), customInput: undefined, cursorIndex: optionIndex }
         : state
-    ));
-    setStates(nextStates);
-    advanceAfterQuestion(qIndex, nextStates);
+    )));
+    advanceAfterQuestion(qIndex);
   };
 
   const openNoteEditor = (qIndex: number, rowKey: string) => {
@@ -581,29 +577,27 @@ export function AskDialog({
                 </button>
               );
             })}
-            {hasReviewTab && (
-              <button
-                type="button"
-                role="tab"
-                id="ask-tab-review"
-                aria-selected={isReviewTab}
-                aria-controls="ask-panel-review"
-                onClick={() => setActiveTab(reviewTabIndex)}
-                style={{
-                  padding: "5px 9px",
-                  borderRadius: 999,
-                  border: `1px solid ${isReviewTab ? "var(--border)" : "transparent"}`,
-                  background: isReviewTab ? "var(--bg)" : "transparent",
-                  color: isReviewTab ? "var(--text)" : "var(--text-muted)",
-                  cursor: "pointer",
-                  fontSize: 12,
-                  whiteSpace: "nowrap",
-                  flexShrink: 0,
-                }}
-              >
-                {t("askDialog.review")}
-              </button>
-            )}
+            <button
+              type="button"
+              role="tab"
+              id="ask-tab-review"
+              aria-selected={isReviewTab}
+              aria-controls="ask-panel-review"
+              onClick={() => setActiveTab(reviewTabIndex)}
+              style={{
+                padding: "5px 9px",
+                borderRadius: 999,
+                border: `1px solid ${isReviewTab ? "var(--border)" : "transparent"}`,
+                background: isReviewTab ? "var(--bg)" : "transparent",
+                color: isReviewTab ? "var(--text)" : "var(--text-muted)",
+                cursor: "pointer",
+                fontSize: 12,
+                whiteSpace: "nowrap",
+                flexShrink: 0,
+              }}
+            >
+              {t("askDialog.review")}
+            </button>
           </div>
 
           <div style={{ padding: 14 }}>
