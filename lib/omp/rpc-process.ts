@@ -5,6 +5,7 @@ import { resolveOmpBin } from "./omp-cli";
 import { type RpcTransport, spawnLocalRpcTransport } from "./rpc-transport";
 import { encodeRpcCommand, RpcFrameDecoder, type RpcFrameRecord, type RpcProtocolVersion } from "./rpc-frame";
 import { LINK_LIMITS } from "../hosts/link-protocol";
+import { passthroughProfile } from "./profile-passthrough";
 
 /**
  * Process + protocol layer for `omp --mode rpc-ui` (NDJSON over stdio).
@@ -116,6 +117,9 @@ export function spawnOmpTransport(options: RpcProcessOptions): RpcTransport {
   const env = sanitizeProjectCommandEnvironment({ ...process.env, ...options.env });
   if (options.env?.OMP_PROFILE === undefined) delete env.OMP_PROFILE;
   if (options.env?.PI_PROFILE === undefined) delete env.PI_PROFILE;
+  // Fork: a profile whose agent dir PI_CODING_AGENT_DIR pins passes through (see passthroughProfile).
+  const pinnedProfile = passthroughProfile({ ...process.env, ...options.env });
+  if (pinnedProfile && options.env?.OMP_PROFILE === undefined) env.OMP_PROFILE = pinnedProfile;
   return spawnLocalRpcTransport({ bin, args, cwd: options.cwd, env, spawn: options.dependencies?.spawn });
 }
 
