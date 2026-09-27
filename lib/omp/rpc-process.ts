@@ -4,6 +4,7 @@ import { isRecord } from "../type-guards";
 import { OMP_NOT_FOUND, resolveOmpBin } from "./omp-cli";
 import { type RpcTransport, spawnLocalRpcTransport } from "./rpc-transport";
 import { LINK_LIMITS } from "../hosts/link-protocol";
+import { passthroughProfile } from "./profile-passthrough";
 
 /**
  * Process + protocol layer for ompweb's omp (`ompweb-omp --headless`), which speaks the channel of
@@ -115,6 +116,10 @@ export function spawnOmpTransport(options: RpcProcessOptions): RpcTransport {
   const env = sanitizeProjectCommandEnvironment({ ...process.env, ...options.env });
   if (options.env?.OMP_PROFILE === undefined) delete env.OMP_PROFILE;
   if (options.env?.PI_PROFILE === undefined) delete env.PI_PROFILE;
+  // A profile whose agent dir PI_CODING_AGENT_DIR pins resolves the same agent state either
+  // way, so it passes through and the child also gets that profile's plugins and caches.
+  const pinnedProfile = passthroughProfile({ ...process.env, ...options.env });
+  if (pinnedProfile && options.env?.OMP_PROFILE === undefined) env.OMP_PROFILE = pinnedProfile;
   return spawnLocalRpcTransport({ bin, args, cwd: options.cwd, env, spawn: options.dependencies?.spawn });
 }
 
