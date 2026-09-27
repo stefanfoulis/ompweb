@@ -140,6 +140,36 @@ test("a note attached to an option appears in Review and the submitted payload, 
   assert.deepEqual(response, { results: [{ id: "q1", selectedOptions: [] }] });
 });
 
+test("each selected multi option keeps its own note, shown under the row and merged on submit", async () => {
+  const user = userEvent.setup();
+  let response;
+  renderAsk(
+    [{ id: "q1", question: "Pick features", multi: true, options: [{ label: "A" }, { label: "B" }, { label: "C" }] }],
+    (_request, result) => { response = result; },
+  );
+
+  await user.click(screen.getByRole("checkbox", { name: "A" }));
+  await user.click(screen.getByRole("checkbox", { name: "C" }));
+  // rows render as [A, B, C, Other]
+  await user.click(screen.getAllByRole("button", { name: "Add note" })[0]);
+  await user.type(screen.getByPlaceholderText("Add a note…"), "needs SSO");
+  await user.keyboard("{Enter}");
+  await user.click(screen.getAllByRole("button", { name: "Add note" })[1]); // C (A now shows "Edit note")
+  await user.type(screen.getByPlaceholderText("Add a note…"), "CSV only");
+  await user.keyboard("{Enter}");
+
+  // Both note texts stay visible in the question pane.
+  const panel = screen.getByRole("tabpanel").textContent;
+  assert.match(panel, /needs SSO/);
+  assert.match(panel, /CSV only/);
+
+  await user.click(screen.getByRole("tab", { name: "Review" }));
+  await user.click(screen.getByRole("button", { name: "Submit" }));
+  assert.deepEqual(response, {
+    results: [{ id: "q1", selectedOptions: ["A", "C"], note: "A: needs SSO; C: CSV only" }],
+  });
+});
+
 test("submit payload matches question declaration order and shape regardless of answer order", async () => {
   const user = userEvent.setup();
   let response;

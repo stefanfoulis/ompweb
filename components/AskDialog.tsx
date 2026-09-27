@@ -29,10 +29,10 @@ interface QuestionRow {
 interface QuestionState {
   selectedOptions: Set<string>;
   customInput: string | undefined;
-  /** A question carries at most one note at a time, attached to whichever
-   *  row `noteRowKey` names (mirrors the TUI's single note slot). */
-  note: string | undefined;
-  noteRowKey: string | undefined;
+  /** Notes keyed by row key (`option:<i>` / `other`). Unlike the TUI's single
+   *  note slot, every row keeps its own note so multi-select answers can carry
+   *  one per selected option; they are merged into the wire `note` on submit. */
+  notes: Record<string, string>;
   /** Row currently showing the note text field, if any. */
   noteEditorRowKey: string | undefined;
   cursorIndex: number;
@@ -48,8 +48,7 @@ function createInitialStates(questions: AskDialogQuestion[]): QuestionState[] {
   return questions.map((question) => ({
     selectedOptions: new Set<string>(),
     customInput: undefined,
-    note: undefined,
-    noteRowKey: undefined,
+    notes: {},
     noteEditorRowKey: undefined,
     cursorIndex: Math.min(Math.max(question.recommended ?? 0, 0), Math.max(question.options.length - 1, 0)),
   }));
@@ -59,26 +58,33 @@ function isAnswered(state: QuestionState): boolean {
   return state.selectedOptions.size > 0 || state.customInput !== undefined;
 }
 
-/** A note is only part of the submitted answer while its row is still the
- *  current answer: an option note survives only if that option is still
- *  selected, an "other" note survives only while custom text is present.
- *  Mirrors the TUI's `noteForSubmittedAnswer`. */
+/** Notes of the rows that are part of the submitted answer: an option note
+ *  only while that option is selected, the "other" note only while custom text
+ *  is present (the TUI's `noteForSubmittedAnswer` rule, applied per row). The
+ *  wire carries one `note` per question, so when several answered rows carry
+ *  notes each is prefixed with its answer: `Auth: needs SSO; Export: CSV only`. */
 function noteForSubmittedAnswer(question: AskDialogQuestion, state: QuestionState): string | undefined {
-  if (!state.note || state.noteRowKey === undefined) return undefined;
-  if (state.noteRowKey === "other") return state.customInput !== undefined ? state.note : undefined;
-  const match = /^option:(\d+)$/.exec(state.noteRowKey);
-  const index = match ? Number(match[1]) : Number.NaN;
-  const option = Number.isInteger(index) ? question.options[index] : undefined;
-  return option && state.selectedOptions.has(option.label) ? state.note : undefined;
+  const noted: Array<[answer: string, note: string]> = [];
+  question.options.forEach((option, index) => {
+    const note = state.notes[`option:${index}`]?.trim();
+    if (note && state.selectedOptions.has(option.label)) noted.push([option.label, note]);
+  });
+  const otherNote = state.notes.other?.trim();
+  if (otherNote && state.customInput !== undefined) noted.push([state.customInput, otherNote]);
+  if (noted.length === 0) return undefined;
+  const answerCount = state.selectedOptions.size + (state.customInput !== undefined ? 1 : 0);
+  if (answerCount <= 1) return noted[0][1];
+  return noted.map(([answer, note]) => `${answer}: ${note}`).join("; ");
 }
 
-/** Closing a note editor commits whatever was typed; a blank note clears
- *  the note slot entirely instead of leaving an empty marker. */
+/** Closing a note editor commits whatever was typed; a blank note removes
+ *  that row's note instead of leaving an empty entry. */
 function finalizeNoteEditorState(state: QuestionState): QuestionState {
-  if (state.noteEditorRowKey === undefined) return state;
-  const trimmed = state.note?.trim();
-  const note = trimmed ? state.note : undefined;
-  return { ...state, noteEditorRowKey: undefined, note, noteRowKey: note === undefined ? undefined : state.noteRowKey };
+  const rowKey = state.noteEditorRowKey;
+  if (rowKey === undefined) return state;
+  const notes = { ...state.notes };
+  if (!notes[rowKey]?.trim()) delete notes[rowKey];
+  return { ...state, noteEditorRowKey: undefined, notes };
 }
 
 function tabLabel(question: AskDialogQuestion): string {
@@ -293,8 +299,8 @@ export function AskDialog({
   const openNoteEditor = (qIndex: number, rowKey: string) => {
     setStates((prev) => prev.map((state, index) => {
       if (index !== qIndex) return state;
-      const sameRow = state.noteRowKey === rowKey;
-      return { ...state, noteEditorRowKey: rowKey, noteRowKey: rowKey, note: sameRow ? state.note ?? "" : "" };
+      // Opening another row's editor commits the one currently open.
+      return { ...finalizeNoteEditorState(state), noteEditorRowKey: rowKey };
     }));
     requestAnimationFrame(() => noteInputRefs.current.get(`${qIndex}:${rowKey}`)?.focus());
   };
@@ -372,7 +378,8 @@ export function AskDialog({
     const highlighted = state.cursorIndex === rowIndex;
     const option = row.kind === "option" && row.index !== undefined ? question.options[row.index] : undefined;
     const checked = row.kind === "option" ? (option ? state.selectedOptions.has(option.label) : false) : state.customInput !== undefined;
-    const hasNoteMarker = Boolean(state.note) && state.noteRowKey === row.key;
+    const rowNote = state.notes[row.key];
+    const editingNote = state.noteEditorRowKey === row.key;
     const isRecommended = row.kind === "option" && question.recommended === row.index;
     const groupName = `ask-${request.id}-${question.id}`;
     return (
@@ -411,7 +418,6 @@ export function AskDialog({
             {row.kind === "option" ? option?.label : t("askDialog.other")}
             {isRecommended && <span style={{ marginLeft: 6, fontSize: 11, color: "var(--text-dim)" }}>({t("askDialog.recommended")})</span>}
           </span>
-          {hasNoteMarker && <span style={{ color: "var(--status-success)", fontSize: 12 }}>✎ {t("askDialog.note")}</span>}
         </label>
         {row.kind === "option" && option?.description && (
           <div style={{ marginLeft: 24, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>{option.description}</div>
@@ -444,16 +450,17 @@ export function AskDialog({
             style={editableInputStyle}
           />
         )}
-        <div style={{ marginLeft: 24 }}>
+        {rowNote && !editingNote && (
           <button
             type="button"
             onClick={() => openNoteEditor(qIndex, row.key)}
-            style={{ padding: "2px 6px", fontSize: 11, borderRadius: 5, border: "1px solid var(--border)", background: "var(--bg)", color: "var(--text-muted)", cursor: "pointer" }}
+            title={t("askDialog.editNote")}
+            style={{ marginLeft: 24, padding: 0, border: "none", background: "none", textAlign: "left", cursor: "pointer", color: "var(--status-success)", fontSize: 12, lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
           >
-            {t("askDialog.addNote")}
+            ✎ {rowNote}
           </button>
-        </div>
-        {state.noteEditorRowKey === row.key && (
+        )}
+        {editingNote ? (
           <input
             type="text"
             data-ask-editable="1"
@@ -462,10 +469,14 @@ export function AskDialog({
               if (el) noteInputRefs.current.set(key, el);
               else noteInputRefs.current.delete(key);
             }}
-            value={state.note ?? ""}
+            value={rowNote ?? ""}
             placeholder={t("askDialog.notePlaceholder")}
             aria-label={t("askDialog.notePlaceholder")}
-            onChange={(e) => setStates((prev) => prev.map((s, i) => (i === qIndex ? { ...s, note: e.target.value } : s)))}
+            onChange={(e) => {
+              const value = e.target.value;
+              setStates((prev) => prev.map((s, i) => (i === qIndex ? { ...s, notes: { ...s.notes, [row.key]: value } } : s)));
+            }}
+            onBlur={() => setStates((prev) => prev.map((s, i) => (i === qIndex && s.noteEditorRowKey === row.key ? finalizeNoteEditorState(s) : s)))}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === "Escape") {
                 e.preventDefault();
@@ -476,6 +487,16 @@ export function AskDialog({
             }}
             style={editableInputStyle}
           />
+        ) : (
+          <div style={{ marginLeft: 24 }}>
+            <button
+              type="button"
+              onClick={() => openNoteEditor(qIndex, row.key)}
+              style={{ padding: "2px 6px", fontSize: 11, borderRadius: 5, border: "1px solid var(--border)", background: "var(--bg)", color: "var(--text-muted)", cursor: "pointer" }}
+            >
+              {rowNote ? t("askDialog.editNote") : t("askDialog.addNote")}
+            </button>
+          </div>
         )}
       </div>
     );

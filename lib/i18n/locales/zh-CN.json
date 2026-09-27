@@ -1470,6 +1470,7 @@
   "askDialog.other": "其他（自行输入）",
   "askDialog.otherPlaceholder": "输入你自己的答案…",
   "askDialog.addNote": "添加备注",
+  "askDialog.editNote": "编辑备注",
   "askDialog.notePlaceholder": "添加备注…",
   "askDialog.note": "备注",
   "askDialog.recommended": "推荐",

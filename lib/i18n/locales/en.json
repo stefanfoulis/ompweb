@@ -1499,6 +1499,7 @@
   "askDialog.other": "Other (type your own)",
   "askDialog.otherPlaceholder": "Type your own answer…",
   "askDialog.addNote": "Add note",
+  "askDialog.editNote": "Edit note",
   "askDialog.notePlaceholder": "Add a note…",
   "askDialog.note": "Note",
   "askDialog.recommended": "Recommended",

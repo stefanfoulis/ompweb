@@ -1470,6 +1470,7 @@
   "askDialog.other": "その他（自由入力）",
   "askDialog.otherPlaceholder": "自由に入力…",
   "askDialog.addNote": "メモを追加",
+  "askDialog.editNote": "メモを編集",
   "askDialog.notePlaceholder": "メモを追加…",
   "askDialog.note": "メモ",
   "askDialog.recommended": "おすすめ",
