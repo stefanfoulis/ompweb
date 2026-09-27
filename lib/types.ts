@@ -253,12 +253,37 @@ export type ExtensionUiRequest =
       method: "custom";
       lines: string[];
       closed?: boolean;
-    };
+    }
+  | AskUiRequest;
 
 export type ExtensionUiResponse =
   | { type: "extension_ui_response"; id: string; value: string }
   | { type: "extension_ui_response"; id: string; confirmed: boolean }
-  | { type: "extension_ui_response"; id: string; cancelled: true };
+  | { type: "extension_ui_response"; id: string; cancelled: true }
+  | { type: "extension_ui_response"; id: string; results: AskDialogResultItem[] }
+  | { type: "extension_ui_response"; id: string; chat: true };
+
+// Rich multi-question "ask" dialog (parity with the TUI ask overlay). See
+// PLAN-ask-dialog.md for the wire protocol this mirrors.
+export type AskDialogOption = { label: string; description?: string; preview?: string };
+export type AskDialogQuestion = {
+  id: string;
+  question: string;
+  header?: string;
+  options: AskDialogOption[];
+  multi?: boolean;
+  recommended?: number;
+};
+export type AskDialogResultItem = { id: string; selectedOptions: string[]; customInput?: string; note?: string };
+export type AskUiRequest = {
+  type: "extension_ui_request";
+  id: string;
+  method: "ask";
+  questions: AskDialogQuestion[];
+  timeout?: number;
+  expiresAt?: number;
+};
+export type AskUiResponse = { results: AskDialogResultItem[] } | { chat: true } | { cancelled: true };
 
 export interface ExtensionStatusItem {
   key: string;

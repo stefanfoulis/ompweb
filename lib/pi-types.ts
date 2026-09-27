@@ -186,7 +186,22 @@ export type OmpExtensionUiRequest =
   | { type: "extension_ui_request"; id: string; method: "setWidget"; widgetKey: string; widgetLines: string[] | undefined; widgetPlacement?: "aboveEditor" | "belowEditor" }
   | { type: "extension_ui_request"; id: string; method: "setTitle"; title: string }
   | { type: "extension_ui_request"; id: string; method: "set_editor_text"; text: string }
-  | { type: "extension_ui_request"; id: string; method: "open_url"; url: string; launchUrl?: string; instructions?: string };
+  | { type: "extension_ui_request"; id: string; method: "open_url"; url: string; launchUrl?: string; instructions?: string }
+  | {
+      type: "extension_ui_request";
+      id: string;
+      method: "ask";
+      questions: Array<{
+        id: string;
+        question: string;
+        header?: string;
+        options: Array<{ label: string; description?: string; preview?: string }>;
+        multi?: boolean;
+        recommended?: number;
+      }>;
+      timeout?: number;
+      expiresAt?: number;
+    };
 
 /**
  * omp's RPC host-tool bridge: omp-web registers host tools (set_host_tools)

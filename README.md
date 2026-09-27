@@ -224,6 +224,7 @@ host (KDE Plasma, and most Wayland/X11 desktops).
 | `OMP_WEB_STT_ENDPOINT` | OpenAI-compatible transcription endpoint URL | _None (disabled)_ |
 | `OMP_WEB_STT_KEY` | Optional API key for the STT endpoint | _None_ |
 | `OMP_WEB_STT_MODEL` | Optional model name for the STT endpoint | _None_ |
+| `OMP_WEB_EXPERIMENTAL_ASK_DIALOG` | Set to `1` to use the rich multi-question ask dialog (requires an omp build that supports the `ask` RPC dialog; falls back to the standard dialog otherwise) | `0` |
 
 ## Development
 

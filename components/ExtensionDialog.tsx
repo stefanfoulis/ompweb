@@ -1,19 +1,22 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { ExtensionUiRequest } from "@/lib/types";
+import type { AskDialogResultItem, ExtensionUiRequest } from "@/lib/types";
 import { useI18n } from "@/lib/i18n";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { AskDialog } from "./AskDialog";
 
 export type ExtensionDialogRequest = Extract<
   ExtensionUiRequest,
-  { method: "select" | "confirm" | "input" | "editor" }
+  { method: "select" | "confirm" | "input" | "editor" | "ask" }
 >;
 
 export type ExtensionDialogResponse =
   | { value: string }
   | { confirmed: boolean }
-  | { cancelled: true };
+  | { cancelled: true }
+  | { results: AskDialogResultItem[] }
+  | { chat: true };
 
 /**
  * Overlay dialog for `select` / `confirm` / `input` / `editor` extension UI
@@ -25,12 +28,28 @@ export type ExtensionDialogResponse =
  *   - backdrop click closes as "cancelled"
  * Logic and i18n keys are unchanged from the in-ChatWindow original.
  */
-export function ExtensionDialog({
+type ExtensionDialogProps = {
+  request: ExtensionDialogRequest;
+  onRespond: (request: ExtensionDialogRequest, response: ExtensionDialogResponse) => void;
+  /** Render as a composer panel instead of a full-chat overlay. */
+  attached?: boolean;
+};
+
+/** `ask` requests get the rich multi-question dialog; everything else the standard one. */
+export function ExtensionDialog(props: ExtensionDialogProps) {
+  const { request } = props;
+  if (request.method === "ask") {
+    return <AskDialog request={request} onRespond={props.onRespond} attached={props.attached ?? false} />;
+  }
+  return <StandardExtensionDialog {...props} request={request} />;
+}
+
+function StandardExtensionDialog({
   request,
   onRespond,
   attached = false,
 }: {
-  request: ExtensionDialogRequest;
+  request: Exclude<ExtensionDialogRequest, { method: "ask" }>;
   onRespond: (request: ExtensionDialogRequest, response: ExtensionDialogResponse) => void;
   /** Render as a composer panel instead of a full-chat overlay. */
   attached?: boolean;

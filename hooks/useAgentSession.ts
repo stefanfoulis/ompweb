@@ -11,6 +11,7 @@ import type {
   SessionInfo,
   SessionTreeNode,
   ToolResultMessage,
+  AskDialogResultItem,
 } from "@/lib/types";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { hasVisibleAssistantContent } from "@/lib/assistant-response";
@@ -1106,7 +1107,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const respondToExtensionUi = useCallback(async (
     request: ExtensionUiDialogRequest,
-    response: { value: string } | { confirmed: boolean } | { cancelled: true },
+    response: { value: string } | { confirmed: boolean } | { cancelled: true } | { results: AskDialogResultItem[] } | { chat: true },
   ) => {
     const sid = sessionIdRef.current;
     if (!sid) {
@@ -1376,6 +1377,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "confirm":
       case "input":
       case "editor":
+      case "ask":
         if (extensionDialogClearTimerRef.current) {
           clearTimeout(extensionDialogClearTimerRef.current);
           extensionDialogClearTimerRef.current = null;

@@ -3,6 +3,7 @@ import { createInterface } from "readline";
 import { sanitizeProjectCommandEnvironment } from "../project-command-env";
 import { resolveOmpBin, wrapWindowsScript } from "./omp-cli";
 import { encodeRpcCommand, RpcFrameDecoder, type RpcFrameRecord, type RpcProtocolVersion } from "./rpc-frame";
+import { isAskDialogExperimentEnabled } from "./experimental";
 
 /**
  * Process + protocol layer for `omp --mode rpc-ui` (NDJSON over stdio).
@@ -110,6 +111,9 @@ export class RpcProcess {
     const childEnv = sanitizeProjectCommandEnvironment({ ...process.env, ...options.env });
     if (options.env?.OMP_PROFILE === undefined) delete childEnv.OMP_PROFILE;
     if (options.env?.PI_PROFILE === undefined) delete childEnv.PI_PROFILE;
+    // Forward the rich ask-dialog opt-in to omp's own gate (OMP_RPC_ASK_DIALOG);
+    // added after sanitization so it cannot be stripped.
+    if (isAskDialogExperimentEnabled(childEnv)) childEnv.OMP_RPC_ASK_DIALOG = "1";
     const target = wrapWindowsScript(bin, args);
     this.child = this.spawnProcess(target.file, target.args, {
       cwd: options.cwd,

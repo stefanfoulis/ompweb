@@ -1462,5 +1462,20 @@
   "settingsConfig.defaultVoice": "システムの既定の音声",
   "messageView.readAloud": "読み上げ",
   "messageView.stopSpeech": "読み上げを停止",
-  "settingsConfig.ttsNotSupported": "このブラウザではサポートされていません"
+  "settingsConfig.ttsNotSupported": "このブラウザではサポートされていません",
+  "askDialog.title": "質問",
+  "askDialog.review": "確認",
+  "askDialog.submit": "送信",
+  "askDialog.chatAboutThis": "この件についてチャット",
+  "askDialog.other": "その他（自由入力）",
+  "askDialog.otherPlaceholder": "自由に入力…",
+  "askDialog.addNote": "メモを追加",
+  "askDialog.notePlaceholder": "メモを追加…",
+  "askDialog.note": "メモ",
+  "askDialog.recommended": "おすすめ",
+  "askDialog.unanswered": "未回答",
+  "askDialog.answered": "回答済み",
+  "askDialog.unansweredWarning.one": "{count} 件の質問が未回答です。送信は可能です。",
+  "askDialog.unansweredWarning.other": "{count} 件の質問が未回答です。送信は可能です。",
+  "askDialog.cancel": "キャンセル"
 }

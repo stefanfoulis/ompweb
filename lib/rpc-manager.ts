@@ -81,7 +81,7 @@ export class WebRpcError extends Error {
 
 // Extension UI methods that stay pending until the client answers (replayed to
 // newly-attached SSE listeners so dialogs survive reconnects).
-const PENDING_UI_METHODS = new Set(["select", "confirm", "input", "editor", "open_url"]);
+const PENDING_UI_METHODS = new Set(["select", "confirm", "input", "editor", "open_url", "ask"]);
 
 // Commands forwarded to omp verbatim (request shape already matches rpc-types).
 const PASSTHROUGH_COMMANDS = new Set([
