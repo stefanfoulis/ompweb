@@ -4,6 +4,7 @@ import { sanitizeProjectCommandEnvironment } from "../project-command-env";
 import { resolveOmpBin, wrapWindowsScript } from "./omp-cli";
 import { encodeRpcCommand, RpcFrameDecoder, type RpcFrameRecord, type RpcProtocolVersion } from "./rpc-frame";
 import { isAskDialogExperimentEnabled } from "./experimental";
+import { passthroughProfile } from "./profile-passthrough";
 
 /**
  * Process + protocol layer for `omp --mode rpc-ui` (NDJSON over stdio).
@@ -115,6 +116,9 @@ export class RpcProcess {
     // added after sanitization so it cannot be stripped.
     if (isAskDialogExperimentEnabled(childEnv)) childEnv.OMP_RPC_ASK_DIALOG = "1";
     const target = wrapWindowsScript(bin, args);
+    // Fork: a profile whose agent dir PI_CODING_AGENT_DIR pins passes through (see passthroughProfile).
+    const pinnedProfile = passthroughProfile({ ...process.env, ...options.env });
+    if (pinnedProfile && options.env?.OMP_PROFILE === undefined) childEnv.OMP_PROFILE = pinnedProfile;
     this.child = this.spawnProcess(target.file, target.args, {
       cwd: options.cwd,
       env: childEnv,
