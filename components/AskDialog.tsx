@@ -246,8 +246,12 @@ export function AskDialog({
   useEffect(() => {
     if (!attached) return;
     // Keyboard navigation here is fully custom (cursor + tab state on the
-    // panel itself), so focus the panel rather than the first form control.
-    const frame = window.requestAnimationFrame(() => panelRef.current?.focus());
+    // panel itself), so focus the panel rather than the first form control —
+    // unless the user already clicked into the dialog before this frame ran.
+    const frame = window.requestAnimationFrame(() => {
+      const panel = panelRef.current;
+      if (panel && !panel.contains(document.activeElement)) panel.focus();
+    });
     return () => window.cancelAnimationFrame(frame);
   }, [attached, panelRef, request.id]);
 
