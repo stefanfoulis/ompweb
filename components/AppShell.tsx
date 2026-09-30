@@ -1988,7 +1988,8 @@ export function AppShell({ appName }: { appName: string }) {
   }, [sidebarHistory.exitNeedsNativeBack, t]);
 
   const activeCwdName = activeCwd ? getFileName(activeCwd) || activeCwd : null;
-  const windowTitle = activeCwdName ? `${activeCwdName} - ${appName}` : appName;
+  // Fork: the tab shows just the session title (else the workspace); the favicon identifies the app.
+  const windowTitle = selectedSession?.name || selectedSession?.firstMessage || activeCwdName || appName;
 
   useEffect(() => {
     const syncWindowTitle = () => {
