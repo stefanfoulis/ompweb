@@ -222,6 +222,9 @@ export interface RpcAskDialogAnswer {
   id: string;
   selectedOptions: string[];
   customInput?: string;
+  /** Free-text note attached to this answer (web-only addition; omp's
+   *  ExtensionAskDialogResultItem.note is already rendered to the model). */
+  note?: string;
 }
 
 /**

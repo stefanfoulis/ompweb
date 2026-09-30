@@ -1965,5 +1965,21 @@
   "modelsConfig.accountApiKey": "API key",
   "modelsConfig.disconnectAccount": "Disconnect {label}",
   "modelsConfig.disconnectAccountTitle": "Disconnect account?",
-  "modelsConfig.disconnectAccountBody": "omp will delete the stored credential for {label}. Other accounts for this provider stay connected."
+  "modelsConfig.disconnectAccountBody": "omp will delete the stored credential for {label}. Other accounts for this provider stay connected.",
+  "askDialog.title": "Ask",
+  "askDialog.review": "Review",
+  "askDialog.submit": "Submit",
+  "askDialog.chatAboutThis": "Chat about this",
+  "askDialog.other": "Other (type your own)",
+  "askDialog.otherPlaceholder": "Type your own answer…",
+  "askDialog.addNote": "Add note",
+  "askDialog.editNote": "Edit note",
+  "askDialog.notePlaceholder": "Add a note…",
+  "askDialog.note": "Note",
+  "askDialog.recommended": "Recommended",
+  "askDialog.unanswered": "Unanswered",
+  "askDialog.answered": "answered",
+  "askDialog.unansweredWarning.one": "{count} question needs an answer; Submit still works.",
+  "askDialog.unansweredWarning.other": "{count} questions need answers; Submit still works.",
+  "askDialog.cancel": "Cancel"
 }
