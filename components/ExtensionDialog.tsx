@@ -5,6 +5,7 @@ import type { ExtensionUiRequest } from "@/lib/types";
 import type { RpcAskDialogAnswer } from "@/lib/pi-types";
 import { useI18n } from "@/lib/i18n";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { AskDialog } from "./AskDialog";
 
 export type ExtensionDialogRequest = Extract<
   ExtensionUiRequest,
@@ -15,7 +16,8 @@ export type ExtensionDialogResponse =
   | { value: string }
   | { confirmed: boolean }
   | { cancelled: true }
-  | { answers: RpcAskDialogAnswer[] };
+  | { answers: RpcAskDialogAnswer[] }
+  | { chat: true };
 
 type AskDraft = { selected: string[]; other: string };
 const EMPTY_ASK_DRAFT: AskDraft = { selected: [], other: "" };
@@ -29,6 +31,20 @@ function initialAskDrafts(request: ExtensionDialogRequest): AskDraft[] {
   });
 }
 
+/** `ask` requests get the rich multi-question dialog; everything else the standard one. */
+export function ExtensionDialog(props: {
+  request: ExtensionDialogRequest;
+  onRespond: (request: ExtensionDialogRequest, response: ExtensionDialogResponse) => void;
+  /** Render as a composer panel instead of a full-chat overlay. */
+  attached?: boolean;
+}) {
+  const { request } = props;
+  if (request.method === "ask") {
+    return <AskDialog request={request} onRespond={props.onRespond} attached={props.attached ?? false} />;
+  }
+  return <StandardExtensionDialog {...props} />;
+}
+
 /**
  * Overlay dialog for `select` / `confirm` / `input` / `editor` / `ask` extension UI
  * requests. Polished UX:
@@ -39,7 +55,7 @@ function initialAskDrafts(request: ExtensionDialogRequest): AskDraft[] {
  *   - backdrop click closes as "cancelled"
  * Logic and i18n keys are unchanged from the in-ChatWindow original.
  */
-export function ExtensionDialog({
+function StandardExtensionDialog({
   request,
   onRespond,
   attached = false,

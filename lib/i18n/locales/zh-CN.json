@@ -1477,5 +1477,21 @@
   "settingsConfig.defaultVoice": "系统默认声音",
   "messageView.readAloud": "朗读",
   "messageView.stopSpeech": "停止朗读",
-  "settingsConfig.ttsNotSupported": "当前浏览器不支持"
+  "settingsConfig.ttsNotSupported": "当前浏览器不支持",
+  "askDialog.title": "提问",
+  "askDialog.review": "确认",
+  "askDialog.submit": "提交",
+  "askDialog.chatAboutThis": "就此聊聊",
+  "askDialog.other": "其他（自行输入）",
+  "askDialog.otherPlaceholder": "输入你自己的答案…",
+  "askDialog.addNote": "添加备注",
+  "askDialog.editNote": "编辑备注",
+  "askDialog.notePlaceholder": "添加备注…",
+  "askDialog.note": "备注",
+  "askDialog.recommended": "推荐",
+  "askDialog.unanswered": "未回答",
+  "askDialog.answered": "已回答",
+  "askDialog.unansweredWarning.one": "还有 {count} 个问题未回答；仍可提交。",
+  "askDialog.unansweredWarning.other": "还有 {count} 个问题未回答；仍可提交。",
+  "askDialog.cancel": "取消"
 }

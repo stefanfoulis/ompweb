@@ -94,7 +94,8 @@ function isAskAnswers(value: unknown): boolean {
     && typeof answer.id === "string"
     && Array.isArray(answer.selectedOptions)
     && answer.selectedOptions.every((option: unknown) => typeof option === "string")
-    && (answer.customInput === undefined || typeof answer.customInput === "string"));
+    && (answer.customInput === undefined || typeof answer.customInput === "string")
+    && (answer.note === undefined || typeof answer.note === "string"));
 }
 
 // Commands forwarded to omp verbatim (request shape already matches rpc-types).
@@ -1398,9 +1399,9 @@ export class AgentSessionWrapper {
       case "extension_ui_response": {
         const { id, ...rest } = command as { id: string; [key: string]: unknown };
         const pendingAsk = this.pendingUiRequests.get(id)?.method === "ask";
-        // A pending ask accepts only its answers or a cancel; anything else would
-        // drop it from reconnect replay while omp rejects the payload.
-        if (("answers" in rest || pendingAsk) && !isAskAnswers(rest.answers) && !(pendingAsk && rest.cancelled === true)) {
+        // A pending ask accepts only its answers, a cancel, or "chat about this";
+        // anything else would drop it from reconnect replay while omp rejects it.
+        if (("answers" in rest || pendingAsk) && !isAskAnswers(rest.answers) && !(pendingAsk && (rest.cancelled === true || rest.chat === true))) {
           throw new WebRpcError("Invalid ask dialog answers", "invalid_ask_answers");
         }
         this.forgetPendingUiRequest(id);

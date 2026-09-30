@@ -1506,5 +1506,21 @@
   "settingsConfig.defaultVoice": "Default system voice",
   "messageView.readAloud": "Read aloud",
   "messageView.stopSpeech": "Stop speaking",
-  "settingsConfig.ttsNotSupported": "Not supported in this browser"
+  "settingsConfig.ttsNotSupported": "Not supported in this browser",
+  "askDialog.title": "Ask",
+  "askDialog.review": "Review",
+  "askDialog.submit": "Submit",
+  "askDialog.chatAboutThis": "Chat about this",
+  "askDialog.other": "Other (type your own)",
+  "askDialog.otherPlaceholder": "Type your own answer…",
+  "askDialog.addNote": "Add note",
+  "askDialog.editNote": "Edit note",
+  "askDialog.notePlaceholder": "Add a note…",
+  "askDialog.note": "Note",
+  "askDialog.recommended": "Recommended",
+  "askDialog.unanswered": "Unanswered",
+  "askDialog.answered": "answered",
+  "askDialog.unansweredWarning.one": "{count} question needs an answer; Submit still works.",
+  "askDialog.unansweredWarning.other": "{count} questions need answers; Submit still works.",
+  "askDialog.cancel": "Cancel"
 }
