@@ -1572,7 +1572,8 @@ export function AppShell() {
   }, [sidebarHistory.exitNeedsNativeBack, t]);
 
   const activeCwdName = activeCwd ? getFileName(activeCwd) || activeCwd : null;
-  const windowTitle = activeCwdName ? `${activeCwdName} - omp web` : "omp web";
+  // Fork: the tab shows just the session title (else the workspace); the favicon identifies omp web.
+  const windowTitle = selectedSession?.name || selectedSession?.firstMessage || activeCwdName || "omp web";
 
   useEffect(() => {
     const syncWindowTitle = () => {
