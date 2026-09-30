@@ -75,6 +75,7 @@ app/api/
   models-config/route.ts          GET/PUT — read/write ~/.omp/agent/models.yml
   models-config/test/route.ts     POST test a configured model/provider
   omp-settings/route.ts           GET/PUT native config.yml settings (allow-listed)
+  web-settings/route.ts           GET/PUT omp-web's own server settings (auto-resume)
   mcp/route.ts                    GET/POST/PUT/DELETE project MCP servers
   plugins/route.ts                GET/POST plugin management (shells out to `omp plugin`)
   projects/route.ts               GET registered+discovered projects | POST add | DELETE hide
@@ -98,10 +99,13 @@ lib/
   project-registry.ts  on-disk managed-project registry (~/.omp/agent/projects.json)
   rpc-manager.ts       session registry + startRpcSession over RpcProcess
   session-reader.ts    session .jsonl parsing + path cache + buildSessionContext
+  session-resume.ts    running-session list for auto-resume after a restart
+  web-settings.ts      omp-web server settings (~/.omp/agent/omp-web-settings.json)
   skills-service.ts    pure-Node skill discovery mirroring omp's providers
   tool-presets.ts      PRESET_NONE/DEFAULT/FULL + getToolNamesForPreset()
   types.ts             shared TypeScript types
   normalize.ts         normalizeToolCalls() — field name mismatch between file format and our types
+  word-prediction.ts   pure ghost-text arithmetic (advance/accept) for composer word prediction
   worktree.ts          project/worktree resolution and git worktree operations
 
 components/
@@ -124,6 +128,7 @@ components/
   SkillsConfig.tsx    modal for loaded/search/installable skills
   FileExplorer.tsx    file tree inside sidebar
   FileViewer.tsx      file content in a tab
+  GhostMirror.tsx     textarea overlay painting ghost-text word completion
   TabBar.tsx          tab bar (Chat + open file tabs)
   ui/                 shared primitives: Dialog/Tooltip/Collapsible, fields, toast
 
@@ -134,6 +139,7 @@ hooks/
   useIsMobile.ts           responsive breakpoint hook
   usePrefersReducedMotion.ts OS reduce-motion preference (SMIL-safe)
   useTheme.ts              theme state (localStorage key "omp-theme")
+  useWordPrediction.ts     debounced omp predict_word ghost text + feedback
 ```
 
 ---
@@ -145,6 +151,21 @@ hooks/
 - `globalThis` survives Next.js hot-reload; plain module-level Map does not.
 - Idle sessions are disposed after a timeout; concurrent `startRpcSession()`
   calls must share a single start promise.
+
+### Auto-resume after a restart (`lib/session-resume.ts`)
+- Off by default (`autoResumeSessions` in `omp-web-settings.json`). When on,
+  `notifyRunningChange()` keeps `omp-web-interrupted-sessions.json` in the
+  agent dir listing sessions that are mid-run; startup
+  (`instrumentation.node.ts`) consumes it, restarts each session and sends
+  `RESUME_PROMPT`.
+- A service stop signals every process at once, so an omp child can die
+  before omp-web's own SIGTERM handler runs. A session whose process died
+  therefore stays listed for `EXIT_GRACE_MS`; the shutdown handler freezes the
+  list (`markShuttingDown`) so those deaths count as interrupted, while a
+  crash with omp-web still up is dropped after the window.
+- Only session ids are stored; paths are re-resolved on resume.
+- Known limit: resume does not detect a terminal `omp --resume <id>` started
+  on the same session while omp-web was down; both would write the file.
 
 ### Two kinds of branching — don't confuse them
 - **Fork** (Fork button on user message): creates a new independent `.jsonl` file. Shown as a child in the sidebar tree via `parentSession` header field.
@@ -329,6 +350,25 @@ handled or safely ignored.
 - Auth flows go through RPC commands (`get_login_providers`, `login`) against the omp child process; credentials live in omp's `agent.db` (SQLite) which omp-web never touches directly.
 - The Models panel reads and writes `models.yml` in the omp agent directory (`~/.omp/agent/models.yml`, `.yaml` fallback).
 - API-key status endpoints must never return the raw key.
+
+### Composer word prediction (`hooks/useWordPrediction.ts`, `components/GhostMirror.tsx`)
+- Ghost text comes from omp's `predict_word` RPC (engine = omp's
+  `spelling.autocomplete` setting; omp applies the prose gates). Tab or →
+  accepts; accept/typed-past outcomes go back as `predict_word_feedback`.
+- Keystroke predictions never spawn or replace an omp child: the agent route
+  answers `{ suffix: null }` when no process is alive, so sessions that are not
+  running show no ghost text until the first send.
+- Ghost text paints only when the caret ends its line (the mirror overlay would
+  otherwise overlap typed text). Settings → Interface & Behavior → Word
+  completion (`lib/composer-prefs.ts`, localStorage `omp-web:word-completion`):
+  Auto (default) enables it only when the primary pointer is fine
+  (`(pointer: fine)` — mouse/trackpad; browsers cannot detect an on-screen
+  keyboard), Enabled/Disabled force it. Also skipped for
+  drafts past 20k chars (omp's prose-gate cap); an omp without `predict_word`
+  ("Unknown command") pauses requests for a minute.
+- Ghost state lives in a small external store (`useSyncExternalStore` in
+  `GhostMirror`), not ChatInput state: re-rendering the composer per ghost
+  change was the dominant per-keystroke cost.
 
 ### Completion sound
 - `hooks/useAudio.ts` stores the toggle in `localStorage` and reuses one `AudioContext`.

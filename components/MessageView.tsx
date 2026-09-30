@@ -431,13 +431,18 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
           )}
           {content && <div data-message-text><SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{content}</SafeMarkdownBody></div>}
         </div>
-        {hasOverflow && (
+        {/* Expanding removes the cap, so the bubble stops overflowing; keep the toggle to collapse it again.
+            Collapsing restores the cap: assume overflow until the next measurement so the focused toggle stays mounted. */}
+        {(hasOverflow || expanded) && (
           <button
             type="button"
             className="message-overflow-toggle ui-focus-ring"
             aria-expanded={expanded}
             aria-label={expanded ? t("messageView.collapseInput") : t("messageView.showFullInput")}
-            onClick={() => setExpanded((value) => !value)}
+            onClick={() => {
+              if (expanded) setHasOverflow(true);
+              setExpanded(!expanded);
+            }}
           >
             <span>{expanded ? t("messageView.collapseInput") : t("messageView.showFullInput")}</span>
             <ChevronDown size={12} strokeWidth={1.8} aria-hidden="true" style={{ transform: expanded ? "rotate(180deg)" : "none" }} />
@@ -1562,10 +1567,11 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
   const detailsText = hasDetails ? safeJson(message.details) : "";
   const isIrc = IRC_CUSTOM_TYPES.has(message.customType);
   const ircEnvelope = isIrc ? parseIrcEnvelope(text) : null;
-  // Async results are raw job output (bash, task, ...) wrapped in <system-notice>.
-  // As markdown the wrapper turns the body into one raw HTML block (newlines
-  // collapse) and `---` becomes a heading, so strip it and show them verbatim.
-  const isPlainText = message.customType === "async-result";
+  // Async results (raw job output) and late LSP diagnostics are plain text wrapped
+  // in <system-notice>. As markdown the wrapper turns the body into one raw HTML
+  // block (newlines collapse) and `---` becomes a heading, so strip it and show
+  // them verbatim.
+  const isPlainText = message.customType === "async-result" || message.customType === "lsp-late-diagnostic";
   const displayText = ircEnvelope ? ircEnvelope.body : isPlainText ? stripHiddenWrappers(text) : text;
   const title = isIrc
     ? (ircEnvelope?.sender ?? formatCustomType(message.customType))

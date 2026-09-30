@@ -11,9 +11,13 @@ import {
   invalidateSessionEntriesCache,
   invalidateSessionListCache,
   invalidateSessionListMeta,
+  readSessionHeader,
+  resolveSessionPath,
 } from "./session-reader";
+import { markShuttingDown, recordRunningSessions, RESUME_PROMPT, takeInterruptedSessions } from "./session-resume";
 import { PRESET_FULL } from "./tool-presets";
 import { comparableProjectPath } from "./comparable-path";
+import { isRecord } from "./type-guards";
 import { isReservedLaunchArg, loadProjectRegistry } from "./project-registry";
 import type {
   BashResultInfo,
@@ -23,7 +27,7 @@ import type {
   SessionStatsInfo,
   WebSessionState,
 } from "./pi-types";
-import type { AgentMessage, ExitedRpcSession, ExtensionWidgetItem, ProjectLaunchConfig } from "./types";
+import type { AgentMessage, CrossSessionHostToolCall, ExitedRpcSession, ExtensionWidgetItem, ProjectLaunchConfig } from "./types";
 import type { SessionLiveSnapshot, SessionLiveToolEvent, SessionStreamCursor } from "./session-sync";
 
 // ============================================================================
@@ -81,7 +85,18 @@ export class WebRpcError extends Error {
 
 // Extension UI methods that stay pending until the client answers (replayed to
 // newly-attached SSE listeners so dialogs survive reconnects).
-const PENDING_UI_METHODS = new Set(["select", "confirm", "input", "editor", "open_url"]);
+const PENDING_UI_METHODS = new Set(["select", "confirm", "input", "editor", "ask", "open_url"]);
+
+/** Shape check for an ask-dialog `answers` payload; omp validates the content. */
+function isAskAnswers(value: unknown): boolean {
+  return Array.isArray(value) && value.every((answer: unknown) =>
+    isRecord(answer)
+    && typeof answer.id === "string"
+    && Array.isArray(answer.selectedOptions)
+    && answer.selectedOptions.every((option: unknown) => typeof option === "string")
+    && (answer.customInput === undefined || typeof answer.customInput === "string")
+    && (answer.note === undefined || typeof answer.note === "string"));
+}
 
 // Commands forwarded to omp verbatim (request shape already matches rpc-types).
 const PASSTHROUGH_COMMANDS = new Set([
@@ -109,7 +124,14 @@ const PASSTHROUGH_COMMANDS = new Set([
   "set_subagent_subscription",
   "get_login_providers",
   "login",
+  "predict_word",
+  "predict_word_feedback",
 ]);
+
+// Outlasts omp's cold prediction-daemon start (up to 3 × 30s start rounds plus a
+// 30s first completion), so omp's answer or error decides; a wedged daemon still
+// cannot pin the request forever.
+const PREDICT_WORD_TIMEOUT_MS = 125_000;
 
 // Commands that can carry user-attached images to the model. All of them must
 // pass the same server-side per-image/count/aggregate validation before the
@@ -364,6 +386,10 @@ export class AgentSessionWrapper {
     // a live subagent roster. Older omp builds may not know the command —
     // degrade silently (the UI falls back to no subagent info).
     await this.proc.sendCommand({ type: "set_subagent_subscription", level: "events" }).catch(() => {});
+    // Opt into omp's all-questions ask dialog; older omp rejects the command
+    // and keeps the per-question select/editor fallback.
+    // Bounded like get_state so a child that never answers cannot stall startup.
+    await this.proc.sendCommand({ type: "set_ask_dialog", enabled: true }, GET_STATE_TIMEOUT_MS).catch(() => {});
     const state = await this.getStateWithTimeout();
     this.applyIdentity(state);
     // Warn when the spawn cwd differs from the session's recorded directory.
@@ -532,14 +558,28 @@ export class AgentSessionWrapper {
         const id = typeof event.id === "string" ? event.id : "";
         const toolName = typeof event.toolName === "string" ? event.toolName : "";
         // Route REGISTERED host tools to an attached UI (the browser answers
-        // via host_tool_result); unregistered tools or no attached listener
-        // are rejected immediately so the agent never hangs on a tool nobody
-        // will answer.
-        if (id && toolName && this.hostToolNames.has(toolName) && this.listeners.length > 0) {
-          this.pendingHostTools.set(id, event);
-          this.emit(event);
-          notifyRunningChange();
-          return;
+        // via host_tool_result). With no tab on this session, hand the call to
+        // any open omp-web tab (the user switched sessions mid-run). Otherwise
+        // reject immediately so the agent never hangs on a tool nobody will
+        // answer.
+        if (id && toolName && this.hostToolNames.has(toolName)) {
+          if (this.listeners.length > 0) {
+            this.pendingHostTools.set(id, event);
+            this.emit(event);
+            notifyRunningChange();
+            return;
+          }
+          const otherTabs = getHostToolListeners();
+          if (otherTabs.size > 0) {
+            this.pendingHostTools.set(id, { ...event, webCrossSession: true });
+            const args = event.arguments && typeof event.arguments === "object" ? event.arguments as Record<string, unknown> : {};
+            const call: CrossSessionHostToolCall = { sessionId: this.sessionId, id, toolName, arguments: args };
+            for (const listener of otherTabs) {
+              try { listener(call); } catch { /* ignore listener errors */ }
+            }
+            notifyRunningChange();
+            return;
+          }
         }
         // Unregistered tool / no listener: reject (emits a notice) and do NOT
         // re-emit the frame — the UI must not answer a call nobody routed.
@@ -688,9 +728,15 @@ export class AgentSessionWrapper {
     this.emit({ type: "notice", level: "warning", message: `Rejected unavailable host tool: ${toolName}` });
   }
 
-  /** Reject every outstanding host tool call (browser disconnected / destroy). */
-  private rejectPendingHostTools(message: string): void {
-    for (const id of this.pendingHostTools.keys()) {
+  /**
+   * Reject outstanding host tool calls (browser disconnected / destroy): "own" ones went to this session's
+   * stream, "cross" ones to other open tabs (see subscribeHostToolCalls).
+   */
+  private rejectPendingHostTools(message: string, which: "all" | "own" | "cross" = "all"): void {
+    for (const [id, event] of this.pendingHostTools) {
+      const cross = event.webCrossSession === true;
+      if ((which === "own" && cross) || (which === "cross" && !cross)) continue;
+      this.pendingHostTools.delete(id);
       this.proc.sendFrame({
         type: "host_tool_result",
         id,
@@ -698,7 +744,11 @@ export class AgentSessionWrapper {
         result: { content: [{ type: "text", text: message }] },
       });
     }
-    this.pendingHostTools.clear();
+  }
+
+  /** The last other tab left: settle calls routed to other tabs. */
+  rejectCrossSessionHostTools(): void {
+    this.rejectPendingHostTools("The web UI disconnected while the agent was waiting for this host tool", "cross");
   }
 
   /** Reject every outstanding host URI request (browser disconnected / destroy). */
@@ -855,7 +905,7 @@ export class AgentSessionWrapper {
       // No UI attached anymore: reject outstanding host tool calls so the
       // agent never waits forever on a tool nobody will answer.
       if (this.listeners.length === 0) {
-        this.rejectPendingHostTools("The web UI disconnected while the agent was waiting for this host tool");
+        this.rejectPendingHostTools("The web UI disconnected while the agent was waiting for this host tool", "own");
         this.rejectPendingHostUris("The web UI disconnected while the agent was waiting for this URI request");
       }
     };
@@ -1096,6 +1146,7 @@ export class AgentSessionWrapper {
         // The replacement process starts with subscriptions disabled; restore
         // the live roster/transcript event stream before reading its state.
         await proc.sendCommand({ type: "set_subagent_subscription", level: "events" }).catch(() => {});
+        await proc.sendCommand({ type: "set_ask_dialog", enabled: true }, GET_STATE_TIMEOUT_MS).catch(() => {});
         const state = await proc.sendCommand<RpcSessionState>({ type: "get_state" }, GET_STATE_TIMEOUT_MS);
         this.applyIdentity(state);
         // Same fresh-spawn guard as startRpcSession: a sessionless wrapper
@@ -1347,6 +1398,12 @@ export class AgentSessionWrapper {
 
       case "extension_ui_response": {
         const { id, ...rest } = command as { id: string; [key: string]: unknown };
+        const pendingAsk = this.pendingUiRequests.get(id)?.method === "ask";
+        // A pending ask accepts only its answers, a cancel, or "chat about this";
+        // anything else would drop it from reconnect replay while omp rejects it.
+        if (("answers" in rest || pendingAsk) && !isAskAnswers(rest.answers) && !(pendingAsk && (rest.cancelled === true || rest.chat === true))) {
+          throw new WebRpcError("Invalid ask dialog answers", "invalid_ask_answers");
+        }
         this.forgetPendingUiRequest(id);
         this.proc.sendFrame({ type: "extension_ui_response", id, ...rest });
         return null;
@@ -1413,7 +1470,10 @@ export class AgentSessionWrapper {
             this.responseRunActive = false;
             this.streamSequence += 1;
           }
-          const result: unknown = await this.proc.sendCommand(command as { type: string });
+          const result: unknown = await this.proc.sendCommand(
+            command as { type: string },
+            type === "predict_word" ? PREDICT_WORD_TIMEOUT_MS : undefined,
+          );
           if (type === "set_thinking_level") this.invalidateSessionLists();
           return result ?? null;
         }
@@ -1489,6 +1549,7 @@ declare global {
   var __ompSessions: Map<string, AgentSessionWrapper> | undefined;
   var __ompStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
   var __ompRunningListeners: Set<(update: RunningSessionUpdate) => void> | undefined;
+  var __ompHostToolListeners: Set<(call: CrossSessionHostToolCall) => void> | undefined;
   var __ompExitedSessions: Map<string, ExitedRpcSession> | undefined;
 }
 
@@ -1515,7 +1576,11 @@ export function clearExitedRpcSession(sessionId: string): boolean {
 function getRegistry(): Map<string, AgentSessionWrapper> {
   if (!globalThis.__ompSessions) {
     globalThis.__ompSessions = new Map();
-    const cleanup = () => globalThis.__ompSessions?.forEach((s) => s.destroy());
+    const cleanup = () => {
+      // Children dying from here on are the shutdown, not finished runs.
+      markShuttingDown();
+      globalThis.__ompSessions?.forEach((s) => s.destroy());
+    };
     process.once("exit", cleanup);
     process.once("SIGINT", cleanup);
     process.once("SIGTERM", cleanup);
@@ -1576,6 +1641,30 @@ export function subscribeRunningSessions(listener: (update: RunningSessionUpdate
   return () => { listeners.delete(listener); };
 }
 
+// ----------------------------------------------------------------------------
+// Cross-session host tool calls
+//
+// A registered host tool called while no tab watches its session goes to every
+// open omp-web tab (over /api/agent/host-tools/events) instead of being rejected.
+// ----------------------------------------------------------------------------
+
+function getHostToolListeners(): Set<(call: CrossSessionHostToolCall) => void> {
+  if (!globalThis.__ompHostToolListeners) globalThis.__ompHostToolListeners = new Set();
+  return globalThis.__ompHostToolListeners;
+}
+
+/** Subscribe to host tool calls for sessions no tab is currently watching. */
+export function subscribeHostToolCalls(listener: (call: CrossSessionHostToolCall) => void): () => void {
+  const listeners = getHostToolListeners();
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) {
+      for (const session of getRegistry().values()) session.rejectCrossSessionHostTools();
+    }
+  };
+}
+
 // Starts at the empty state so an idle server never broadcasts "nothing changed".
 let lastRunningSnapshot = "[[],[]]";
 
@@ -1592,10 +1681,41 @@ export function notifyRunningChange({ refreshSessionList = false }: { refreshSes
   const snapshot = JSON.stringify([runningSessions.slice().sort(byId), exitedSessions.slice().sort(byId)]);
   if (snapshot === lastRunningSnapshot && !refreshSessionList) return;
   lastRunningSnapshot = snapshot;
+  syncInterruptibleSessions();
   const update: RunningSessionUpdate = { ids, runningSessions, exitedSessions, refreshSessionList };
   for (const listener of getRunningListeners()) {
     try { listener(update); } catch { /* ignore listener errors */ }
   }
+}
+
+/** Record which sessions are mid-run, for resume after a restart. */
+export function syncInterruptibleSessions(): void {
+  const registry = getRegistry();
+  const running = new Map<string, { id: string; advisor: boolean }>();
+  for (const session of registry.values()) {
+    if (session.sessionId && session.isRunning()) running.set(session.sessionId, { id: session.sessionId, advisor: session.advisorSpawned });
+  }
+  recordRunningSessions([...running.values()], (id) => registry.get(id)?.isAlive() === true);
+}
+
+/**
+ * Restart the sessions that were mid-run when omp-web last stopped and ask
+ * each to continue. Only runs when the auto-resume setting is on.
+ */
+export async function resumeInterruptedSessions(): Promise<void> {
+  await Promise.all(takeInterruptedSessions().map(async ({ id, advisor }) => {
+    try {
+      const filePath = await resolveSessionPath(id);
+      if (!filePath) return;
+      const header = readSessionHeader(filePath);
+      const { cwd } = resolveSpawnCwdResult(header?.cwd);
+      const { session } = await startRpcSession(id, filePath, cwd, undefined, advisor, header?.cwd);
+      await session.send({ type: "prompt", message: RESUME_PROMPT });
+      console.log(`[omp-web] resumed interrupted session ${id}`);
+    } catch (error) {
+      console.warn(`[omp-web] could not resume session ${id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }));
 }
 
 /** Look up the workspace-registered launch config; unregistered projects attach none. */
