@@ -951,8 +951,9 @@ function withNormalizedTimestamp(message: AgentMessage): AgentMessage {
  * allowlists those keys — extend the allowlist if MessageView ever reads more.
  * Task toolResults additionally keep a SIZE-BOUNDED subset of their
  * results/progress (telemetry, no full output) so the message flow can render
- * a per-subagent summary. On-disk parsing (loadSessionFile/getSessionEntries)
- * keeps full details.
+ * a per-subagent summary. Ask toolResults keep a bounded subset of their
+ * questions/answers (components/AskResultCard.tsx) with image data dropped.
+ * On-disk parsing (loadSessionFile/getSessionEntries) keeps full details.
  */
 const TASK_DETAIL_MAX_TEXT = 240;
 const TASK_DETAIL_MAX_ROWS = 50;
@@ -1093,6 +1094,50 @@ function hubDetailTargets(value: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
+function askDetailOptions(value: unknown): string[] | undefined {
+  const out = Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string").slice(0, TASK_DETAIL_MAX_ROWS).map(truncateTaskDetailText)
+    : undefined;
+  return out;
+}
+
+const ASK_DETAIL_ROW_STRING_KEYS = ["question", "customInput", "note"] as const;
+
+function keepAskResultRow(raw: unknown): Record<string, unknown> | null {
+  if (!isRecord(raw)) return null;
+  const out: Record<string, unknown> = {};
+  if (typeof raw.id === "string") out.id = truncateTaskDetailText(raw.id);
+  for (const key of ASK_DETAIL_ROW_STRING_KEYS) {
+    if (typeof raw[key] === "string") out[key] = truncateTaskDetailText(raw[key]);
+  }
+  const options = askDetailOptions(raw.options);
+  if (options) out.options = options;
+  const selectedOptions = askDetailOptions(raw.selectedOptions);
+  if (selectedOptions) out.selectedOptions = selectedOptions;
+  if (typeof raw.multi === "boolean") out.multi = raw.multi;
+  if (typeof raw.timedOut === "boolean") out.timedOut = raw.timedOut;
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+export function keepAskToolResultDetails(details: Record<string, unknown>): Record<string, unknown> | null {
+  if (details.chatRedirect === true) {
+    const questions = askDetailOptions(details.questions);
+    return questions ? { chatRedirect: true, questions } : { chatRedirect: true, questions: [] };
+  }
+  if (Array.isArray(details.results)) {
+    const results = details.results
+      .slice(0, TASK_DETAIL_MAX_ROWS)
+      .map((raw) => keepAskResultRow(raw))
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+    return results.length > 0 ? { results } : null;
+  }
+  if (typeof details.question === "string") {
+    const row = keepAskResultRow(details);
+    return row;
+  }
+  return null;
+}
+
 function stripToolResultDetails(message: AgentMessage): AgentMessage {
   if (message.role !== "toolResult" || message.details === undefined) return message;
   const { details, ...rest } = message;
@@ -1107,6 +1152,10 @@ function stripToolResultDetails(message: AgentMessage): AgentMessage {
     if (message.toolName === "hub") {
       const hubDetails = keepHubToolResultDetails(details);
       if (hubDetails) Object.assign(kept, hubDetails);
+    }
+    if (message.toolName === "ask") {
+      const askDetails = keepAskToolResultDetails(details);
+      if (askDetails) Object.assign(kept, askDetails);
     }
     if (Object.keys(kept).length > 0) return { ...rest, details: kept };
   }

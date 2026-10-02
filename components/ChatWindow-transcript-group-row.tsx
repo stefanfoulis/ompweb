@@ -2,9 +2,10 @@
 
 import { useState, type ReactNode } from "react";
 import { ChevronDown, Layers } from "lucide-react";
-import type { AgentMessage, AssistantContentBlock, AssistantMessage } from "@/lib/types";
+import type { AgentMessage, AssistantContentBlock, AssistantMessage, ToolResultMessage } from "@/lib/types";
 import { useI18n } from "@/lib/i18n";
 import type { ActivityPiece, TranscriptRow } from "@/lib/chat-transcript-plan";
+import { AskResultCard, collectAskResults } from "./AskResultCard";
 
 /** Renders one committed message, optionally as a partial/overridden view under its own key prefix. */
 export type RenderMessage = (idx: number, options?: { attachRef?: boolean; keyPrefix?: string; messageOverride?: AgentMessage; showTimestamp?: boolean; sourceBlockIndices?: number[] }) => ReactNode;
@@ -20,6 +21,7 @@ export interface TranscriptGroupRowContext {
   flat: boolean;
   messageRefs: React.RefObject<(HTMLDivElement | null)[]>;
   visibleRefIndexByMessage: Map<number, number>;
+  toolResultsMap: Map<string, ToolResultMessage>;
 }
 
 function withAssistantBlocks(
@@ -92,7 +94,7 @@ export function renderActivityPieces(messages: AgentMessage[], pieces: ActivityP
 }
 
 /** Render one user turn as keyed transcript entries for `CommittedTranscript`'s row list. */
-export function renderTranscriptGroupRow(row: TranscriptGroupRow, { messages, renderMessage, flat, messageRefs, visibleRefIndexByMessage }: TranscriptGroupRowContext): ReactNode[] {
+export function renderTranscriptGroupRow(row: TranscriptGroupRow, { messages, renderMessage, flat, messageRefs, visibleRefIndexByMessage, toolResultsMap }: TranscriptGroupRowContext): ReactNode[] {
   const { userIndex: userIdx, endIndex: endIdx, segments } = row;
   const rendered: ReactNode[] = [];
 
@@ -139,6 +141,12 @@ export function renderTranscriptGroupRow(row: TranscriptGroupRow, { messages, re
         </ProcessDetailsGroup>
       </div>,
     );
+    // Answered `ask` tool calls get a standalone recap card here, outside
+    // the collapsed group, so a user can scroll back and see the questions
+    // and the chosen answers without expanding raw tool JSON (#ask-history).
+    for (const askCard of collectAskResults(messages, segment.pieces, toolResultsMap)) {
+      rendered.push(<AskResultCard key={`ask-result-${askCard.toolCallId}`} data={askCard} />);
+    }
   });
   return rendered;
 }

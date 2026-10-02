@@ -374,7 +374,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
       rendered.push(renderMessage(row.index));
       continue;
     }
-    rendered.push(...renderTranscriptGroupRow(row, { messages, renderMessage, flat: rendersFlat(row), messageRefs, visibleRefIndexByMessage }));
+    rendered.push(...renderTranscriptGroupRow(row, { messages, renderMessage, flat: rendersFlat(row), messageRefs, visibleRefIndexByMessage, toolResultsMap }));
   }
   return (
     <>
