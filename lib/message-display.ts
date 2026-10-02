@@ -1,5 +1,12 @@
 import type { AssistantContentBlock, AssistantMessage, ThinkingContent } from "./types";
 
+/** CustomMessage.customType for omp's `continue` RPC directive (a hidden
+ *  role:"developer", `synthetic: true` message that resumes the agent).
+ *  Shared by lib/session-reader.ts (reload) and hooks/useAgentSession.ts
+ *  (live SSE) so both paths tag it the same way; rendered as the collapsed
+ *  "hidden" marker row (see MessageView's friendlyHiddenLabel). */
+export const DEVELOPER_MARKER_CUSTOM_TYPE = "developer-marker";
+
 interface DisplayOptions {
   isStreaming?: boolean;
 }

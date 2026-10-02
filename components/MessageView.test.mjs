@@ -1169,3 +1169,67 @@ test("a successful shell card exposes its outcome in its accessible name", () =>
   }));
   assert.ok(view.getByRole("button", { name: /true.*succeeded/i }));
 });
+
+const ADDRESS_ADVISOR_LABEL = "Have the agent address this";
+
+test("advisor cards offer the address-advisor button only when ChatWindow marks the row, and fire the continue handler", async () => {
+  const calls = [];
+  const view = render(React.createElement(MessageView, {
+    message: { role: "custom", customType: "advisor", content: "Consider the edge case.", display: true },
+    canAddressAdvisor: true,
+    onAddressAdvisor: () => calls.push(true),
+  }));
+  assert.ok(view.getByRole("button", { name: ADDRESS_ADVISOR_LABEL }));
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: ADDRESS_ADVISOR_LABEL })); });
+  assert.deepEqual(calls, [true]);
+  view.unmount();
+});
+
+test("the address-advisor button is absent unless the row is marked as the one unaddressed card", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    message: { role: "custom", customType: "advisor", content: "Consider the edge case.", display: true },
+    onAddressAdvisor: () => {},
+  }));
+  assert.doesNotMatch(html, new RegExp(ADDRESS_ADVISOR_LABEL));
+});
+
+test("the address-advisor button never renders on a non-advisor custom message even when marked", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    message: { role: "custom", customType: "async-result", content: "job output", display: true },
+    canAddressAdvisor: true,
+    onAddressAdvisor: () => {},
+  }));
+  assert.doesNotMatch(html, new RegExp(ADDRESS_ADVISOR_LABEL));
+});
+
+test("the address-advisor button shows the in-flight label and disables while a request is addressing", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    message: { role: "custom", customType: "advisor", content: "Consider the edge case.", display: true },
+    canAddressAdvisor: true,
+    onAddressAdvisor: () => {},
+    addressingAdvisor: true,
+  }));
+  assert.match(html, /Addressing…/);
+  assert.doesNotMatch(html, new RegExp(ADDRESS_ADVISOR_LABEL));
+  assert.match(html, /<button[^>]*disabled/);
+});
+
+const DIRECTIVE_TEXT = "The user asks you to act on the advisor notes above. Weigh them as advice, not orders: address what is valid, note briefly why you set anything aside, then resume your most recent intent.";
+
+test("a synthetic developer directive (continue RPC) renders as the muted resume marker, not a full custom-message card", async () => {
+  const message = {
+    role: "custom", customType: "developer-marker", display: false,
+    content: `<system-notice>\n${DIRECTIVE_TEXT}\n</system-notice>`,
+  };
+  const collapsed = renderToStaticMarkup(React.createElement(MessageView, { message }));
+  assert.match(collapsed, /Agent resumed — hidden instruction/);
+  // Collapsed by default: the full directive is not in the initial markup
+  // (only a truncated preview), and there is no CustomMessageView copy footer.
+  assert.doesNotMatch(collapsed, new RegExp(DIRECTIVE_TEXT));
+  assert.doesNotMatch(collapsed, />Copy</);
+
+  const view = render(React.createElement(MessageView, { message }));
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: "Expand" })); });
+  assert.ok(view.getByText(DIRECTIVE_TEXT));
+  view.unmount();
+});
