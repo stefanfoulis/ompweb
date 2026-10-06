@@ -25,6 +25,7 @@ import { NotificationBell } from "./NotificationBell";
 import { BranchNavigator } from "./BranchNavigator";
 import { LanguageSwitcher } from "./LanguageSwitcher";
 import { CommandPaletteMount } from "./CommandPaletteMount";
+import { useDocumentTitle } from "./AppShell-document-title";
 import { Check, ChevronDown, Command, Ellipsis, Folder, GitBranch, History, Menu, PanelLeft, PanelRight, Server, Terminal, Wand2, Zap } from "lucide-react";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import { translate, useI18n } from "@/lib/i18n";
@@ -1820,18 +1821,7 @@ export function AppShell({ appName }: { appName: string }) {
 
   const activeCwdName = activeCwd ? getFileName(activeCwd) || activeCwd : null;
   // Fork: the tab shows just the session title (else the workspace); the favicon identifies the app.
-  const windowTitle = selectedSession?.name || selectedSession?.firstMessage || activeCwdName || appName;
-
-  useEffect(() => {
-    const syncWindowTitle = () => {
-      if (document.title !== windowTitle) document.title = windowTitle;
-    };
-
-    syncWindowTitle();
-    const observer = new MutationObserver(syncWindowTitle);
-    observer.observe(document.head, { childList: true, subtree: true, characterData: true });
-    return () => observer.disconnect();
-  }, [windowTitle]);
+  useDocumentTitle(selectedSession?.name || selectedSession?.firstMessage || activeCwdName || appName);
 
   // The sidebar search drives the chat's find-in-page highlights.
   const [chatSearchQuery, setChatSearchQuery] = useState("");
