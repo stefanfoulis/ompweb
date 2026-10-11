@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import "../tests/setup-dom.mjs";
-import test, { afterEach } from "node:test";
+import test, { afterEach, beforeEach } from "node:test";
 import React from "react";
-import { cleanup, fireEvent, render } from "@testing-library/react/pure.js";
-import { createJiti } from "jiti";
+const { cleanup, fireEvent, render } = await import("@testing-library/react/pure.js");
 
-const jiti = createJiti(import.meta.url, {
-  jsx: { runtime: "automatic" },
-  tsconfigPaths: true,
+const { MessageView } = await import("./MessageView.tsx");
+
+// jsdom ships no matchMedia; the svg write-tool panel's SvgBlock reads
+// useTheme (for background auto-detect) at mount.
+beforeEach(() => {
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
 });
-const { MessageView } = await jiti.import("./MessageView.tsx");
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  delete window.matchMedia;
+});
 
 const svgContent = '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>';
 
