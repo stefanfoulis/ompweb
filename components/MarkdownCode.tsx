@@ -51,7 +51,7 @@ export function markdownCodeRenderer(options: {
         return <MermaidBlock code={raw.replace(/\n$/, "")} isStreaming={options.isStreaming} defaultPreview={options.defaultPreview} />;
       }
       if (lang === "svg" || ((lang === "xml" || lang === "html" || lang === "") && startsWithSvgRoot(raw))) {
-        return <SvgBlock code={raw.replace(/\n$/, "")} isStreaming={options.isStreaming} />;
+        return <SvgBlock code={raw.replace(/\n$/, "")} isStreaming={options.isStreaming} injectTheme />;
       }
       return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} isStreaming={options.isStreaming} />;
     }
