@@ -1575,6 +1575,12 @@ export function AppShell({ appName }: { appName: string }) {
   }, [openUrlAutomatically]);
   const handleSessionOpenUrl = useCallback((url: string) => requestOpenUrl(url, selectedSession?.id ?? "", false), [requestOpenUrl, selectedSession?.id]);
   const pendingCrossHostToolsRef = useRef(new Map<string, AbortController>());
+  // Drives the open session's tab-favicon "waiting" dot: an open_url (OAuth/login
+  // included) confirmation is pending for the session shown in this tab.
+  const pendingOpenUrlForSession = useMemo(
+    () => pendingOpens.some((open) => open.kind === "url" && open.sessionId === selectedSession?.id),
+    [pendingOpens, selectedSession?.id],
+  );
   const handleCrossSessionHostTool = useCallback(async (call: CrossSessionHostToolCall) => {
     const key = JSON.stringify([call.sessionId, call.id]);
     if (pendingCrossHostToolsRef.current.has(key)) return;
@@ -2583,6 +2589,7 @@ export function AppShell({ appName }: { appName: string }) {
               chatInputRef={chatInputRef}
               onOpenFile={handleOpenFile}
               onOpenUrl={handleSessionOpenUrl}
+              openUrlPending={pendingOpenUrlForSession}
               onBranchDataChange={handleBranchDataChange}
               onSystemPromptChange={handleSystemPromptChange}
               onSystemPromptLoaderChange={handleSystemPromptLoaderChange}

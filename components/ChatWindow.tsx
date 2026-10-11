@@ -1,7 +1,7 @@
 "use client";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useReducer, useRef, useState, type ReactNode, type Ref } from "react";
 import { ArrowDown, ChevronDown, ChevronUp, Paperclip, Square } from "lucide-react";
 import type { AgentMessage, AssistantMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
 import { translate, useI18n } from "@/lib/i18n";
@@ -30,6 +30,8 @@ import { GithubRepoContext } from "@/lib/github-refs";
 import { useDragDrop } from "@/hooks/useDragDrop";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { useTabStatusIcon } from "@/hooks/useTabStatusIcon";
+import { deriveTabStatus, doneUnseenReducer, lastMessageErrored } from "@/lib/tab-status";
 import type { SessionStatsInfo, GenerationSpeedInfo } from "@/lib/pi-types";
 import type { ProviderUsageContext } from "@/lib/provider-usage-types";
 import { normalizeCustomPanelLines, parseAnsiLine } from "@/lib/ansi";
@@ -87,6 +89,8 @@ interface Props {
   /** Handles the open_url host tool; returns the result text for the agent. */
   onOpenUrl?: (url: string) => string;
   onGenerationSpeedChange?: (speed: GenerationSpeedInfo | null) => void;
+  /** A pending open_url (incl. OAuth/login) confirmation exists for this session; drives the tab favicon's "waiting" dot. */
+  openUrlPending?: boolean;
   /** Open Settings → API Keys & Providers (from the model picker). */
   onOpenProviders?: () => void;
   /** The sidebar search query: its hits are highlighted ("" for none). */
@@ -407,7 +411,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
   );
 });
 
-export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, onOpenProviders, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
+export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, openUrlPending, onOpenProviders, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
   const { t, tn } = useI18n();
   const fileSource = useMemo<WorkspaceFileSource>(() => ({
     hostId: session?.hostId ?? newSessionHostId ?? "local",
@@ -431,6 +435,25 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     onSessionMoved(oldId, newId);
   }, [composerRef, onSessionMoved]);
 
+  // Tracks a run that finished while this tab was hidden or unfocused, for
+  // the favicon's "done" dot (cleared once the tab is seen again, or the
+  // open session changes).
+  const [doneUnseen, dispatchDoneUnseen] = useReducer(doneUnseenReducer, false);
+  useEffect(() => {
+    dispatchDoneUnseen({ type: "session_change" });
+  }, [session?.id]);
+  useEffect(() => {
+    const markSeen = () => {
+      if (!document.hidden && document.hasFocus()) dispatchDoneUnseen({ type: "visible_and_focused" });
+    };
+    document.addEventListener("visibilitychange", markSeen);
+    window.addEventListener("focus", markSeen);
+    return () => {
+      document.removeEventListener("visibilitychange", markSeen);
+      window.removeEventListener("focus", markSeen);
+    };
+  }, []);
+
   // Wrap onAgentEnd to play the completion sound. This is more reliable than
   // wrapping handleAgentEventRef because useAgentSession overwrites that ref
   // on every render (it syncs the latest callback), which would blow away an
@@ -451,6 +474,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   const wrappedOnAgentEnd = useCallback(() => {
     playDoneSoundRef.current();
     if (ttsRef.current.autoPlayEnabled) autoplayPendingRef.current = true;
+    dispatchDoneUnseen({ type: "run_ended", hidden: document.hidden, focused: document.hasFocus() });
     onAgentEnd?.();
   }, [onAgentEnd]);
 
@@ -494,6 +518,17 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     if (speech) ttsRef.current.speak(speech.id, speech.text);
   }, [messages, entryIds, streamState, agentRunning]);
   const sessionBusy = agentRunning || bashRunning;
+  const lastRunErrored = useMemo(() => lastMessageErrored(messages), [messages]);
+  const tabStatus = useMemo(() => deriveTabStatus({
+    extensionDialogPending: extensionDialog !== null,
+    openUrlPending: !!openUrlPending,
+    errored: lastRunErrored,
+    agentRunning,
+    bashRunning,
+    activeSubagentCount,
+    doneUnseen,
+  }), [extensionDialog, openUrlPending, lastRunErrored, agentRunning, bashRunning, activeSubagentCount, doneUnseen]);
+  useTabStatusIcon(tabStatus);
   const modelCapacity = useMemo(() => {
     if (!displayModelValue) return null;
     const model = modelList.find((entry) => entry.provider === displayModelValue.provider && entry.id === displayModelValue.modelId);
