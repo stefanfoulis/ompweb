@@ -73,7 +73,7 @@ function subscribeViewport(onChange: () => void): () => void {
  * `undefined` when there is no window (SSR, tests) — the CSS default then
  * applies unchanged.
  */
-function useViewportMaxHeight(): number | undefined {
+export function useViewportMaxHeight(): number | undefined {
   return useSyncExternalStore(subscribeViewport, readPanelMaxHeight, () => undefined);
 }
 
@@ -96,7 +96,7 @@ function visibleHeight(): number {
  * that focused a field will raise one even before the browser has repainted.
  * A slow re-check covers mobile browsers that resize nothing on focus.
  */
-function useMobileInputOpen(panelRef: RefObject<HTMLDivElement | null>, attached: boolean) {
+export function useMobileInputOpen(panelRef: RefObject<HTMLDivElement | null>, attached: boolean) {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     if (!attached) {

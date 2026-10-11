@@ -5,6 +5,8 @@ import type { ExtensionUiRequest } from "@/lib/types";
 import type { RpcAskDialogAnswer, RpcAskDialogQuestion } from "@/lib/pi-types";
 import { useI18n } from "@/lib/i18n";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { useTouchTargets } from "@/hooks/useTouchTargets";
+import { shouldDeferAttachedFocus, useMobileInputOpen, useViewportMaxHeight } from "./ExtensionDialog";
 import { MarkdownBody } from "./MarkdownBody";
 
 /**
@@ -18,6 +20,10 @@ import { MarkdownBody } from "./MarkdownBody";
  */
 
 const MAX_TAB_LABEL_CHARS = 24;
+
+// Layout-viewport cap for the composer panel. While the soft keyboard is up
+// the panel is capped to the visual viewport instead (see useViewportMaxHeight).
+const ATTACHED_PANEL_MAX_HEIGHT = "min(480px, 65dvh)";
 
 export type AskDialogRequest = Extract<ExtensionUiRequest, { method: "ask" }>;
 export type AskDialogResponse = { answers: RpcAskDialogAnswer[] } | { chat: true } | { cancelled: true };
@@ -134,7 +140,9 @@ const primaryButtonStyle = {
 } as const;
 
 const editableInputStyle = {
-  marginLeft: 24,
+  flex: 1,
+  minWidth: 0,
+  boxSizing: "border-box",
   padding: "5px 7px",
   borderRadius: 6,
   border: "1px solid var(--border)",
@@ -143,6 +151,9 @@ const editableInputStyle = {
   fontSize: 12,
   outline: "none",
 } as const;
+
+/** Rows indent their secondary content under the option's checkbox/radio. */
+const ROW_INDENT = 24;
 
 export function AskDialog({
   request,
@@ -161,6 +172,9 @@ export function AskDialog({
   const [remainingMs, setRemainingMs] = useState<number | undefined>(undefined);
   const otherInputRefs = useRef<Map<number, HTMLInputElement>>(new Map());
   const noteInputRefs = useRef<Map<string, HTMLInputElement>>(new Map());
+  const viewportMaxHeight = useViewportMaxHeight();
+  const { touchTargets } = useTouchTargets();
+  const footerMinHeight = touchTargets === "accessible" ? 44 : undefined;
 
   useEffect(() => {
     setStates(createInitialStates(questions));
@@ -243,6 +257,14 @@ export function AskDialog({
   // useModalDialog's document-level Escape/Tab handling only applies when
   // rendered as the full overlay.
   const panelRef = useModalDialog<HTMLDivElement>({ onClose: resolveEscape, active: !attached });
+  const keyboardOpen = useMobileInputOpen(panelRef, attached);
+  // With the keyboard up the panel fills the visible area instead of the
+  // taller layout-viewport cap, so the footer (Cancel / Chat about this /
+  // Submit) stays in reach (#236).
+  const attachedMaxHeight = keyboardOpen && viewportMaxHeight !== undefined
+    ? `${viewportMaxHeight}px`
+    : ATTACHED_PANEL_MAX_HEIGHT;
+
   useEffect(() => {
     if (!attached) return;
     // Keyboard navigation here is fully custom (cursor + tab state on the
@@ -250,7 +272,12 @@ export function AskDialog({
     // unless the user already clicked into the dialog before this frame ran.
     const frame = window.requestAnimationFrame(() => {
       const panel = panelRef.current;
-      if (panel && !panel.contains(document.activeElement)) panel.focus();
+      if (!panel) return;
+      // On touch input or a phone width the question waits to be read: moving
+      // focus here scrolls the unread panel around and, with the browser's
+      // focus-follows-tap heuristics, can raise the on-screen keyboard (#235).
+      if (shouldDeferAttachedFocus()) return;
+      if (!panel.contains(document.activeElement)) panel.focus();
     });
     return () => window.cancelAnimationFrame(frame);
   }, [attached, panelRef, request.id]);
@@ -261,6 +288,19 @@ export function AskDialog({
 
   const focusOtherInput = (qIndex: number) => {
     requestAnimationFrame(() => otherInputRefs.current.get(qIndex)?.focus());
+  };
+
+  /** Enter in the custom-answer field: the text is already stored on every
+   *  keystroke, so "sending" it means leaving the field — which drops the
+   *  on-screen keyboard and gives the footer its room back — and, for a
+   *  single-answer question, moving on exactly as picking an option does. The
+   *  last question lands on the Review tab, where the footer's Submit lives. */
+  const commitOtherAnswer = (qIndex: number) => {
+    const question = questions[qIndex];
+    // The field stores `undefined` for blank text — nothing to send.
+    if (!question || states[qIndex]?.customInput === undefined) return;
+    otherInputRefs.current.get(qIndex)?.blur();
+    if (!question.multi) advanceAfterQuestion(qIndex);
   };
 
   const setCursor = (qIndex: number, rowIndex: number) => {
@@ -392,6 +432,12 @@ export function AskDialog({
         onMouseEnter={() => setCursor(qIndex, rowIndex)}
         style={{
           display: "grid",
+          // Rows must be able to shrink below their content: a long option
+          // label or a typed answer is wider than a phone, and an implicit
+          // max-content track would push the panel past the composer column
+          // and clip it (#234).
+          gridTemplateColumns: "minmax(0, 1fr)",
+          minWidth: 0,
           gap: 4,
           padding: "7px 8px",
           borderRadius: 7,
@@ -399,7 +445,7 @@ export function AskDialog({
           background: highlighted ? "color-mix(in srgb, var(--accent) 8%, var(--bg-panel))" : "transparent",
         }}
       >
-        <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: "var(--text)" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, cursor: "pointer", fontSize: 13, color: "var(--text)" }}>
           <input
             type={question.multi ? "checkbox" : "radio"}
             name={groupName}
@@ -418,48 +464,50 @@ export function AskDialog({
               }
             }}
           />
-          <span style={{ flex: 1 }}>
+          <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere" }}>
             {row.kind === "option" ? option?.label : t("askDialog.other")}
             {isRecommended && <span style={{ marginLeft: 6, fontSize: 11, color: "var(--text-dim)" }}>({t("askDialog.recommended")})</span>}
           </span>
         </label>
         {row.kind === "option" && option?.description && (
-          <div style={{ marginLeft: 24, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>{option.description}</div>
+          <div style={{ marginLeft: ROW_INDENT, minWidth: 0, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5, overflowWrap: "anywhere" }}>{option.description}</div>
         )}
         {row.kind === "other" && (
-          <input
-            type="text"
-            data-ask-editable="1"
-            ref={(el) => {
-              if (el) otherInputRefs.current.set(qIndex, el);
-              else otherInputRefs.current.delete(qIndex);
-            }}
-            value={state.customInput ?? ""}
-            placeholder={t("askDialog.otherPlaceholder")}
-            aria-label={t("askDialog.other")}
-            onFocus={() => setCursor(qIndex, rowIndex)}
-            onChange={(e) => setCustomInput(qIndex, e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                e.stopPropagation();
-                if (!question.multi && state.customInput) advanceAfterQuestion(qIndex);
-                e.currentTarget.blur();
-              } else if (e.key === "Escape") {
-                e.preventDefault();
-                e.stopPropagation();
-                e.currentTarget.blur();
-              }
-            }}
-            style={editableInputStyle}
-          />
+          <div style={{ display: "flex", alignItems: "center", marginLeft: ROW_INDENT, minWidth: 0 }}>
+            <input
+              type="text"
+              data-ask-editable="1"
+              ref={(el) => {
+                if (el) otherInputRefs.current.set(qIndex, el);
+                else otherInputRefs.current.delete(qIndex);
+              }}
+              value={state.customInput ?? ""}
+              placeholder={t("askDialog.otherPlaceholder")}
+              aria-label={t("askDialog.other")}
+              onFocus={() => setCursor(qIndex, rowIndex)}
+              onChange={(e) => setCustomInput(qIndex, e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  commitOtherAnswer(qIndex);
+                  e.currentTarget.blur();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  e.currentTarget.blur();
+                }
+              }}
+              style={editableInputStyle}
+            />
+          </div>
         )}
         {rowNote && !editingNote && (
           <button
             type="button"
             onClick={() => openNoteEditor(qIndex, row.key)}
             title={t("askDialog.editNote")}
-            style={{ marginLeft: 24, padding: 0, border: "none", background: "none", textAlign: "left", cursor: "pointer", color: "var(--status-success)", fontSize: 12, lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+            style={{ marginLeft: ROW_INDENT, padding: 0, border: "none", background: "none", textAlign: "left", cursor: "pointer", color: "var(--status-success)", fontSize: 12, lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
           >
             ✎ {rowNote}
           </button>
@@ -489,10 +537,10 @@ export function AskDialog({
                 e.currentTarget.blur();
               }
             }}
-            style={editableInputStyle}
+            style={{ ...editableInputStyle, marginLeft: ROW_INDENT }}
           />
         ) : (
-          <div style={{ marginLeft: 24 }}>
+          <div style={{ marginLeft: ROW_INDENT }}>
             <button
               type="button"
               onClick={() => openNoteEditor(qIndex, row.key)}
@@ -535,6 +583,12 @@ export function AskDialog({
         className={attached ? undefined : "animate-scale-in"}
         style={{
           width: attached ? "100%" : "min(640px, 100%)",
+          boxSizing: "border-box",
+          // Flex/grid children below must be able to shrink: a min-content
+          // question, option or preview is wider than a phone, and without
+          // this the panel grows past its composer column and gets clipped
+          // (#234).
+          minWidth: 0,
           display: "flex",
           flexDirection: "column",
           border: "1px solid var(--border)",
@@ -543,15 +597,15 @@ export function AskDialog({
           boxShadow: attached ? "var(--shadow-card)" : "var(--shadow-modal)",
           overflow: "hidden",
           outline: "none",
-          maxHeight: attached ? "min(480px, 65dvh)" : "min(640px, 85dvh)",
+          maxHeight: attached ? attachedMaxHeight : "min(640px, 85dvh)",
         }}
       >
-        <div style={{ minHeight: 0, overflowY: "auto", overflowWrap: "anywhere" }}>
+        <div className="ask-dialog-content" style={{ minWidth: 0, minHeight: 0, overflowY: "auto", overflowX: "hidden", overflowWrap: "anywhere" }}>
           <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--border)" }}>
             <div style={{ color: "var(--text)", fontSize: 14, fontWeight: 650 }}>{titleText}</div>
           </div>
 
-          <div role="tablist" aria-label={t("askDialog.title")} style={{ display: "flex", gap: 4, padding: "6px 10px", borderBottom: "1px solid var(--border)", overflowX: "auto", background: "var(--bg-panel)" }}>
+          <div role="tablist" aria-label={t("askDialog.title")} style={{ display: "flex", gap: 4, minWidth: 0, padding: "6px 10px", borderBottom: "1px solid var(--border)", overflowX: "auto", background: "var(--bg-panel)" }}>
             {questions.map((question, index) => {
               const selected = !isReviewTab && index === currentIndex;
               const answered = isAnswered(states[index]);
@@ -610,18 +664,20 @@ export function AskDialog({
 
           <div style={{ padding: 14 }}>
             {!isReviewTab && currentQuestion && currentState && (
-              <div role="tabpanel" id={`ask-panel-${currentIndex}`} aria-labelledby={`ask-tab-${currentIndex}`} style={{ display: "grid", gap: 10 }}>
+              <div role="tabpanel" id={`ask-panel-${currentIndex}`} aria-labelledby={`ask-tab-${currentIndex}`} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 10 }}>
                 {currentQuestion.header && (
                   <span style={{ justifySelf: "start", fontSize: 10, padding: "1px 6px", borderRadius: 999, border: "1px solid var(--border)", color: "var(--text-muted)", background: "var(--bg-panel)" }}>
                     {currentQuestion.header}
                   </span>
                 )}
-                <div style={{ color: "var(--text)", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{currentQuestion.question}</div>
-                <div role={currentQuestion.multi ? "group" : "radiogroup"} aria-label={currentQuestion.question} style={{ display: "grid", gap: 6 }}>
+                <div style={{ minWidth: 0, color: "var(--text)", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{currentQuestion.question}</div>
+                <div role={currentQuestion.multi ? "group" : "radiogroup"} aria-label={currentQuestion.question} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 6 }}>
                   {currentRows.map((row, rowIndex) => renderRow(row, rowIndex))}
                 </div>
                 {highlightedPreview && (
-                  <div style={{ border: "1px solid var(--border)", borderRadius: 7, padding: 10, background: "var(--bg-panel)", fontSize: 12 }}>
+                  // The preview wraps rather than scrolling the row sideways;
+                  // only a fenced code block inside keeps its own scroller.
+                  <div style={{ minWidth: 0, overflowX: "hidden", border: "1px solid var(--border)", borderRadius: 7, padding: 10, background: "var(--bg-panel)", fontSize: 12 }}>
                     <MarkdownBody>{highlightedPreview}</MarkdownBody>
                   </div>
                 )}
@@ -629,18 +685,18 @@ export function AskDialog({
             )}
 
             {isReviewTab && (
-              <div role="tabpanel" id="ask-panel-review" aria-labelledby="ask-tab-review" style={{ display: "grid", gap: 10 }}>
+              <div role="tabpanel" id="ask-panel-review" aria-labelledby="ask-tab-review" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 10 }}>
                 {unansweredCount > 0 && (
                   <div style={{ color: "var(--status-warning)", fontSize: 12 }}>{tn("askDialog.unansweredWarning", unansweredCount)}</div>
                 )}
-                <div style={{ display: "grid", gap: 8 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 8 }}>
                   {questions.map((question, index) => {
                     const state = states[index];
                     const answered = isAnswered(state);
                     const summary = answered ? answerSummary(question, state) : undefined;
                     const note = noteForSubmittedAnswer(question, state);
                     return (
-                      <div key={question.id} style={{ fontSize: 13, lineHeight: 1.5 }}>
+                      <div key={question.id} style={{ minWidth: 0, fontSize: 13, lineHeight: 1.5, overflowWrap: "anywhere" }}>
                         <span style={{ color: "var(--text-dim)" }}>{index + 1}. {tabLabel(question)}:</span>{" "}
                         <span style={{ color: answered ? "var(--text)" : "var(--status-warning)" }}>{answered ? summary : t("askDialog.unanswered")}</span>
                         {note && <div style={{ marginLeft: 14, color: "var(--text-muted)", fontSize: 12 }}>{t("askDialog.note")}: {note}</div>}
@@ -653,11 +709,11 @@ export function AskDialog({
           </div>
         </div>
 
-        <div style={{ display: "flex", flexShrink: 0, justifyContent: "flex-end", gap: 8, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-panel)" }}>
-          <button type="button" onClick={cancel} style={secondaryButtonStyle}>{t("askDialog.cancel")}</button>
-          <button type="button" onClick={() => onRespond(request, { chat: true })} style={secondaryButtonStyle}>{t("askDialog.chatAboutThis")}</button>
+        <div className="extension-dialog-footer" style={{ display: "flex", flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end", gap: 8, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-panel)" }}>
+          <button type="button" onClick={cancel} style={{ ...secondaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.cancel")}</button>
+          <button type="button" onClick={() => onRespond(request, { chat: true })} style={{ ...secondaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.chatAboutThis")}</button>
           {isReviewTab && (
-            <button type="button" onClick={() => submit()} style={primaryButtonStyle}>{t("askDialog.submit")}</button>
+            <button type="button" onClick={() => submit()} style={{ ...primaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.submit")}</button>
           )}
         </div>
       </div>
