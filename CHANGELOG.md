@@ -14,6 +14,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 - **The model picker groups each provider's models by family and tier.** Each provider's list now opens on the latest version of every model family (haiku/sonnet/opus/fable-style tiers), ordered from least to most capable, with a separator before the full list of every version underneath — the latest versions appear in both. A dated snapshot of an already-listed version shows dimmed. Searching still shows a plain flat list across providers, like before.
 - Show Mermaid diagrams in chat rendered by default, like the file viewer already does: a block shows its source while the reply is still streaming and switches to the diagram once it ends. The **Source** button still shows the code.
+- Preview SVG inline in chat: fenced `svg` code blocks (and `xml`/`html` blocks whose root element is an `<svg>`) show a rendered preview by default once streaming finishes, with a **Source** toggle back to the raw markup and a click-to-zoom viewer; the preview renders only through an `<img>` data URL, so embedded scripts never run. A `write` tool call to an `.svg` path shows the same preview in its expanded tool card, alongside the raw written content.
 
 ## [v0.7.4] - 2026-11-20
 

@@ -22,6 +22,7 @@ import { OriginMessageView } from "./OriginMessageView";
 import { SessionLink } from "./SessionLink";
 import { resolveSessionRef } from "@/lib/session-names";
 import type { SessionOriginRef } from "@/lib/message-origin";
+import { SvgWritePreviewPanel } from "./MessageView-svg-panel";
 import { isMessageOverflowing } from "@/lib/message-overflow";
 import { getResultDiff, PairedDiffResult, PairedResult } from "./MessageView-diff-view";
 import {
@@ -1359,6 +1360,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
                 {t(inputExpanded ? "messageView.collapseInput" : "messageView.showFullInput")}
               </button>
             </div>
+            <SvgWritePreviewPanel toolName={block.toolName} input={block.input} />
             <div id={inputId} hidden={!inputExpanded} className="tool-call-input">
               {inputExpanded && (
                 block.input && typeof block.input === "object" && !Array.isArray(block.input) && Object.keys(block.input).length > 0 ? (
