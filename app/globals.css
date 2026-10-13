@@ -1486,6 +1486,18 @@ pre, code {
   display: block;
   width: fit-content;
 }
+/* The SVG preview's click-to-zoom button spans its row. Sized to its content
+   (inline-block here, `fit-content` in markdown above), the button collapses
+   to 0px for an SVG sized only by its viewBox, which has no natural width as an
+   <img>. Inside a definite-width box the image keeps an explicit size, or fills
+   the row when it only has a viewBox. Stays after `.markdown-body
+   .image-clickable`: same specificity, so source order decides. */
+.svg-block-preview > .image-clickable {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+}
 .image-clickable:hover img {
   opacity: 0.85;
 }
