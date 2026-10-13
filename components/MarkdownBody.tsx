@@ -110,7 +110,7 @@ export function useMarkdownBodyRendering({ children, isStreaming, cwd, sourceSes
       });
 
     return {
-    code: markdownCodeRenderer({ isStreaming, inlineClassName: "markdown-inline-code" }),
+    code: markdownCodeRenderer({ isStreaming, defaultPreview: true, inlineClassName: "markdown-inline-code" }),
     pre({ children }) {
       return <>{children}</>;
     },
