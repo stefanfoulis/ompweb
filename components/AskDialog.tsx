@@ -6,7 +6,7 @@ import type { RpcAskDialogAnswer, RpcAskDialogQuestion } from "@/lib/pi-types";
 import { useI18n } from "@/lib/i18n";
 import { useModalDialog } from "@/hooks/useModalDialog";
 import { useTouchTargets } from "@/hooks/useTouchTargets";
-import { shouldDeferAttachedFocus, useMobileInputOpen, useViewportMaxHeight } from "./ExtensionDialog";
+import { shouldDeferAttachedFocus, useKeyboardPressGuard, useMobileInputOpen, useViewportMaxHeight } from "./ExtensionDialog";
 import { MarkdownBody } from "./MarkdownBody";
 
 /**
@@ -225,7 +225,15 @@ export function AskDialog({
   const highlightedPreview = highlightedOption?.preview?.trim() ? highlightedOption.preview : undefined;
   const unansweredCount = questions.filter((_, index) => !isAnswered(states[index])).length;
 
-  const cancel = () => onRespond(request, { cancelled: true });
+  // Answering removes the panel. Release its text field first, in the same
+  // task, so the phone keyboard closes once instead of flashing as the
+  // focused field disappears from under it.
+  const respond = (response: AskDialogResponse) => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && panelRef.current?.contains(active)) active.blur();
+    onRespond(request, response);
+  };
+  const cancel = () => respond({ cancelled: true });
   const submit = (statesOverride?: QuestionState[]) => {
     const answers: RpcAskDialogAnswer[] = questions.map((question, index) => {
       const state = (statesOverride ?? states)[index];
@@ -236,7 +244,7 @@ export function AskDialog({
       if (note) item.note = note;
       return item;
     });
-    onRespond(request, { answers });
+    respond({ answers });
   };
 
   // Escape closes whatever text field is focused (custom-answer or note
@@ -264,6 +272,16 @@ export function AskDialog({
   const attachedMaxHeight = keyboardOpen && viewportMaxHeight !== undefined
     ? `${viewportMaxHeight}px`
     : ATTACHED_PANEL_MAX_HEIGHT;
+  const pressGuard = useKeyboardPressGuard();
+  // Leaving a text field closes the phone keyboard; the panel takes focus
+  // back because the arrow-key cursor lives on it.
+  const releaseTextFocus = () => {
+    const panel = panelRef.current;
+    const active = document.activeElement;
+    if (!panel || !isEditableElement(active) || !panel.contains(active)) return;
+    active.blur();
+    panel.focus();
+  };
 
   useEffect(() => {
     if (!attached) return;
@@ -322,6 +340,9 @@ export function AskDialog({
     const question = questions[qIndex];
     const option = question?.options[optionIndex];
     if (!question || !option) return;
+    // The press guard left the Other field focused, so the keyboard is still
+    // up and further typing would re-choose Other over this option.
+    releaseTextFocus();
     if (question.multi) {
       setStates((prev) => prev.map((state, index) => {
         if (index !== qIndex) return state;
@@ -580,6 +601,8 @@ export function AskDialog({
         aria-label={titleText}
         tabIndex={-1}
         onKeyDown={handleContainerKeyDown}
+        // Keeps the phone keyboard up while a text box of this panel has focus.
+        {...pressGuard}
         className={attached ? undefined : "animate-scale-in"}
         style={{
           width: attached ? "100%" : "min(640px, 100%)",
@@ -711,7 +734,7 @@ export function AskDialog({
 
         <div className="extension-dialog-footer" style={{ display: "flex", flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end", gap: 8, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-panel)" }}>
           <button type="button" onClick={cancel} style={{ ...secondaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.cancel")}</button>
-          <button type="button" onClick={() => onRespond(request, { chat: true })} style={{ ...secondaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.chatAboutThis")}</button>
+          <button type="button" onClick={() => respond({ chat: true })} style={{ ...secondaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.chatAboutThis")}</button>
           {isReviewTab && (
             <button type="button" onClick={() => submit()} style={{ ...primaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.submit")}</button>
           )}

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore, type RefObject } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { Eye, EyeOff } from "lucide-react";
 import type { ExtensionUiRequest } from "@/lib/types";
 import type { RpcAskDialogAnswer } from "@/lib/pi-types";
@@ -212,6 +212,30 @@ export function isSensitivePrompt(title?: string, placeholder?: string): boolean
   return SENSITIVE_PATTERN.test(strippedFull);
 }
 
+/**
+ * Panel props that keep the soft keyboard up while one of the panel's own
+ * text boxes has focus: a press elsewhere in it (an option, Cancel, Submit)
+ * must not move focus, or the keyboard closes and the panel resizes before
+ * the click, so the press misses what it aimed at (#252, #255). A pressed
+ * option label still focuses its radio once the click lands, so the keyboard
+ * closes after the choice is made. Touch and pen only, judged per press (a
+ * hybrid laptop has both): a mouse keeps text selection and radio arrow keys.
+ */
+export function useKeyboardPressGuard() {
+  // `pointerType` of the latest press: the pointer media query only describes
+  // the primary pointer, not the one pressing now.
+  const pressPointer = useRef<string | null>(null);
+  return {
+    onPointerDown: (event: ReactPointerEvent<HTMLElement>) => { pressPointer.current = event.pointerType; },
+    onMouseDown: (event: ReactMouseEvent<HTMLElement>) => {
+      const target = event.target as Element;
+      const pointer = pressPointer.current;
+      if (pointer && pointer !== "mouse" && document.activeElement?.matches(TEXT_ENTRY) && event.currentTarget.contains(document.activeElement) && !target.closest(TEXT_ENTRY)) {
+        event.preventDefault();
+      }
+    },
+  };
+}
 /** Single-select questions start on their recommended option. */
 function initialAskDrafts(request: ExtensionDialogRequest): AskDraft[] {
   if (request.method !== "ask") return [];
@@ -260,9 +284,7 @@ function StandardExtensionDialog({
   const [showPassword, setShowPassword] = useState(false);
   const [selectedOption, setSelectedOption] = useState<string | null>(null);
   const requestIdRef = useRef(request.id);
-  // `pointerType` of the latest press: the pointer media query only describes
-  // the primary pointer, not the one pressing now.
-  const pressPointerRef = useRef<string | null>(null);
+  const pressGuard = useKeyboardPressGuard();
   const [askDrafts, setAskDrafts] = useState(() => initialAskDrafts(request));
   const viewportMaxHeight = useViewportMaxHeight();
   const { touchTargets } = useTouchTargets();
@@ -385,21 +407,8 @@ function StandardExtensionDialog({
         aria-modal={attached ? undefined : "true"}
         aria-label={title}
         tabIndex={-1}
-        // While a text box in the panel has focus, a tap elsewhere in it (an
-        // option, Cancel, Submit) must not move focus on press: the phone
-        // keyboard would close and the panel resize before the click, so the
-        // tap misses its target. A tapped option label still focuses its radio
-        // once the click lands, so the keyboard closes after the choice.
-        // Touch and pen only, judged per press (a hybrid laptop has both): a
-        // mouse keeps text selection and radio arrow keys.
-        onPointerDown={(event) => { pressPointerRef.current = event.pointerType; }}
-        onMouseDown={(event) => {
-          const target = event.target as Element;
-          const pointer = pressPointerRef.current;
-          if (pointer && pointer !== "mouse" && document.activeElement?.matches(TEXT_ENTRY) && event.currentTarget.contains(document.activeElement) && !target.closest(TEXT_ENTRY)) {
-            event.preventDefault();
-          }
-        }}
+        // Keeps the phone keyboard up while a text box of this panel has focus.
+        {...pressGuard}
         className={attached ? undefined : "animate-scale-in"}
         style={{
           width: attached ? "100%" : "min(560px, 100%)",

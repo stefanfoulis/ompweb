@@ -238,6 +238,98 @@ test("without a visible-area API the panel keeps its CSS cap", () => {
   assert.deepEqual(responses, [{ answers: [{ id: "color", selectedOptions: [], customInput: "Teal" }] }]);
 });
 
+test("on touch, focusing an option or button keeps the panel's height", () => {
+  const restoreMedia = stubMedia({ coarse: true });
+  const restore = stubVisualViewport(Math.round(window.innerHeight * 0.5));
+  try {
+    renderAttached();
+    const panel = screen.getByRole("dialog");
+    // No keyboard comes up for them, and a resize under the finger made the
+    // tap that focused them miss.
+    for (const control of [screen.getByRole("radio", { name: "Red" }), screen.getByRole("button", { name: "Cancel" })]) {
+      fireEvent.focus(control);
+      assert.equal(panel.style.maxHeight, "min(480px, 65dvh)");
+    }
+  } finally {
+    restore();
+    restoreMedia();
+  }
+});
+
+// ---- #252 / #255: the keyboard stays up until the choice is made --------------
+
+/** A press as the browser sends it: pointerdown, then the compat mousedown.
+ * Returns whether mousedown's default (moving focus) still runs. */
+function press(target, pointerType) {
+  fireEvent.pointerDown(target, { pointerType });
+  return fireEvent.mouseDown(target);
+}
+
+test("on touch, while Other is being typed, a press elsewhere in the panel keeps focus there", async () => {
+  // A phone: the panel leaves focus alone until tapped (#235).
+  const restore = stubMedia({ coarse: true });
+  const composer = document.body.appendChild(document.createElement("textarea"));
+  try {
+    renderAttached();
+    await settleFocusFrame();
+    const other = otherField();
+    const red = screen.getByRole("radio", { name: "Red" });
+    const targets = [red, red.closest("label"), screen.getByRole("button", { name: "Cancel" }), screen.getByRole("button", { name: "Chat about this" })];
+    // No text box of the panel focused: no keyboard of ours to protect.
+    for (const target of targets) assert.equal(press(target, "touch"), true);
+    act(() => composer.focus());
+    for (const target of targets) assert.equal(press(target, "touch"), true, "a field outside the panel is not ours to keep");
+
+    act(() => other.focus());
+    // A focus change on press closes the phone keyboard and resizes the panel
+    // before the click, so the click misses the option or button it aimed at.
+    for (const pointerType of ["touch", "pen"]) {
+      for (const target of targets) assert.equal(press(target, pointerType), false, `${target.textContent} must not take focus (${pointerType})`);
+    }
+    assert.equal(press(other, "touch"), true, "the text box itself still takes the press");
+  } finally {
+    composer.remove();
+    restore();
+  }
+});
+
+test("a mouse press in the panel moves focus as usual, even on a touch-first device", () => {
+  // The pointer media query describes the primary pointer only; a hybrid
+  // device's mouse must keep text selection and the caret.
+  const restore = stubMedia({ coarse: true });
+  try {
+    renderAttached();
+    act(() => otherField().focus());
+    assert.equal(press(screen.getByText("Red"), "mouse"), true);
+  } finally {
+    restore();
+  }
+});
+
+test("choosing an option takes focus from Other, so later typing cannot pick Other again", () => {
+  renderAttached();
+  const other = otherField();
+  const red = screen.getByRole("radio", { name: "Red" });
+  act(() => other.focus());
+  // A touch press on the option itself keeps focus in Other; the choice must
+  // move it, to the panel the arrow-key cursor lives on.
+  assert.equal(press(red, "touch"), false);
+  fireEvent.click(red);
+  // Compare identities: a failing element diff walks the whole jsdom graph.
+  assert.ok(document.activeElement === screen.getByRole("dialog"), "the panel has focus");
+});
+
+test("responding releases the Other field at once, so the keyboard does not wait for the server", () => {
+  const { responses } = renderAttached();
+  const other = otherField();
+  act(() => other.focus());
+  fireEvent.change(other, { target: { value: "Teal" } });
+  // The panel stays mounted until omp acknowledges the response (plus a hand-off delay).
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  assert.deepEqual(responses, [{ cancelled: true }]);
+  assert.ok(document.activeElement !== other, "the Other field must not keep focus");
+});
+
 test("the footer carries the touch-target class and honours the accessible preference", () => {
   localStorage.setItem("omp-touch-targets", "accessible");
   try {
