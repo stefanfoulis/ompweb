@@ -11,7 +11,7 @@ import { isReservedLaunchArg, loadProjectRegistry } from "../project-registry";
 import { invalidateSessionEntriesCache, invalidateSessionListCache, invalidateSessionListMeta } from "../session-reader";
 import { PRESET_FULL } from "../tool-presets";
 import type { ProjectLaunchConfig } from "../types";
-import type { Host } from "./host";
+import type { Host, SpawnRequest } from "./host";
 import { HostOpError } from "./link-protocol";
 import { sessionOps } from "./session-ops";
 
@@ -42,9 +42,13 @@ export function mapPresetToolNames(toolNames: string[]): string[] {
 const FULL_PRESET_KEY = [...PRESET_FULL].map((n) => n.toLowerCase()).sort().join(",");
 
 /** Extra CLI args for spawning `omp --mode rpc-ui` for a session. */
-export function buildSessionSpawnArgs(sessionFile: string, toolNames?: string[], advisor = false, launchConfig?: ProjectLaunchConfig, modelOverride?: string): string[] {
+export function buildSessionSpawnArgs(sessionFile: string, toolNames?: string[], advisor = false, launchConfig?: ProjectLaunchConfig, modelOverride?: string, fork?: SpawnRequest["fork"]): string[] {
   const args: string[] = [];
-  if (sessionFile) {
+  if (fork) {
+    // `--fork` opens a copy, so this child never touches the source file and
+    // the session's own process (possibly mid-turn) is left alone.
+    args.push("--fork", fork.sourceFile, "--fork-at", fork.cutEntryId);
+  } else if (sessionFile) {
     // An absolute path (or anything containing "/") resolves deterministically:
     // omp's createSessionManager opens it directly via SessionManager.open
     // without any interactive resume/fork prompts (main.ts resume handling).
@@ -154,7 +158,7 @@ export const localHost: Omit<Host, "workspaceOps" | "supportsWorkspaceOp"> = {
       // Re-read per spawn so a respawn picks up environment values the user
       // added in Settings after the session was created (#104).
       env: getAgentEnvOverrides(),
-      extraArgs: [...buildSessionSpawnArgs(request.sessionFile, request.toolNames, request.advisor, launchConfig, request.spawnModel), "--extension", SESSION_EDIT_EXTENSION_PATH],
+      extraArgs: [...buildSessionSpawnArgs(request.sessionFile, request.toolNames, request.advisor, launchConfig, request.spawnModel, request.fork), "--extension", SESSION_EDIT_EXTENSION_PATH],
     });
     return {
       transport,

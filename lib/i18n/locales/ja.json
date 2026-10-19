@@ -711,6 +711,8 @@
   "errors.file_not_found": "ファイルが見つかりません",
   "errors.file_path_required": "ファイルパスが必要です",
   "errors.file_too_large_preview": "ファイルが大きすぎてプレビューできません（256KB 超）",
+  "errors.fork_at_unsupported": "この omp は単一のメッセージからフォークできません。セッションの途中からフォークするには oh-my-pi を更新してください。",
+  "errors.fork_entry_required": "フォーク元のメッセージが必要です",
   "errors.generic": "リクエストに失敗しました",
   "errors.git_not_found": "git を実行できません。インストールされていますか？",
   "errors.host_restart_required": "ファイルを添付するには、このマシンの ompweb ホストサービスを再起動してください",

@@ -18,6 +18,13 @@ export interface SpawnRequest {
   advisor: boolean;
   /** `provider/modelId` bound at spawn (--model); resume only. */
   spawnModel?: string;
+  /**
+   * Spawn on a *copy* of another session on this host (`--fork <sourceFile>
+   * --fork-at <cutEntryId>`) instead of resuming `sessionFile`, which must be
+   * "" then: omp names the fork's file itself. The source file keeps its own
+   * (possibly mid-turn) process, which is why a fork works during a run.
+   */
+  fork?: { sourceFile: string; cutEntryId: string };
 }
 
 export interface SpawnResult {

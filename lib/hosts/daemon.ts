@@ -94,8 +94,11 @@ export function runHostDaemon(options: DaemonOptions): { stop(): Promise<void>; 
         || !(launch.recordedCwd === null || launch.recordedCwd === undefined || typeof launch.recordedCwd === "string")
         || typeof launch.sessionFile !== "string" || typeof launch.advisor !== "boolean"
         || !(launch.toolNames === undefined || Array.isArray(launch.toolNames) && launch.toolNames.every(name => typeof name === "string"))
-        || !(launch.spawnModel === undefined || typeof launch.spawnModel === "string")) throw new HostOpError(400, "invalid_request", "Invalid spawn request");
-      return { ...launch, recordedCwd: launch.recordedCwd ?? null, sessionFile: launch.sessionFile ? sessionsPath(launch.sessionFile) : "" };
+        || !(launch.spawnModel === undefined || typeof launch.spawnModel === "string")
+        || !(launch.fork === undefined || isRecord(launch.fork) && typeof launch.fork.sourceFile === "string" && typeof launch.fork.cutEntryId === "string" && !!launch.fork.cutEntryId)) throw new HostOpError(400, "invalid_request", "Invalid spawn request");
+      // The fork copies a session file of this host, so it is confined like any other.
+      const fork = isRecord(launch.fork) ? { sourceFile: sessionsPath(launch.fork.sourceFile), cutEntryId: launch.fork.cutEntryId as string } : undefined;
+      return { ...launch, recordedCwd: launch.recordedCwd ?? null, sessionFile: launch.sessionFile ? sessionsPath(launch.sessionFile) : "", fork };
     },
     autoApproveExtension: () => localHost.autoApproveExtension(), log,
     runningChanged: () => { try { resume.recordRunning(channels.running()); } catch (error) { log("could not save interrupted sessions: " + reason(error)); } },

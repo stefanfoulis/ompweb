@@ -3742,25 +3742,28 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [addNotice, catchUp, connectEvents, isNew, onSessionMoved, opts.chatInputRef, reloadActiveSessionHistory]);
 
-  // editPrompt: omp's `branch` drops the chosen user prompt from the fork and
-  // returns its text — put it in the fork's composer (edit-and-resend).
-  const handleFork = useCallback(async (entryId: string, editPrompt: boolean) => {
-    if (bashRunningRef.current || agentRunningRef.current || forkInFlightRef.current || editInFlightRef.current) return;
+  // `prefill` is the text of the prompt the fork cuts away: the fork keeps the
+  // history before it and the composer offers the prompt for editing.
+  // No gate on the running agent — the fork is a separate omp process on a copy
+  // of the session file, so this session's turn keeps going untouched. An Edit
+  // in progress is still waited out: it is rewriting the history being copied.
+  const handleFork = useCallback(async (entryId: string, prefill?: string) => {
+    if (forkInFlightRef.current || editInFlightRef.current) return;
     const sid = sessionIdRef.current;
     if (!sid) return;
     forkInFlightRef.current = true;
     setForkingEntryId(entryId);
     try {
-      const result = await sendAgentCommand<{ cancelled?: boolean; newSessionId?: string; text?: string }>(sid, {
+      const result = await sendAgentCommand<{ newSessionId?: string }>(sid, {
         type: "fork",
         entryId,
       });
-      const { cancelled, newSessionId, text } = result ?? {};
-      if (!cancelled && newSessionId) {
-        if (editPrompt && text) setDraft(newSessionId, { value: text, images: [], files: [] });
-        // The forked child keeps its spawn flags: carry the advisor choice to
-        // the new id, or the toggle flips off on switch and the next prompt
-        // respawns the fork without --advisor.
+      const newSessionId = result?.newSessionId;
+      if (newSessionId) {
+        if (prefill) setDraft(newSessionId, { value: prefill, images: [], files: [] });
+        // The fork is spawned with this session's advisor flag: carry the
+        // choice to the new id, or the toggle flips off on switch and the next
+        // prompt respawns the fork without --advisor.
         if (advisorEnabled) {
           setSessionAdvisorSpawn(newSessionId, true);
           try {
@@ -3772,12 +3775,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         onSessionForked?.(newSessionId);
       }
     } catch (e) {
-      console.error("Fork failed:", e);
+      // A fork that cannot start (unknown entry, an omp without --fork-at)
+      // exits before its ready frame; the route forwards that message.
+      addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
     } finally {
       forkInFlightRef.current = false;
       setForkingEntryId(null);
     }
-  }, [advisorEnabled, onSessionForked]);
+  }, [addNotice, advisorEnabled, onSessionForked]);
 
   const handleLeafChange = useCallback(async (leafId: string | null) => {
     if (bashRunningRef.current || agentRunningRef.current || editInFlightRef.current) return;

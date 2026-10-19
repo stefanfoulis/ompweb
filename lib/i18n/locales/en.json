@@ -728,6 +728,8 @@
   "errors.file_not_found": "File not found",
   "errors.file_path_required": "A file path is required",
   "errors.file_too_large_preview": "File too large for preview (over 256KB)",
+  "errors.fork_at_unsupported": "This omp cannot fork from a single message. Update oh-my-pi to fork from the middle of a session.",
+  "errors.fork_entry_required": "A message to fork from is required",
   "errors.generic": "Request failed",
   "errors.git_not_found": "Could not run git — is it installed?",
   "errors.host_restart_required": "Restart the ompweb host service on this machine to attach files",

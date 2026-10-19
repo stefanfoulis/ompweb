@@ -153,6 +153,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 - On phones and narrow windows, the top bar's tools menu is only as wide as its buttons instead of spanning the screen, and its **System** button opens the system prompt again. The prompt panel used to open inside the menu's sideways-scrolling strip, which clipped it out of view.
 - **Search looks inside sessions and ranks by relevance.** The workspace search now also matches the text of your messages and the assistant's replies, not only titles. Each word is matched on its own, in any order and with small typos tolerated; results matching your word order, and matches in titles, rank first. Put text in "quotes" to require that exact phrase. Title matches show at once; transcript matches stream in while a spinner shows the search is running, and **Stop** ends it, keeping the results found so far.
 
+### Sessions
+
+- **Fork from any message, even while the agent is working.** The **Fork a new session from this point** button no longer waits for the run to finish: omp-web starts a second `omp` on a copy of the conversation (`--fork … --fork-at …`), so the running session keeps streaming in its own file and the fork opens right away. Forking an agent reply keeps that reply; forking one of your prompts keeps everything before it and puts the prompt back in the new session's message box, ready to edit and send again. Needs an `omp` that supports `--fork-at`; an older one reports that it cannot fork from a single message and nothing is opened.
+
 ### Sidebar
 
 - **Recently completed sessions stay in the running filter.** A session that just finished no longer vanishes from the running filter at once; it remains visible as recently completed. (#267)

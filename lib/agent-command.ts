@@ -1,5 +1,5 @@
 import { apiErrorResponse, hostOfflineResponse, resolveSessionHostOr404 } from "@/lib/api-utils";
-import { startRpcSession, getRpcSession, getRpcSessionKeys, WebRpcError, type AgentSessionWrapper } from "@/lib/rpc-manager";
+import { startRpcSession, forkRpcSessionAt, getRpcSession, getRpcSessionKeys, WebRpcError, type AgentSessionWrapper } from "@/lib/rpc-manager";
 import { sessionSpawnTarget } from "@/lib/hosts/session-index";
 import { RpcCommandError } from "@/lib/omp/rpc-process";
 import { RequestBodyTooLargeError } from "@/lib/bounded-form-data";
@@ -98,6 +98,27 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
         return result;
       });
     };
+
+    // Forking never addresses the session's own child: omp copies the history
+    // up to the cut into a new file on the session's host and a second process
+    // owns it, so a fork can be taken while the agent is mid-turn.
+    if (type === "fork") {
+      if (typeof command.entryId !== "string" || !command.entryId) {
+        return Response.json({ error: "entryId is required", code: "fork_entry_required" }, { status: 400 });
+      }
+      const source = await resolveSessionHostOr404(id);
+      if ("response" in source) return source.response;
+      const sourceOffline = hostOfflineResponse(source.host);
+      if (sourceOffline) return sourceOffline;
+      const sourceTarget = await sessionSpawnTarget(id, source.host);
+      if (!sourceTarget) return Response.json({ error: "Session not found", code: "session_not_found" }, { status: 404 });
+      const forked = await forkRpcSessionAt(sourceTarget.sessionFile, command.entryId, sourceTarget.cwd, {
+        advisor,
+        recordedCwd: sourceTarget.recordedCwd,
+        host: source.host,
+      });
+      return Response.json({ success: true, data: forked });
+    }
 
     // Fast path: already-running session. --advisor is a spawn-time flag with
     // no runtime RPC, so a toggle that now differs from the live child's spawn

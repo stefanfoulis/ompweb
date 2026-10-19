@@ -33,7 +33,7 @@ import type {
   SessionStatsInfo,
   WebSessionState,
 } from "./pi-types";
-import type { AgentMessage, CrossSessionHostToolCall, CrossSessionHostToolEvent, ExitedRpcSession, ExtensionWidgetItem } from "./types";
+import type { AgentMessage, CrossSessionHostToolCall, CrossSessionHostToolEvent, CustomMessage, ExitedRpcSession, ExtensionWidgetItem, SessionContext } from "./types";
 import { isLinkUp, type Host, type HostStatus, type SpawnRequest, type SpawnResult } from "./hosts/host";
 import { freezeHostLinks, getHost, hostOwnsLifecycle, isNotifier, lastUplinkAt, listHosts, orphanExit } from "./hosts/hub";
 import { HISTORY_MUTATING_COMMANDS, HostOpError, PEER_MESSAGE_FRAME } from "./hosts/link-protocol";
@@ -204,6 +204,7 @@ const UNSUPPORTED_COMMANDS: Record<string, string> = {
   set_tools: "Changing tools on a running session is not supported over the omp RPC protocol; tool presets apply to new sessions",
   extension_ui_input: "Extension custom UI is not supported over the omp RPC protocol",
 };
+
 
 function toImageContents(value: unknown): Array<{ type: "image"; data: string; mimeType: string }> | undefined {
   const images = value as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
@@ -2722,24 +2723,6 @@ export class AgentSessionWrapper {
 
       case "edit_message":
         return this.editMessage(command.entryId);
-
-      case "fork": {
-        // omp's `branch` is pi-web's fork: it creates a branched session file
-        // and switches this live process onto it (entryId must be a user
-        // message entry, matching the web UI's fork buttons).
-        if (this.bashRunning) {
-          throw new Error("Cannot fork while a shell command is running");
-        }
-        const result = await this.proc.sendCommand<{ text: string; cancelled: boolean }>({
-          type: "branch",
-          entryId: command.entryId as string,
-        });
-        if (result.cancelled) return { cancelled: true };
-        const newSessionId = await this.refreshIdentityAfterSessionChange();
-        // `text` is the branched prompt omp hands back for edit-and-resend.
-        return { cancelled: false, newSessionId, text: result.text };
-      }
-
       case "new_session":
       case "switch_session": {
         const result = await this.proc.sendCommand<{ cancelled: boolean }>(command as { type: string });
@@ -3308,6 +3291,8 @@ async function resumeSession({ id, advisor, hostId }: InterruptibleSession): Pro
  * For new sessions (sessionFile === ""), omp generates its own id.
  * Pass toolNames to pre-configure the builtin toolset of a NEW session
  * (empty array = all tools disabled); ignored when resuming.
+ * Pass `fork` to spawn a child on a *copy* of another session instead
+ * (sessionFile must then be "", since omp names the new file itself).
  */
 declare global {
   var __ompAgentToolGuard: AgentToolGuard | undefined;
@@ -3470,10 +3455,13 @@ export async function startRpcSession(
   spawnModel?: string,
   host: Host = getHost(LOCAL_HOST_ID),
   preparingCommand = false,
+  /** Spawn on a copy of another session on `host` instead of resuming one;
+   *  `sessionFile` must be "" then, since omp names the fork's file itself. */
+  fork?: SpawnRequest["fork"],
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
   const registry = getRegistry();
   const locks = getLocks();
-  const launch: SpawnRequest = { cwd, recordedCwd: recordedCwd ?? null, sessionFile, toolNames, advisor: advisor === true, spawnModel };
+  const launch: SpawnRequest = { cwd, recordedCwd: recordedCwd ?? null, sessionFile, toolNames, advisor: advisor === true, spawnModel, fork };
   let replacement: SpawnResult | undefined;
 
   // A child of this session the host still ran from before a restart of this
@@ -3567,8 +3555,9 @@ export async function startRpcSession(
       // first prompt into an old .jsonl. The child's reported session file
       // existing on disk is the resume signal — a genuinely fresh child reports
       // a path it has not created yet (session files are written lazily on the
-      // first message), so this never fires for a real new session.
-      if (!sessionFile && created.sessionFile && await host.sessionFileExists(created.sessionFile)) {
+      // first message), so this never fires for a real new session. A fork is
+      // the deliberate exception: its file holds the copied history already.
+      if (!sessionFile && !fork && created.sessionFile && await host.sessionFileExists(created.sessionFile)) {
         await created.send({ type: "new_session" });
       }
       // Register server agent tools (#275) at startup when the gate is on,
@@ -3702,4 +3691,110 @@ export async function adoptRpcSession({ host, transport, sessionId, cwd, replay,
   // A start for this session meanwhile joins the adoption instead of spawning a second child beside it.
   locks.set(sessionId, adopting);
   return (await adopting).session;
+}
+
+/**
+ * Whether a forked session really honoured the requested cut.
+ *
+ * An omp that predates `--fork-at` ignores the flag and copies the whole
+ * transcript, which would silently hand the user a full clone instead of the
+ * fork they asked for. A full clone keeps the conversation going past the cut,
+ * so only that is rejected. Everything else a fork can legitimately look like
+ * passes:
+ * - the recorded tool results of the cut's tool-call batch follow it (omp
+ *   extends the cut through them);
+ * - the cut entry is absent altogether: omp ends the fork *before* an assistant
+ *   message whose tool calls have no recorded results yet, which is what a
+ *   fork taken mid-tool-call looks like;
+ * - the fork's own omp appends an eval-state snapshot after the transcript at
+ *   startup, when the forked session used eval.
+ */
+export function forkHonouredCut(messages: readonly AgentMessage[], entryIds: readonly string[], cutEntryId: string): boolean {
+  const cut = entryIds.indexOf(cutEntryId);
+  if (cut < 0) return true;
+  return messages.slice(cut + 1).every(
+    (message) => message.role === "toolResult" || (message.role === "custom" && (message as CustomMessage).customType === "eval-state-context"),
+  );
+}
+
+/** omp refuses an impossible fork before its `ready` frame, so the failure
+ * arrives as RpcProcess's "omp exited (code …): <stderr>". The user needs
+ * omp's own sentence (`Entry "…" is not a message in session "…"`), not the
+ * exit bookkeeping around it. The code carries no dictionary entry: this text
+ * is the message worth showing. */
+function forkStartupError(error: unknown): WebRpcError {
+  const raw = error instanceof Error ? error.message : String(error);
+  const reported = raw.split("): ").slice(1).join("): ").trim() || raw;
+  return new WebRpcError(reported.replace(/^Error:\s*/, ""), "fork_failed");
+}
+
+/** The fork's own transcript, read back from the host that wrote it. */
+async function readForkedContext(host: Host, sessionId: string): Promise<SessionContext | null> {
+  const result = await host.sessionOps.readContext(sessionId, undefined, {
+    deferThinking: true,
+    deferMedia: true,
+    // The cut is checked against the file, not against one branch of it.
+    includePreCompaction: true,
+    boundary: false,
+    sync: null,
+  });
+  if (!result.ok) return null;
+  const value = result.value as { context?: SessionContext } | null;
+  return value?.context ?? null;
+}
+
+/**
+ * Fork a session at one entry into a new session of its own, by spawning a
+ * second omp (`--fork <file> --fork-at <entry>`) on a copy of the history.
+ *
+ * Runs on the host that holds `sourceFile`. The source session is never
+ * addressed: its own process may be mid-turn and keeps streaming into its own
+ * file. The new child is registered like any other session, so the UI can
+ * switch to it immediately.
+ */
+export async function forkRpcSessionAt(
+  sourceFile: string,
+  cutEntryId: string,
+  cwd: string,
+  options: { advisor?: boolean; recordedCwd?: string | null; host?: Host } = {},
+): Promise<{ newSessionId: string; sessionFile: string }> {
+  const host = options.host ?? getHost(LOCAL_HOST_ID);
+  // A fork has no id until omp names it, and startRpcSession coalesces
+  // concurrent callers that share a key: a unique one keeps two forks apart.
+  const startKey = `__fork__${randomUUID()}`;
+  let started;
+  try {
+    started = await startRpcSession(
+      startKey,
+      "",
+      cwd,
+      undefined,
+      options.advisor === true,
+      options.recordedCwd,
+      undefined,
+      host,
+      false,
+      { sourceFile, cutEntryId },
+    );
+  } catch (error) {
+    throw forkStartupError(error);
+  }
+  const { session, realSessionId } = started;
+
+  const sessionFile = session.sessionFile;
+  host.invalidateSessionLists(sessionFile || undefined);
+  invalidateHostSessionList(host.id);
+  const context = sessionFile ? await readForkedContext(host, realSessionId) : null;
+  if (!context || !forkHonouredCut(context.messages, context.entryIds, cutEntryId)) {
+    // Nothing else is cleaned up: the stray file is a real session the user
+    // can still open, and deleting a file omp just wrote would race its child.
+    await session.destroyAndWait();
+    throw new WebRpcError(
+      "This omp build cannot fork at a single message (--fork-at). Update oh-my-pi to fork from the middle of a session.",
+      "fork_at_unsupported",
+    );
+  }
+
+  notifyRunningChange({ refreshSessionList: true });
+  return { newSessionId: realSessionId, sessionFile };
 }

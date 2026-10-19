@@ -946,7 +946,7 @@ test("interrupted message with partial content renders content before interrupte
 
 const FORK_LABEL = "Fork a new session from this point";
 
-test("agent replies offer copy and fork at their resolved target", async (t) => {
+test("agent replies offer copy and fork at their own entry", async (t) => {
   const originalMatchMedia = window.matchMedia;
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
   t.after(() => {
@@ -957,11 +957,10 @@ test("agent replies offer copy and fork at their resolved target", async (t) => 
   const props = {
     message: { role: "assistant", model: "test", provider: "test", content: [{ type: "text", text: "Done." }] },
     entryId: "assistant-1",
-    // Resolved by resolveForkTargets: the newest reply falls back to its own
-    // turn's prompt with edit-and-resend.
-    forkEntryId: "user-1",
-    forkEditsPrompt: true,
-    onFork: (entryId, editPrompt) => forked.push([entryId, editPrompt]),
+    // Resolved by resolveForkTargets: a reply is kept by the fork, so the cut
+    // is the reply itself and nothing goes back into the composer.
+    forkEntryId: "assistant-1",
+    onFork: (entryId, prefill) => forked.push([entryId, prefill]),
   };
   const view = render(React.createElement(MessageView, props));
   assert.ok(view.getByRole("button", { name: "Copy message" }));
@@ -971,12 +970,12 @@ test("agent replies offer copy and fork at their resolved target", async (t) => 
   assert.deepEqual(forked, []);
   await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Fork" })); });
-  assert.deepEqual(forked, [["user-1", true]]);
+  assert.deepEqual(forked, [["assistant-1", undefined]]);
 
   await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
   view.rerender(React.createElement(MessageView, { ...props, forkDisabled: true }));
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Fork" })); });
-  assert.deepEqual(forked, [["user-1", true]], "a row blocked while the dialog was open does not fork");
+  assert.deepEqual(forked, [["assistant-1", undefined]], "a row blocked while the dialog was open does not fork");
   view.unmount();
 });
 
@@ -1009,7 +1008,7 @@ test("a streaming reply and an unforkable row keep no fork action", () => {
   assert.doesNotMatch(noTarget, new RegExp(`aria-label="${FORK_LABEL}"`));
 });
 
-test("user messages fork at their own entry and edit the prompt", async (t) => {
+test("user messages fork at the entry before them and hand their prompt back", async (t) => {
   const originalMatchMedia = window.matchMedia;
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
   t.after(() => {
@@ -1020,14 +1019,21 @@ test("user messages fork at their own entry and edit the prompt", async (t) => {
   const view = render(React.createElement(MessageView, {
     message: { role: "user", content: "Keep this forkable." },
     entryId: "user-7",
-    forkEntryId: "user-7",
-    onFork: (entryId, editPrompt) => forked.push([entryId, editPrompt]),
+    forkEntryId: "assistant-6",
+    forkPrefill: "Keep this forkable.",
+    onFork: (entryId, prefill) => forked.push([entryId, prefill]),
   }));
   await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
   assert.deepEqual(forked, []);
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Fork" })); });
-  assert.deepEqual(forked, [["user-7", true]]);
+  assert.deepEqual(forked, [["assistant-6", "Keep this forkable."]]);
   view.unmount();
+
+  // The first prompt of a session has no entry to cut at: no fork action.
+  const unforkable = renderToStaticMarkup(React.createElement(MessageView, {
+    message: { role: "user", content: "First prompt." }, entryId: "user-0", onFork: () => {},
+  }));
+  assert.doesNotMatch(unforkable, new RegExp(`aria-label="${FORK_LABEL}"`));
 });
 
 test("user-message Edit only runs after confirmation, and not once blocked", async (t) => {
@@ -1072,6 +1078,8 @@ test("an open confirmation closes when the row starts showing another message", 
   const row = (entryId, content) => React.createElement(MessageView, {
     message: { role: "user", content },
     entryId,
+    // A prompt forks at the entry before it; each row carries its own cut.
+    forkEntryId: `before-${entryId}`,
     onEdit: async (id, text) => { calls.push(["edit", id, text]); return true; },
     onFork: (id) => calls.push(["fork", id]),
   });

@@ -711,6 +711,8 @@
   "errors.file_not_found": "未找到文件",
   "errors.file_path_required": "需要提供文件路径",
   "errors.file_too_large_preview": "文件过大，无法预览（超过 256KB）",
+  "errors.fork_at_unsupported": "此 omp 无法从单条消息分叉。请更新 oh-my-pi 以便从会话中间分叉。",
+  "errors.fork_entry_required": "需要提供用于分叉的消息",
   "errors.generic": "请求失败",
   "errors.git_not_found": "无法运行 git，是否已安装？",
   "errors.host_restart_required": "请重启本机的 ompweb 主机服务以附加文件",
