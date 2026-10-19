@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { listSessionsAllHosts } from "@/lib/hosts/session-index";
+import { listPinnedSessionIds } from "@/lib/pin-store";
 import { getRunningRpcSessions } from "@/lib/rpc-manager";
 
 // The session list mixes on-disk sessions with the live runningSessionIds set,
@@ -14,7 +15,15 @@ const SESSION_LIST_HEADERS = {
 
 export async function GET(req: Request) {
   try {
-    const sessions = await listSessionsAllHosts();
+    const listed = await listSessionsAllHosts();
+    // Pins are server-side state, so they ride along in the list body: the
+    // ETag below then changes the moment a pin does, and every client picks
+    // the new state up on its normal refresh. Only pinned rows get a copy —
+    // the rest stay the cached list's own objects.
+    const pinned = listPinnedSessionIds(new Set(listed.map((session) => session.id)));
+    const sessions = pinned.size === 0
+      ? listed
+      : listed.map((session) => (pinned.has(session.id) ? { ...session, pinned: true } : session));
     const runningSessions = getRunningRpcSessions();
     const runningSessionIds = runningSessions.map((s) => s.id);
     const body = { sessions, runningSessionIds, runningSessions };

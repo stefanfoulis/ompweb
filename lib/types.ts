@@ -471,6 +471,9 @@ export interface SessionInfo {
   /** Host the session's file lives on ("local" for this machine). Set by the
    *  all-hosts session list; a host's own list leaves it out. */
   hostId?: string;
+  /** Set by /api/sessions when the session is pinned in the server-side pin
+   *  store (lib/pin-store.ts); absent means not pinned. */
+  pinned?: boolean;
 }
 
 /** Metadata for a gzip-compressed session in OMP's archive tree. */

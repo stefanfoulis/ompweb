@@ -4,6 +4,7 @@ import { invalidateHostSessionList } from "@/lib/hosts/session-index";
 import { invalidateSessionCaches } from "@/lib/session-reader";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
 import { clearExitedRpcSession, getLiveRpcSessionIds, getRpcSession, WebRpcError } from "@/lib/rpc-manager";
+import { setSessionPinned } from "@/lib/pin-store";
 
 /** Stable, client-safe error body for catch-all handlers: details go to the
  *  server log only, never to the browser. */
@@ -136,6 +137,7 @@ export async function DELETE(
     if (!result.ok) return opErrorResponse(result);
     invalidateHostSessionList(resolved.host.id);
     clearExitedRpcSession(id);
+    setSessionPinned(id, false); // the session is gone; so is any pin on it
     return Response.json({ ok: true, ...result.value });
   } catch (error) {
     return sessionsErrorResponse(error);
