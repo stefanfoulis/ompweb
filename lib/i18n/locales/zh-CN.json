@@ -449,6 +449,8 @@
   "chatInput.modelsLabel": "模型",
   "chatInput.providersLabel": "提供商",
   "chatInput.addProviders": "添加提供商",
+  "chatInput.modelsLatest": "最新",
+  "chatInput.modelsAllVersions": "所有版本",
   "chatInput.changeReasoning": "更改思考等级",
   "chatInput.changeReasoningTitle": "更改思考等级：{level}",
   "chatInput.reasoningLabel": "思考",

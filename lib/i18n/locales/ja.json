@@ -449,6 +449,8 @@
   "chatInput.modelsLabel": "モデル",
   "chatInput.providersLabel": "プロバイダー",
   "chatInput.addProviders": "プロバイダーを追加",
+  "chatInput.modelsLatest": "最新",
+  "chatInput.modelsAllVersions": "すべてのバージョン",
   "chatInput.changeReasoning": "思考レベルを変更",
   "chatInput.changeReasoningTitle": "思考レベルを変更: {level}",
   "chatInput.reasoningLabel": "思考",

@@ -465,6 +465,8 @@
   "chatInput.modelsLabel": "模型",
   "chatInput.providersLabel": "供應商",
   "chatInput.addProviders": "新增供應商",
+  "chatInput.modelsLatest": "最新",
+  "chatInput.modelsAllVersions": "所有版本",
   "chatInput.changeReasoning": "變更推論程度",
   "chatInput.changeReasoningTitle": "變更推論程度：{level}",
   "chatInput.reasoningLabel": "推論",
