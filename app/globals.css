@@ -2677,6 +2677,10 @@ span.token.table {
   text-transform: uppercase;
 }
 .picker-group-label + .picker-row { margin-top: 0; }
+.picker-section-divider {
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+}
 .picker-row {
   display: flex;
   align-items: center;
@@ -2699,6 +2703,10 @@ span.token.table {
   color: var(--text);
   background: var(--bg-hover);
   outline: none;
+}
+/* Dated re-publish of an already-listed version (see lib/model-families.ts `versionOf`); still selectable, just visually secondary among "All versions". */
+.picker-row[data-snapshot="true"] {
+  color: var(--text-dim);
 }
 .picker-row[data-active="true"] {
   color: var(--text);

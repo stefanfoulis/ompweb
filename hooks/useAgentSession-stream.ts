@@ -506,7 +506,7 @@ export interface AttachedImage {
 }
 
 export type SelectedModel = { provider: string; modelId: string };
-export type ModelEntry = { id: string; name: string; provider: string; supportsFastMode?: boolean; supportsSlowMode?: boolean; contextWindow?: number; maxTokens?: number };
+export type ModelEntry = { id: string; name: string; provider: string; supportsFastMode?: boolean; supportsSlowMode?: boolean; contextWindow?: number; maxTokens?: number; identity?: { class: string; family?: string; revision?: string }; costOutput?: number };
 export type ModelsResponse = {
   models: Record<string, string>;
   modelList?: ModelEntry[];

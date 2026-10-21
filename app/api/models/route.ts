@@ -86,7 +86,7 @@ async function loadModels(): Promise<ModelsData> {
   const nameMap = new Map<string, string>();
   const thinkingLevels: Record<string, string[]> = {};
   const modelList = available
-    .map((m) => ({ id: m.id, name: m.name, provider: m.provider, thinkingLevels: thinkingLevelsFor(m), supportsFastMode: supportsFastMode(m), supportsSlowMode: SLOW_MODE_PROVIDERS[m.provider] === true, contextWindow: m.contextWindow ?? undefined, maxTokens: m.maxTokens ?? undefined }))
+    .map((m) => ({ id: m.id, name: m.name, provider: m.provider, thinkingLevels: thinkingLevelsFor(m), supportsFastMode: supportsFastMode(m), supportsSlowMode: SLOW_MODE_PROVIDERS[m.provider] === true, contextWindow: m.contextWindow ?? undefined, maxTokens: m.maxTokens ?? undefined, identity: m.identity, costOutput: m.cost?.output }))
     .sort(compareModelEntries);
   const loginResponse = await runUtilityCommand<{ providers?: unknown }>(
     { type: "get_login_providers" },

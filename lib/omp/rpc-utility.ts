@@ -43,6 +43,8 @@ export interface OmpModel {
   contextWindow?: number | null;
   maxTokens?: number | null;
   cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+  /** Vendor lineage/family/revision classification (packages/catalog/src/compat/types.ts `ModelIdentity`). */
+  identity?: { class: string; family?: string; revision?: string };
 }
 
 /** Entry of the get_login_providers response (modes/rpc/rpc-types.ts). */

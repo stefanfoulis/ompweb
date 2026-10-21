@@ -192,7 +192,7 @@ interface Props {
   model?: { provider: string; modelId: string } | null;
   isAutoModelSelection?: boolean;
   modelNames?: Record<string, string>;
-  modelList?: { id: string; name: string; provider: string; supportsFastMode?: boolean }[];
+  modelList?: { id: string; name: string; provider: string; supportsFastMode?: boolean; identity?: { class: string; family?: string; revision?: string }; costOutput?: number }[];
   modelError?: string | null;
   modelsLoading?: boolean;
   onModelChange?: (provider: string, modelId: string) => void;
@@ -2156,7 +2156,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
   const modelOptions: ModelOption[] = React.useMemo(() => {
     if (modelList && modelList.length > 0) {
-      return modelList.map((m) => ({ provider: m.provider, modelId: m.id, name: m.name }))
+      return modelList.map((m) => ({ provider: m.provider, modelId: m.id, name: m.name, identity: m.identity, costOutput: m.costOutput }))
         .filter((m) => visibleModelKeys === null || visibleModelKeys.has(`${m.provider}:${m.modelId}`))
         .sort((a, b) => compareModelOptions(modelCollator, a, b));
     }

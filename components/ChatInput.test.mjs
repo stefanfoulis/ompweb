@@ -341,6 +341,50 @@ test("model picker panel renders providers rail, models pane, and Add Providers"
   assert.match(html, />(Add Providers|chatInput\.addProviders)</);
 });
 
+test("model picker shows Latest/All versions sections without a search query, flat list with one", async () => {
+  const { ModelPickerPanel } = await import("./ChatInput-model-picker.tsx");
+  const options = [
+    { provider: "codex", modelId: "gpt-6-sol", name: "GPT-6 Sol", identity: { class: "openai", family: "gpt", revision: "6.0.0" }, costOutput: 10 },
+    { provider: "codex", modelId: "gpt-6.1-sol", name: "GPT-6.1 Sol", identity: { class: "openai", family: "gpt", revision: "6.1.0" }, costOutput: 10 },
+    { provider: "codex", modelId: "gpt-6-luna", name: "GPT-6 Luna", identity: { class: "openai", family: "gpt", revision: "6.0.0" }, costOutput: 0.5 },
+  ];
+  const baseProps = {
+    modelOptions: options,
+    currentModel: { provider: "codex", modelId: "gpt-6.1-sol" },
+    isMobile: false,
+    onSelectModel() {},
+    onOpenProviders() {},
+    onSearchQueryChange() {},
+  };
+
+  const noQueryHtml = renderToStaticMarkup(
+    React.createElement(ModelPickerPanel, {
+      ...baseProps,
+      filteredModelOptions: options,
+      modelSearchQuery: "",
+    }),
+  );
+  assert.match(noQueryHtml, /picker-section-divider/);
+  assert.match(noQueryHtml, />(Latest|chatInput\.modelsLatest)</);
+  assert.match(noQueryHtml, />(All versions|chatInput\.modelsAllVersions)</);
+  // The newer version of the same family represents it in Latest; both
+  // versions still show up once each under All versions.
+  assert.equal((noQueryHtml.match(/GPT-6\.1 Sol/g) ?? []).length, 2);
+  assert.match(noQueryHtml, /GPT-6 Sol</);
+
+  const filtered = options.filter((o) => o.modelId.includes("sol"));
+  const queryHtml = renderToStaticMarkup(
+    React.createElement(ModelPickerPanel, {
+      ...baseProps,
+      filteredModelOptions: filtered,
+      modelSearchQuery: "sol",
+    }),
+  );
+  assert.doesNotMatch(queryHtml, /picker-section-divider/);
+  assert.doesNotMatch(queryHtml, />(Latest|chatInput\.modelsLatest)</);
+  assert.doesNotMatch(queryHtml, />(All versions|chatInput\.modelsAllVersions)</);
+});
+
 
 test("exposes tool presets through the plus menu when a handler is provided", () => {
   const html = renderToStaticMarkup(
