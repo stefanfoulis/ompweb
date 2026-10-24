@@ -38,6 +38,18 @@ test("current means pinned, running or unread — nothing else", () => {
   assert.deepEqual(current.map((s) => s.id).sort(), ["pinned", "running", "unread"]);
 });
 
+test("pinned lists only pinned sessions — running and unread ones stay out unless pinned", () => {
+  const sessions = [
+    session("plain"),
+    session("pinned", { pinned: true }),
+    session("running"),
+    session("unread"),
+    session("pinned-running", { pinned: true }),
+  ];
+  const pinned = selectCurrentSessions(sessions, new Set(["running", "pinned-running"]), new Set(["unread"]), { pinnedOnly: true });
+  assert.deepEqual(pinned.map((s) => s.id), ["pinned-running", "pinned"]);
+});
+
 test("running sessions lead, then most recent activity first", () => {
   const sessions = [
     session("old-pin", { pinned: true, modified: "2026-01-01T09:00:00.000Z" }),
@@ -116,4 +128,19 @@ test("a registry alias replaces the folder name, and the empty state explains pi
     onSelectSession: () => {},
   }));
   assert.equal(filtered.container.textContent, "No matching sessions");
+});
+
+test("the pinned view's empty state explains pinning, not activity", () => {
+  const empty = render(React.createElement(CurrentSessionList, {
+    sessions: [],
+    selectedSessionId: null,
+    runningSessionIds: new Set(),
+    unreadSessionIds: new Set(),
+    exitedSessions: new Map(),
+    relativeTimeNow: 0,
+    pinnedOnly: true,
+    onSelectSession: () => {},
+  }));
+  assert.match(empty.container.textContent, /Sessions you pin show up here/);
+  assert.doesNotMatch(empty.container.textContent, /running/);
 });

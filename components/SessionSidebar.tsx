@@ -253,7 +253,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const sortButtonRef = useRef<HTMLButtonElement>(null);
   const closeSortMenu = useCallback(() => setSortMenuOpen(false), []);
   const pinsActive = projectSortMode !== "none";
-  // Current (flat: pinned + active) vs All (the workspace tree); per browser.
+  // Current (flat: pinned + active), Pinned (flat: pinned only) or All (the
+  // workspace tree); per browser.
   const [sidebarView, setSidebarView] = useSidebarView();
 
   // Once the SSE stream has delivered a frame it is the source of truth for
@@ -942,12 +943,13 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     return entries;
   }, [sortedProjects, sessionsByProject, runningOnly, trimmedSearchQuery, currentTranscriptSearch, runningSessionIds, effectiveRecentCompletedSet]);
 
-  // The Current view's flat list: the running-only filter and the tree's own
-  // ranked search (streamed transcript scores where the server has answered,
-  // local title scores otherwise), applied to the pinned/running/unread set.
+  // The flat views' list: the running-only filter and the tree's own ranked
+  // search (streamed transcript scores where the server has answered, local
+  // title scores otherwise), applied to the pinned/running/unread set, or to
+  // the pinned set alone in Pinned.
   const currentSessions = useMemo(() => {
-    if (sidebarView !== "current") return NO_SESSIONS;
-    let list = selectCurrentSessions(visibleSessions, runningSessionIds, unreadSessionIds);
+    if (sidebarView === "all") return NO_SESSIONS;
+    let list = selectCurrentSessions(visibleSessions, runningSessionIds, unreadSessionIds, { pinnedOnly: sidebarView === "pinned" });
     if (runningOnly) list = list.filter((s) => runningSessionIds.has(s.id));
     const query = compileSearchQuery(trimmedSearchQuery);
     if (!query) return list;
@@ -1615,7 +1617,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             onChange={(view) => {
               setSidebarView(view);
               // The sort orders the workspace tree; its menu must not outlive
-              // the switch to the flat Current list, which hides the button.
+              // the switch to a flat list, which hides the button.
               setSortMenuOpen(false);
             }}
           />
@@ -1635,7 +1637,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             <Search size={15} strokeWidth={1.9} aria-hidden="true" />
           </SidebarIconButton>
           {/* The sort orders workspaces, so it only applies to the tree in All;
-              Current is one flat list, ordered by activity (or by search rank). */}
+              Current and Pinned are flat lists, ordered by activity (or by search rank). */}
           {sidebarView === "all" && (
             <>
               <SidebarIconButton
@@ -1770,7 +1772,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
               <button className="load-retry-button" type="button" onClick={() => { loadSessions(false); void loadProjects(); }} style={{ minHeight: 32, padding: "4px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>{t("sessionSidebar.refresh")}</button>
             </div>
           )}
-          {!loading && !projectsError && !error && sidebarView === "current" && (
+          {!loading && !projectsError && !error && sidebarView !== "all" && (
             <CurrentSessionList
               sessions={currentSessions}
               selectedSessionId={selectedSessionId}
@@ -1783,6 +1785,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
               onRenamed={loadSessions}
               onSessionDeleted={handleSessionDeleted}
               filtersActive={filtersActive}
+              pinnedOnly={sidebarView === "pinned"}
             />
           )}
           {!loading && !projectsError && !error && sidebarView === "all" && sortedProjects.length === 0 && (

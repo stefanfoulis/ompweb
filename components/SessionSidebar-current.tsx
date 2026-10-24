@@ -8,8 +8,9 @@ import { projectLabel } from "./SessionSidebar-helpers";
 import { SessionItem } from "./SessionSidebar-rows";
 
 /**
- * The sidebar's "Current" view: one flat list of the sessions that matter
- * right now, as opposed to the "All" view's workspace tree.
+ * The sidebar's flat session lists, as opposed to the "All" view's workspace
+ * tree: "Current" for the sessions that matter right now, "Pinned" for the
+ * pinned ones alone.
  *
  * A session is current when it is pinned (server-side, shared by every
  * browser), running (which covers a turn waiting on a question — the turn is
@@ -18,7 +19,7 @@ import { SessionItem } from "./SessionSidebar-rows";
  * its own workspace.
  */
 
-export type SidebarView = "current" | "all";
+export type SidebarView = "current" | "pinned" | "all";
 
 const SIDEBAR_VIEW_STORAGE_KEY = "omp-web:sidebar-view";
 
@@ -34,7 +35,8 @@ function subscribeSidebarView(onChange: () => void): () => void {
 /** The stored view; "all" (the workspace tree) whenever nothing usable is stored. */
 function storedSidebarView(): SidebarView {
   try {
-    return window.localStorage.getItem(SIDEBAR_VIEW_STORAGE_KEY) === "current" ? "current" : "all";
+    const stored = window.localStorage.getItem(SIDEBAR_VIEW_STORAGE_KEY);
+    return stored === "current" || stored === "pinned" ? stored : "all";
   } catch {
     return "all";
   }
@@ -68,7 +70,8 @@ function selectSidebarView(view: SidebarView): void {
 }
 
 /**
- * The current sessions, most recent activity first. Running sessions lead:
+ * The sessions a flat view lists, most recent activity first: the pinned ones,
+ * plus, for "current", the running and unread ones. Running sessions lead:
  * their file's `modified` only catches up when omp flushes the turn, so
  * sorting on it alone would bury the session the user is watching.
  */
@@ -76,9 +79,11 @@ export function selectCurrentSessions(
   sessions: readonly SessionInfo[],
   runningSessionIds: ReadonlySet<string>,
   unreadSessionIds: ReadonlySet<string>,
+  { pinnedOnly = false }: { pinnedOnly?: boolean } = {},
 ): SessionInfo[] {
   const current = sessions.filter(
-    (session) => session.pinned === true || runningSessionIds.has(session.id) || unreadSessionIds.has(session.id),
+    (session) => session.pinned === true
+      || (!pinnedOnly && (runningSessionIds.has(session.id) || unreadSessionIds.has(session.id))),
   );
   return current.sort((a, b) => {
     const running = Number(runningSessionIds.has(b.id)) - Number(runningSessionIds.has(a.id));
@@ -87,12 +92,13 @@ export function selectCurrentSessions(
   });
 }
 
-/** The Current / All switch, in the sidebar's section header. */
+/** The Current / Pinned / All switch, in the sidebar's section header. */
 export function SidebarViewToggle({ view, onChange }: { view: SidebarView; onChange: (view: SidebarView) => void }) {
   const { t } = useI18n();
   return (
     <div role="group" aria-label={t("sessionSidebar.viewToggle")} style={{ display: "flex", alignItems: "center", gap: 2, minWidth: 0 }}>
       <ViewToggleButton label={t("sessionSidebar.viewCurrent")} active={view === "current"} onClick={() => onChange("current")} />
+      <ViewToggleButton label={t("sessionSidebar.viewPinned")} active={view === "pinned"} onClick={() => onChange("pinned")} />
       <ViewToggleButton label={t("sessionSidebar.viewAll")} active={view === "all"} onClick={() => onChange("all")} />
     </div>
   );
@@ -141,6 +147,8 @@ interface CurrentSessionListProps {
   onSessionDeleted?: (id: string) => void;
   /** True while a filter is on: the empty state then reads as "no matches". */
   filtersActive?: boolean;
+  /** Lists only pinned sessions: the empty state then explains pinning alone. */
+  pinnedOnly?: boolean;
 }
 
 export function CurrentSessionList({
@@ -155,12 +163,13 @@ export function CurrentSessionList({
   onRenamed,
   onSessionDeleted,
   filtersActive = false,
+  pinnedOnly = false,
 }: CurrentSessionListProps) {
   const { t } = useI18n();
   if (sessions.length === 0) {
     return (
       <div style={{ padding: "14px 4px", color: "var(--text-dim)", fontSize: 11.5, lineHeight: 1.5 }}>
-        {filtersActive ? t("sessionSidebar.noMatches") : t("sessionSidebar.currentEmpty")}
+        {filtersActive ? t("sessionSidebar.noMatches") : pinnedOnly ? t("sessionSidebar.pinnedEmpty") : t("sessionSidebar.currentEmpty")}
       </div>
     );
   }
