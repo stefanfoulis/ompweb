@@ -1282,7 +1282,7 @@
   "sessionSidebar.viewCurrent": "現在",
   "sessionSidebar.viewPinned": "ピン留め",
   "sessionSidebar.viewAll": "すべて",
-  "sessionSidebar.currentEmpty": "ピン留めしたセッションと、実行中または未読のまま終了したセッションがここに表示されます。「すべて」の ⋯ メニューからピン留めできます。",
+  "sessionSidebar.currentEmpty": "ピン留めしたセッションと、実行中、未読のまま終了した、または最近完了したセッションがここに表示されます。「すべて」の ⋯ メニューからピン留めできます。",
   "sessionSidebar.pinnedEmpty": "ピン留めしたセッションがここに表示されます。⋯ メニューの「セッションをピン留め」でピン留めできます。",
   "skillsConfig.addCustomSkill": "カスタムスキルを追加",
   "skillsConfig.addSkill": "スキルを追加",

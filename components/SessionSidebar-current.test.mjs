@@ -1,13 +1,16 @@
 import "../tests/setup-dom.mjs";
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
-import React from "react";
+import test, { afterEach, before } from "node:test";
+import React, { act } from "react";
 const { cleanup, render } = await import("@testing-library/react/pure.js");
 
 // The sidebar's Current view: one flat list of the sessions that matter right
-// now — pinned, running, or finished-but-unread — each naming its workspace.
+// now — pinned, running, finished-but-unread, or recently completed (the same
+// set upstream's "Show running sessions only" filter keeps in All) — each
+// naming its workspace.
 
 const { CurrentSessionList, selectCurrentSessions } = await import("@/components/SessionSidebar-current");
+const { SessionSidebar } = await import("./SessionSidebar.tsx");
 
 afterEach(() => cleanup());
 
@@ -27,26 +30,46 @@ function rows(container) {
   return Array.from(container.querySelectorAll(".session-item-row"));
 }
 
-test("current means pinned, running or unread — nothing else", () => {
+test("current means pinned, running, unread or recently completed — nothing else", () => {
   const sessions = [
     session("plain"),
     session("pinned", { pinned: true }),
     session("running"),
     session("unread"),
   ];
-  const current = selectCurrentSessions(sessions, new Set(["running"]), new Set(["unread"]));
+  const current = selectCurrentSessions(sessions, new Set(["running"]), new Set(["unread"]), new Set());
   assert.deepEqual(current.map((s) => s.id).sort(), ["pinned", "running", "unread"]);
 });
 
-test("pinned lists only pinned sessions — running and unread ones stay out unless pinned", () => {
+test("a recently-completed session not otherwise current appears; one outside the caller's limit does not", () => {
+  const sessions = [
+    session("plain"),
+    session("completed-in-limit"),
+    session("completed-outside-limit"),
+  ];
+  // SessionSidebar already trims its recently-completed set to the configured
+  // limit before passing it down — selectCurrentSessions trusts it as-is, so
+  // a session left out of the set (outside the limit) simply does not appear.
+  const current = selectCurrentSessions(sessions, new Set(), new Set(), new Set(["completed-in-limit"]));
+  assert.deepEqual(current.map((s) => s.id), ["completed-in-limit"]);
+});
+
+test("pinned lists only pinned sessions — running, unread and recently-completed ones stay out unless pinned", () => {
   const sessions = [
     session("plain"),
     session("pinned", { pinned: true }),
     session("running"),
     session("unread"),
     session("pinned-running", { pinned: true }),
+    session("recently-completed"),
   ];
-  const pinned = selectCurrentSessions(sessions, new Set(["running", "pinned-running"]), new Set(["unread"]), { pinnedOnly: true });
+  const pinned = selectCurrentSessions(
+    sessions,
+    new Set(["running", "pinned-running"]),
+    new Set(["unread"]),
+    new Set(["recently-completed"]),
+    { pinnedOnly: true },
+  );
   assert.deepEqual(pinned.map((s) => s.id), ["pinned-running", "pinned"]);
 });
 
@@ -59,7 +82,7 @@ test("running sessions lead, then most recent activity first", () => {
     // the turn, so it must not be sorted behind the pins it is older than.
     session("running", { modified: "2026-01-01T08:00:00.000Z" }),
   ];
-  const current = selectCurrentSessions(sessions, new Set(["running"]), new Set(["unread"]));
+  const current = selectCurrentSessions(sessions, new Set(["running"]), new Set(["unread"]), new Set());
   assert.deepEqual(current.map((s) => s.id), ["running", "new-pin", "unread", "old-pin"]);
 });
 
@@ -143,4 +166,71 @@ test("the pinned view's empty state explains pinning, not activity", () => {
   }));
   assert.match(empty.container.textContent, /Sessions you pin show up here/);
   assert.doesNotMatch(empty.container.textContent, /running/);
+});
+
+test("a recently-completed row shows the status marker, unless it is also running", () => {
+  const view = render(React.createElement(CurrentSessionList, {
+    sessions: [session("done"), session("running", { modified: "2026-01-01T01:00:00.000Z" })],
+    selectedSessionId: null,
+    runningSessionIds: new Set(["running"]),
+    unreadSessionIds: new Set(),
+    recentlyCompletedIds: new Set(["done", "running"]),
+    exitedSessions: new Map(),
+    relativeTimeNow: Date.parse("2026-01-01T00:00:00.000Z"),
+    onSelectSession: () => {},
+  }));
+  assert.equal(
+    view.container.querySelectorAll('[aria-label="Recently completed"]').length,
+    1,
+    "only the non-running session shows the marker, even though both are in the set",
+  );
+});
+
+// The header's "Show running sessions only" button is redundant in Current:
+// its own inclusion rule already covers running and recently-completed
+// sessions. It keeps its upstream meaning (and stays visible) in All.
+class FakeTransportWorker {
+  postMessage() {}
+  terminate() {}
+}
+
+before(() => {
+  globalThis.Worker = FakeTransportWorker;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith("/api/sessions")) return new Response(JSON.stringify({ sessions: [], runningSessionIds: [] }), { status: 200 });
+    if (u.startsWith("/api/projects")) return new Response(JSON.stringify({ projects: [] }), { status: 200 });
+    return new Response("{}", { status: 200 });
+  };
+});
+
+async function renderSidebarInView(view) {
+  window.localStorage.setItem("omp-web:sidebar-view", view);
+  let rendered;
+  await act(async () => {
+    rendered = render(React.createElement(SessionSidebar, {
+      selectedSessionId: null,
+      onSelectSession: () => {},
+      addProjectOpen: false,
+      setAddProjectOpen: () => {},
+      usageVisible: false,
+    }));
+  });
+  return rendered;
+}
+
+test("the running-filter button is hidden in Current, and kept in All", async () => {
+  const current = await renderSidebarInView("current");
+  assert.equal(
+    current.container.querySelector('[aria-label="Show running sessions only"]'),
+    null,
+    "Current hides the redundant filter button",
+  );
+  cleanup();
+
+  const all = await renderSidebarInView("all");
+  assert.ok(
+    all.container.querySelector('[aria-label="Show running sessions only"]'),
+    "All keeps the filter button",
+  );
 });

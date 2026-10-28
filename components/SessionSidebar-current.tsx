@@ -14,7 +14,10 @@ import { SessionItem } from "./SessionSidebar-rows";
  *
  * A session is current when it is pinned (server-side, shared by every
  * browser), running (which covers a turn waiting on a question — the turn is
- * still in progress), or unread (it finished while the user was elsewhere).
+ * still in progress), unread (it finished while the user was elsewhere), or
+ * recently completed — the same set and limit All's "Show running sessions
+ * only" filter adds (`effectiveRecentCompletedSet`, computed once in
+ * SessionSidebar and passed down here).
  * Forks are listed next to their parents instead of nested, so each row names
  * its own workspace.
  */
@@ -71,19 +74,25 @@ function selectSidebarView(view: SidebarView): void {
 
 /**
  * The sessions a flat view lists, most recent activity first: the pinned ones,
- * plus, for "current", the running and unread ones. Running sessions lead:
- * their file's `modified` only catches up when omp flushes the turn, so
- * sorting on it alone would bury the session the user is watching.
+ * plus, for "current", the running, unread and recently-completed ones.
+ * Running sessions lead: their file's `modified` only catches up when omp
+ * flushes the turn, so sorting on it alone would bury the session the user
+ * is watching.
  */
 export function selectCurrentSessions(
   sessions: readonly SessionInfo[],
   runningSessionIds: ReadonlySet<string>,
   unreadSessionIds: ReadonlySet<string>,
+  recentlyCompletedIds: ReadonlySet<string>,
   { pinnedOnly = false }: { pinnedOnly?: boolean } = {},
 ): SessionInfo[] {
   const current = sessions.filter(
     (session) => session.pinned === true
-      || (!pinnedOnly && (runningSessionIds.has(session.id) || unreadSessionIds.has(session.id))),
+      || (!pinnedOnly && (
+        runningSessionIds.has(session.id)
+        || unreadSessionIds.has(session.id)
+        || recentlyCompletedIds.has(session.id)
+      )),
   );
   return current.sort((a, b) => {
     const running = Number(runningSessionIds.has(b.id)) - Number(runningSessionIds.has(a.id));
@@ -138,6 +147,8 @@ interface CurrentSessionListProps {
   selectedSessionId: string | null;
   runningSessionIds: ReadonlySet<string>;
   unreadSessionIds: ReadonlySet<string>;
+  /** Marks a row "Recently completed" (All's running-filter set, same limit); never set for a running session. */
+  recentlyCompletedIds?: ReadonlySet<string>;
   exitedSessions: ReadonlyMap<string, ExitedRpcSession>;
   relativeTimeNow: number;
   /** Display name of a session's workspace (registry alias when it has one). */
@@ -164,6 +175,7 @@ export function CurrentSessionList({
   onSessionDeleted,
   filtersActive = false,
   pinnedOnly = false,
+  recentlyCompletedIds,
 }: CurrentSessionListProps) {
   const { t } = useI18n();
   if (sessions.length === 0) {
@@ -183,6 +195,7 @@ export function CurrentSessionList({
           isSelected={session.id === selectedSessionId}
           isRunning={runningSessionIds.has(session.id)}
           isUnread={unreadSessionIds.has(session.id)}
+          isRecentlyCompleted={!runningSessionIds.has(session.id) && (recentlyCompletedIds?.has(session.id) ?? false)}
           exited={exitedSessions.get(session.id)}
           relativeTimeNow={relativeTimeNow}
           onSelectSession={onSelectSession}
@@ -201,6 +214,7 @@ const CurrentSessionRow = memo(function CurrentSessionRow({
   isSelected,
   isRunning,
   isUnread,
+  isRecentlyCompleted,
   exited,
   relativeTimeNow,
   onSelectSession,
@@ -212,6 +226,7 @@ const CurrentSessionRow = memo(function CurrentSessionRow({
   isSelected: boolean;
   isRunning: boolean;
   isUnread: boolean;
+  isRecentlyCompleted?: boolean;
   exited?: ExitedRpcSession;
   relativeTimeNow: number;
   onSelectSession: (session: SessionInfo) => void;
@@ -231,6 +246,7 @@ const CurrentSessionRow = memo(function CurrentSessionRow({
       isSelected={isSelected}
       isRunning={isRunning}
       isUnread={isUnread}
+      isRecentlyCompleted={isRecentlyCompleted}
       exited={exited}
       relativeTimeNow={relativeTimeNow}
       onClick={handleClick}

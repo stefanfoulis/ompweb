@@ -1325,7 +1325,7 @@
   "sessionSidebar.viewCurrent": "Current",
   "sessionSidebar.viewPinned": "Pinned",
   "sessionSidebar.viewAll": "All",
-  "sessionSidebar.currentEmpty": "Pinned sessions and sessions that are running or finished unread show up here. Pin one from its ⋯ menu in All.",
+  "sessionSidebar.currentEmpty": "Pinned sessions and sessions that are running, finished unread, or recently completed show up here. Pin one from its ⋯ menu in All.",
   "sessionSidebar.pinnedEmpty": "Sessions you pin show up here. Pin one with Pin session in its ⋯ menu.",
   "skillsConfig.addCustomSkill": "Add custom skill",
   "skillsConfig.addSkill": "Add skill",

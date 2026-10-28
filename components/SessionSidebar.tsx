@@ -945,12 +945,16 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
 
   // The flat views' list: the running-only filter and the tree's own ranked
   // search (streamed transcript scores where the server has answered, local
-  // title scores otherwise), applied to the pinned/running/unread set, or to
-  // the pinned set alone in Pinned.
+  // title scores otherwise), applied to the pinned/running/unread/recently-
+  // completed set, or to the pinned set alone in Pinned.
   const currentSessions = useMemo(() => {
     if (sidebarView === "all") return NO_SESSIONS;
-    let list = selectCurrentSessions(visibleSessions, runningSessionIds, unreadSessionIds, { pinnedOnly: sidebarView === "pinned" });
-    if (runningOnly) list = list.filter((s) => runningSessionIds.has(s.id));
+    let list = selectCurrentSessions(visibleSessions, runningSessionIds, unreadSessionIds, effectiveRecentCompletedSet, { pinnedOnly: sidebarView === "pinned" });
+    // The running-only filter button is hidden in Current (its own inclusion
+    // rule already covers running and recently-completed sessions), but the
+    // toggle's state is shared across views — ignore it here so switching
+    // into Current from a filtered All never silently drops sessions.
+    if (runningOnly && sidebarView !== "current") list = list.filter((s) => runningSessionIds.has(s.id));
     const query = compileSearchQuery(trimmedSearchQuery);
     if (!query) return list;
     const serverScores = currentTranscriptSearch?.scores;
@@ -962,7 +966,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     }
     // Best match first; ties keep the activity order (stable sort).
     return list.filter((s) => scores.has(s.id)).sort((a, b) => (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0));
-  }, [sidebarView, visibleSessions, runningSessionIds, unreadSessionIds, runningOnly, trimmedSearchQuery, currentTranscriptSearch]);
+  }, [sidebarView, visibleSessions, runningSessionIds, unreadSessionIds, effectiveRecentCompletedSet, runningOnly, trimmedSearchQuery, currentTranscriptSearch]);
 
   // A workspace's own name for the flat list: its registry alias when it has
   // one, otherwise the folder name the tree's rows show.
@@ -1671,14 +1675,20 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
               </SidebarPortalMenu>
             </>
           )}
-          <SidebarIconButton
-            label={t("sessionSidebar.filterRunning")}
-            title={t("sessionSidebar.filterRunningTitle", { count: recentRunsLimit })}
-            active={runningOnly}
-            onClick={() => setRunningOnly((v) => !v)}
-          >
-            <SlidersHorizontal size={15} strokeWidth={1.9} aria-hidden="true" />
-          </SidebarIconButton>
+          {/* Current's own inclusion rule already covers running and
+              recently-completed sessions, so the filter here would just
+              re-narrow it to "running only" with no visible control to undo
+              it — the button only makes sense in Pinned and All. */}
+          {sidebarView !== "current" && (
+            <SidebarIconButton
+              label={t("sessionSidebar.filterRunning")}
+              title={t("sessionSidebar.filterRunningTitle", { count: recentRunsLimit })}
+              active={runningOnly}
+              onClick={() => setRunningOnly((v) => !v)}
+            >
+              <SlidersHorizontal size={15} strokeWidth={1.9} aria-hidden="true" />
+            </SidebarIconButton>
+          )}
           <SidebarIconButton
             label={t("projects.add")}
             title={t("projects.addTitle")}
@@ -1785,6 +1795,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
               onRenamed={loadSessions}
               onSessionDeleted={handleSessionDeleted}
               filtersActive={filtersActive}
+              recentlyCompletedIds={effectiveRecentCompletedSet}
               pinnedOnly={sidebarView === "pinned"}
             />
           )}
