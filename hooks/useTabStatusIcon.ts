@@ -28,7 +28,11 @@ function loadBaseIcon(): Promise<HTMLImageElement> {
     const { promise, resolve, reject } = Promise.withResolvers<HTMLImageElement>();
     const img = new Image();
     img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error("failed to load base favicon"));
+    img.onerror = () => {
+      // Forget the failure so a later status change can try again.
+      baseIconPromise = null;
+      reject(new Error("failed to load base favicon"));
+    };
     img.src = BASE_ICON_SRC;
     baseIconPromise = promise;
   }
@@ -105,9 +109,12 @@ export function useTabStatusIcon(status: TabStatus): void {
       document.head.appendChild(link);
     }
     const ownLink = link;
-    void renderStatusIcon(status).then((href) => {
-      if (!cancelled) ownLink.href = href;
-    });
+    // A dot that cannot be drawn (icon failed to load, no canvas) falls back
+    // to the plain icon rather than leaving the tab without one.
+    renderStatusIcon(status).then(
+      (href) => { if (!cancelled) ownLink.href = href; },
+      () => { if (!cancelled) ownLink.href = BASE_ICON_SRC; },
+    );
     return () => {
       cancelled = true;
     };
