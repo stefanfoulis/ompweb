@@ -115,6 +115,11 @@ function formatToolPreviewValue(value: unknown): string {
 }
 
 function getAskPreview(input: Record<string, unknown>): string | null {
+  // Form-based ask calls (`{ html }`) carry no structured question list; strip
+  // markup instead of parsing it — this is a one-line preview, not a render.
+  if (typeof input.html === "string") {
+    return input.html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  }
   if (!Array.isArray(input.questions)) return null;
 
   const prompts = input.questions

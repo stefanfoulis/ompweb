@@ -49,8 +49,18 @@ export interface AskResultQuestion {
   timedOut?: boolean;
 }
 
+/** One named field's question and answer, from a form-based ask call's
+ * `AskToolDetails.answers` (see packages/tui/src/html-form/data.ts `FormAnswer`). */
+export interface AskFormAnswer {
+  name: string;
+  question: string;
+  answer: string;
+  note?: string;
+}
+
 export type AskResultCardData =
   | { toolCallId: string; state: "answered"; questions: AskResultQuestion[] }
+  | { toolCallId: string; state: "answeredForm"; answers: AskFormAnswer[]; timedOut?: boolean }
   | { toolCallId: string; state: "chatRedirect"; questions: string[] }
   | { toolCallId: string; state: "cancelled"; questions: AskInputQuestion[] };
 
@@ -82,6 +92,17 @@ function normalizeAnsweredRow(
   };
 }
 
+/** A form-based answer row; `null` for a malformed entry (missing name/question/answer). */
+function normalizeFormAnswer(row: Record<string, unknown>): AskFormAnswer | null {
+  if (typeof row.name !== "string" || typeof row.question !== "string" || typeof row.answer !== "string") return null;
+  return {
+    name: row.name,
+    question: row.question,
+    answer: row.answer,
+    note: typeof row.note === "string" && row.note.trim() ? row.note : undefined,
+  };
+}
+
 /** Builds one card's data from an `ask` tool call and its matching
  * toolResult. Returns `null` for a still-pending ask (no result yet — the
  * live dialog owns that state) or an unrecognized/empty result shape. */
@@ -97,8 +118,19 @@ export function buildAskResultCard(block: ToolCallContent, result: ToolResultMes
   if (!isRecord(details)) return null;
 
   if (details.chatRedirect === true) {
+    // A form-based chat redirect (`{ answers: [], chatRedirect: true }`) carries no
+    // question text — the html's visible copy isn't preserved structurally.
+    if (Array.isArray(details.answers)) {
+      return { toolCallId: block.toolCallId, state: "chatRedirect", questions: [] };
+    }
     const questions = Array.isArray(details.questions) ? details.questions.filter((q): q is string => typeof q === "string") : [];
     return { toolCallId: block.toolCallId, state: "chatRedirect", questions };
+  }
+
+  if (Array.isArray(details.answers)) {
+    const answers = details.answers.filter(isRecord).map(normalizeFormAnswer).filter((a): a is AskFormAnswer => a !== null);
+    if (answers.length === 0) return null;
+    return { toolCallId: block.toolCallId, state: "answeredForm", answers, timedOut: details.timedOut === true };
   }
 
   const byId = new Map(
@@ -234,6 +266,25 @@ function AskInputQuestionRow({ question }: { question: AskInputQuestion }) {
   );
 }
 
+function AskFormAnswerRow({ answer }: { answer: AskFormAnswer }) {
+  const { t } = useI18n();
+  return (
+    <div style={{ display: "grid", gap: 3 }}>
+      <div style={{ fontSize: 12.5, color: "var(--text)", lineHeight: 1.4 }}>{answer.question}</div>
+      <div style={{ fontSize: 11.5, color: "var(--text)", fontStyle: "italic", overflowWrap: "anywhere" }}>
+        {answer.answer
+          ? <>&ldquo;{answer.answer}&rdquo;</>
+          : <span style={{ color: "var(--text-dim)" }}>{t("chatWindow.askResultNoSelection")}</span>}
+      </div>
+      {answer.note && (
+        <div style={{ fontSize: 11, color: "var(--text-muted)", overflowWrap: "anywhere" }}>
+          <span style={{ fontWeight: 600 }}>{t("chatWindow.askResultNote")}:</span> {answer.note}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Compact, read-only recap of one answered `ask` tool call. Renders nothing
  * while the ask is still pending (no matching toolResult). */
 export function AskResultCard({ data }: { data: AskResultCardData }) {
@@ -262,8 +313,14 @@ export function AskResultCard({ data }: { data: AskResultCardData }) {
           <span style={{ fontWeight: 600, color: "var(--text)" }}>{t("chatWindow.askResultHeading")}</span>
           <span style={{ marginLeft: "auto", color: "var(--text-muted)" }}>{stateLabel}</span>
         </div>
+        {data.state === "answeredForm" && data.timedOut && (
+          <span style={{ fontSize: 10.5, color: "var(--status-warning)" }}>{t("chatWindow.askResultTimedOut")}</span>
+        )}
         {data.state === "answered" && data.questions.map((question) => (
           <AskResultQuestionRow key={question.id} question={question} />
+        ))}
+        {data.state === "answeredForm" && data.answers.map((answer) => (
+          <AskFormAnswerRow key={answer.name} answer={answer} />
         ))}
         {data.state === "chatRedirect" && data.questions.map((question, index) => (
           <div key={index} style={{ fontSize: 12.5, color: "var(--text-muted)", lineHeight: 1.4 }}>{question}</div>

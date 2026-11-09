@@ -13,6 +13,10 @@ function askToolCall(toolCallId, questions) {
   return { type: "toolCall", toolCallId, toolName: "ask", input: { questions } };
 }
 
+function askFormToolCall(toolCallId, html) {
+  return { type: "toolCall", toolCallId, toolName: "ask", input: { html } };
+}
+
 function toolResult(toolCallId, details, extra) {
   return { role: "toolResult", toolCallId, content: [{ type: "text", text: "" }], details, ...extra };
 }
@@ -145,6 +149,58 @@ test("a timed-out question shows the auto-selected marker", () => {
     data: buildAskResultCard(block, result),
   }));
   assert.match(html, /Auto-selected after timeout/);
+});
+
+test("form-based ask: answered details render each answer with its note", () => {
+  const block = askFormToolCall("call-form", '<form><label>Which color?<input name="color"></label></form>');
+  const result = toolResult("call-form", {
+    answers: [{ name: "color", question: "Which color?", answer: "Blue", note: "matches the logo" }],
+  });
+
+  const data = buildAskResultCard(block, result);
+  assert.equal(data.state, "answeredForm");
+
+  const html = renderToStaticMarkup(React.createElement(AskResultCard, { data }));
+  assert.match(html, /Which color\?/);
+  assert.match(html, /Blue/);
+  assert.match(html, /matches the logo/);
+});
+
+test("form-based ask: timedOut details show the auto-selected marker and empty answers show 'No selection'", () => {
+  const block = askFormToolCall("call-form-timeout", '<form><input name="proceed"></form>');
+  const result = toolResult("call-form-timeout", {
+    answers: [{ name: "proceed", question: "Proceed?", answer: "" }],
+    timedOut: true,
+  });
+
+  const data = buildAskResultCard(block, result);
+  assert.equal(data.timedOut, true);
+
+  const html = renderToStaticMarkup(React.createElement(AskResultCard, { data }));
+  assert.match(html, /Auto-selected after timeout/);
+  assert.match(html, /No selection/);
+});
+
+test("form-based ask: chat redirect has no question list (not preserved structurally in the html)", () => {
+  const block = askFormToolCall("call-form-chat", '<form><input name="q"></form>');
+  const result = toolResult("call-form-chat", { answers: [], chatRedirect: true });
+
+  const data = buildAskResultCard(block, result);
+  assert.deepEqual(data, { toolCallId: "call-form-chat", state: "chatRedirect", questions: [] });
+
+  const html = renderToStaticMarkup(React.createElement(AskResultCard, { data }));
+  assert.match(html, /Chose to chat about this/);
+});
+
+test("form-based ask: isError result shows the cancelled state with no question list", () => {
+  const block = askFormToolCall("call-form-cancel", '<form><input name="q"></form>');
+  const result = toolResult("call-form-cancel", {}, { isError: true, content: [{ type: "text", text: "Ask tool was cancelled by the user" }] });
+
+  const data = buildAskResultCard(block, result);
+  assert.deepEqual(data, { toolCallId: "call-form-cancel", state: "cancelled", questions: [] });
+
+  const html = renderToStaticMarkup(React.createElement(AskResultCard, { data }));
+  assert.match(html, /Cancelled/);
 });
 
 test("collectAskResults gathers answered asks from a segment's activity pieces in order", () => {

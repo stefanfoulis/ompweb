@@ -1119,10 +1119,36 @@ function keepAskResultRow(raw: unknown): Record<string, unknown> | null {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+const ASK_FORM_ANSWER_STRING_KEYS = ["name", "question", "answer", "note"] as const;
+
+/** A form-based ask answer row (`AskFormAnswer`); `null` when the required name/question/answer are missing. */
+function keepAskFormAnswerRow(raw: unknown): Record<string, unknown> | null {
+  if (!isRecord(raw)) return null;
+  const out: Record<string, unknown> = {};
+  for (const key of ASK_FORM_ANSWER_STRING_KEYS) {
+    if (typeof raw[key] === "string") out[key] = truncateTaskDetailText(raw[key]);
+  }
+  if (typeof out.name !== "string" || typeof out.question !== "string" || typeof out.answer !== "string") return null;
+  return out;
+}
+
 export function keepAskToolResultDetails(details: Record<string, unknown>): Record<string, unknown> | null {
   if (details.chatRedirect === true) {
+    // Form-based chat redirect (`{ answers: [], chatRedirect: true }`) carries no
+    // question text; the legacy shape keeps the original question strings.
+    if (Array.isArray(details.answers)) return { chatRedirect: true, answers: [] };
     const questions = askDetailOptions(details.questions);
     return questions ? { chatRedirect: true, questions } : { chatRedirect: true, questions: [] };
+  }
+  if (Array.isArray(details.answers)) {
+    const answers = details.answers
+      .slice(0, TASK_DETAIL_MAX_ROWS)
+      .map((raw) => keepAskFormAnswerRow(raw))
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+    if (answers.length === 0) return null;
+    const kept: Record<string, unknown> = { answers };
+    if (details.timedOut === true) kept.timedOut = true;
+    return kept;
   }
   if (Array.isArray(details.results)) {
     const results = details.results
