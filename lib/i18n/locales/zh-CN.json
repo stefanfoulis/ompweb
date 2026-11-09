@@ -1940,5 +1940,16 @@
   "askDialog.answered": "已回答",
   "askDialog.unansweredWarning.one": "还有 {count} 个问题未回答；仍可提交。",
   "askDialog.unansweredWarning.other": "还有 {count} 个问题未回答；仍可提交。",
-  "askDialog.cancel": "取消"
+  "askDialog.cancel": "取消",
+  "askDialog.fixErrors": "提交前需要修正部分答案。",
+  "askDialog.errorRequired": "必填",
+  "askDialog.errorSelectOne": "至少选择一项",
+  "askDialog.errorNumber": "请输入数字",
+  "askDialog.errorMin": "不能小于 {min}",
+  "askDialog.errorMax": "不能大于 {max}",
+  "askDialog.errorMinLength": "至少需要 {count} 个字符",
+  "askDialog.errorMaxLength": "最多 {count} 个字符",
+  "askDialog.errorEmail": "请输入电子邮件地址",
+  "askDialog.errorUrl": "请输入完整的 URL",
+  "askDialog.errorPattern": "必须匹配 {pattern}"
 }

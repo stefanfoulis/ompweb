@@ -139,6 +139,19 @@ function isAskAnswers(value: unknown): boolean {
     && (answer.note === undefined || typeof answer.note === "string"));
 }
 
+/** Shape check for a form-dialog `{data, notes}` payload; omp validates the
+ *  content (names, option values, constraints) and rejects what it dislikes. */
+function isFormSubmission(value: unknown, notes: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const values = Object.values(value).every((entry: unknown) =>
+    typeof entry === "string"
+    || typeof entry === "number"
+    || (Array.isArray(entry) && entry.every((item: unknown) => typeof item === "string")));
+  if (!values) return false;
+  return notes === undefined
+    || (isRecord(notes) && Object.values(notes).every((note: unknown) => typeof note === "string"));
+}
+
 // Commands forwarded to omp verbatim (request shape already matches rpc-types).
 const PASSTHROUGH_COMMANDS = new Set([
   "abort",
@@ -2798,11 +2811,18 @@ export class AgentSessionWrapper {
 
       case "extension_ui_response": {
         const { id, ...rest } = command as { id: string; [key: string]: unknown };
-        const pendingAsk = this.pendingUiRequests.get(id)?.method === "ask";
-        // A pending ask accepts only its answers, a cancel, or "chat about this";
-        // anything else would drop it from reconnect replay while omp rejects it.
-        if (("answers" in rest || pendingAsk) && !isAskAnswers(rest.answers) && !(pendingAsk && (rest.cancelled === true || rest.chat === true))) {
+        const pendingMethod = this.pendingUiRequests.get(id)?.method;
+        const pendingAsk = pendingMethod === "ask";
+        const pendingForm = pendingMethod === "form";
+        // A pending question accepts only its answer, a cancel, or "chat about
+        // this"; anything else would drop it from reconnect replay while omp
+        // rejects it.
+        const settles = rest.cancelled === true || rest.chat === true;
+        if (("answers" in rest || pendingAsk) && !isAskAnswers(rest.answers) && !(pendingAsk && settles)) {
           throw new WebRpcError("Invalid ask dialog answers", "invalid_ask_answers");
+        }
+        if (("data" in rest || pendingForm) && !isFormSubmission(rest.data, rest.notes) && !(pendingForm && settles)) {
+          throw new WebRpcError("Invalid form dialog data", "invalid_form_data");
         }
         const wasPending = this.pendingUiRequests.has(id);
         this.forgetPendingUiRequest(id);

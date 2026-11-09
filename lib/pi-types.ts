@@ -228,6 +228,97 @@ export interface RpcAskDialogAnswer {
 }
 
 /**
+ * omp's parsed agent-written `<form>` (`method: "form"`, opt-in via the same
+ * `set_ask_dialog` command as `ask`), mirrored from oh-my-pi's
+ * packages/tui/src/html-form/parse.ts — omp-web does not depend on omp's
+ * packages. Every piece of text arrives as plain spans, so form content is
+ * rendered as text and never as HTML.
+ */
+export type FormSpanStyle = "code" | "strong" | "em";
+
+/** A run of inline text; `"\n"` inside `text` is a hard line break. */
+export interface FormSpan {
+  text: string;
+  style?: FormSpanStyle;
+}
+
+/** One answer of a {@link ChoiceField}. */
+export interface ChoiceOption {
+  value: string;
+  label: FormSpan[];
+  checked: boolean;
+  disabled: boolean;
+}
+
+/** A radio group (`multi: false`), checkbox group (`multi: true`) or `<select>`. */
+export interface ChoiceField {
+  kind: "choice";
+  name: string;
+  multi: boolean;
+  select: boolean;
+  /** The UI offers a free-text "Other" answer beside the options. */
+  other: boolean;
+  /** The control's own label; empty for radio/checkbox groups, whose question is the surrounding text. */
+  label: FormSpan[];
+  options: ChoiceOption[];
+  required: boolean;
+}
+
+/** A single-line `<input>` (`multiline: false`) or a `<textarea>`. */
+export interface TextField {
+  kind: "text";
+  /** The `<input type>` (`text`, `number`, `url`, …); `textarea` for textareas. */
+  type: string;
+  name: string;
+  multiline: boolean;
+  label: FormSpan[];
+  value: string;
+  placeholder: string;
+  required: boolean;
+  min?: number;
+  max?: number;
+  pattern?: string;
+  minLength?: number;
+  maxLength?: number;
+  /** Visible rows a textarea asked for (`rows`), 1 for inputs. */
+  rows: number;
+}
+
+export type FormField = ChoiceField | TextField;
+
+/** A renderable unit of a section, in document order. */
+export type FormBlock =
+  | { kind: "text"; spans: FormSpan[]; heading: boolean }
+  | { kind: "list"; items: FormSpan[][]; ordered: boolean }
+  | { kind: "pre"; text: string }
+  | { kind: "table"; rows: FormSpan[][][]; headerRows: number }
+  /** omp inlines the image as a `data:` URL; `src` is empty when it could not be read. */
+  | { kind: "image"; src: string; alt: string }
+  /** An inline `<svg>`, serialized whole: rendered through an `<img>` so nothing in it can run. */
+  | { kind: "svg"; markup: string; alt: string }
+  | { kind: "field"; field: FormField };
+
+/** A `<fieldset>` (titled by its `<legend>`) or loose content between fieldsets (untitled). */
+export interface FormSection {
+  title: FormSpan[];
+  blocks: FormBlock[];
+}
+
+/** What to draw, the fields in document order, and the form's hidden inputs
+ *  (omp merges those into the submission itself; clients never send them). */
+export interface HtmlForm {
+  sections: FormSection[];
+  fields: FormField[];
+  hidden: Array<[name: string, value: string]>;
+}
+
+/** Submitted value of one control: text, a number for `number`/`range` inputs, or a group's checked values. */
+export type HtmlFormValue = string | number | string[];
+
+/** Submitted form data by control `name` (oh-my-pi's packages/tui/src/html-form/data.ts). */
+export type HtmlFormData = Record<string, HtmlFormValue>;
+
+/**
  * omp's rpc-ui extension UI request frames, including the methods missing from
  * the browser-facing union in lib/types.ts (`open_url`, `cancel`). The wrapper
  * adds `expiresAt` when a timeout is present so reconnecting clients can
@@ -239,6 +330,7 @@ export type OmpExtensionUiRequest =
   | { type: "extension_ui_request"; id: string; method: "input"; title: string; placeholder?: string; timeout?: number; expiresAt?: number }
   | { type: "extension_ui_request"; id: string; method: "editor"; title: string; prefill?: string; promptStyle?: boolean; timeout?: number; expiresAt?: number }
   | { type: "extension_ui_request"; id: string; method: "ask"; questions: RpcAskDialogQuestion[]; timeout?: number; expiresAt?: number }
+  | { type: "extension_ui_request"; id: string; method: "form"; form: HtmlForm; questions: Record<string, string>; timeout?: number; expiresAt?: number }
   | { type: "extension_ui_request"; id: string; method: "cancel"; targetId: string }
   | { type: "extension_ui_request"; id: string; method: "notify"; message: string; notifyType?: "info" | "warning" | "error" }
   | { type: "extension_ui_request"; id: string; method: "setStatus"; statusKey: string; statusText: string | undefined }

@@ -119,7 +119,7 @@ export function renderNotification(event: NotificationEvent, t: Translate): Rend
 const MODEL_SWITCH_NOTICE_SOURCES = new Set(["prewalk", "plan-yolo"]);
 
 /** Extension UI methods that block the agent until the user answers (rpc-manager replays these too). */
-export const BLOCKING_UI_METHODS = new Set(["select", "confirm", "input", "editor", "ask", "open_url"]);
+export const BLOCKING_UI_METHODS = new Set(["select", "confirm", "input", "editor", "ask", "form", "open_url"]);
 
 const NOTIFICATION_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
 
@@ -213,7 +213,11 @@ export function createNotificationDetector(): Detect {
         // Only reached for requests that wait on the user (omp-web answers
         // auto-approved ones before they are emitted).
         if (typeof frame.method !== "string" || !BLOCKING_UI_METHODS.has(frame.method)) return [];
-        const firstQuestion = Array.isArray(frame.questions) && isRecord(frame.questions[0]) ? str(frame.questions[0].question) : undefined;
+        // `ask` lists its questions; a `form` maps each named field to its question.
+        const questions = frame.questions;
+        const firstQuestion = Array.isArray(questions)
+          ? (isRecord(questions[0]) ? str(questions[0].question) : undefined)
+          : (isRecord(questions) ? str(Object.values(questions)[0]) : undefined);
         return [{ ...base, type: "input", detail: str(frame.title) ?? firstQuestion ?? str(frame.message) ?? str(frame.instructions) }];
       }
       default:

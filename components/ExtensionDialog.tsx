@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { Eye, EyeOff } from "lucide-react";
 import type { ExtensionUiRequest } from "@/lib/types";
-import type { RpcAskDialogAnswer } from "@/lib/pi-types";
+import type { HtmlFormData, RpcAskDialogAnswer } from "@/lib/pi-types";
 import { useI18n } from "@/lib/i18n";
 import { useModalDialog } from "@/hooks/useModalDialog";
 import { useTouchTargets } from "@/hooks/useTouchTargets";
@@ -12,7 +12,7 @@ import { AskDialog } from "./AskDialog";
 
 export type ExtensionDialogRequest = Extract<
   ExtensionUiRequest,
-  { method: "select" | "confirm" | "input" | "editor" | "ask" }
+  { method: "select" | "confirm" | "input" | "editor" | "ask" | "form" }
 >;
 
 export type ExtensionDialogResponse =
@@ -20,6 +20,7 @@ export type ExtensionDialogResponse =
   | { confirmed: boolean }
   | { cancelled: true }
   | { answers: RpcAskDialogAnswer[] }
+  | { data: HtmlFormData; notes?: Record<string, string> }
   | { chat: true };
 
 // The Other text lives as long as the question: choosing a regular option only
@@ -245,7 +246,7 @@ function initialAskDrafts(request: ExtensionDialogRequest): AskDraft[] {
   });
 }
 
-/** `ask` requests get the rich multi-question dialog; everything else the standard one. */
+/** Questions — `ask` and `form` — get the rich tabbed dialog; everything else the standard one. */
 export function ExtensionDialog(props: {
   request: ExtensionDialogRequest;
   onRespond: (request: ExtensionDialogRequest, response: ExtensionDialogResponse) => void;
@@ -253,11 +254,15 @@ export function ExtensionDialog(props: {
   attached?: boolean;
 }) {
   const { request } = props;
-  if (request.method === "ask") {
+  if (request.method === "ask" || request.method === "form") {
     return <AskDialog request={request} onRespond={props.onRespond} attached={props.attached ?? false} />;
   }
-  return <StandardExtensionDialog {...props} />;
+  return <StandardExtensionDialog request={request} onRespond={props.onRespond} attached={props.attached} />;
 }
+
+/** Everything the standard dialog can draw: a `form` has no title and no flat
+ *  list of options, so it only ever reaches the tabbed dialog. */
+type StandardDialogRequest = Exclude<ExtensionDialogRequest, { method: "form" }>;
 
 /**
  * Overlay dialog for `select` / `confirm` / `input` / `editor` / `ask` extension UI
@@ -274,8 +279,8 @@ function StandardExtensionDialog({
   onRespond,
   attached = false,
 }: {
-  request: ExtensionDialogRequest;
-  onRespond: (request: ExtensionDialogRequest, response: ExtensionDialogResponse) => void;
+  request: StandardDialogRequest;
+  onRespond: (request: StandardDialogRequest, response: ExtensionDialogResponse) => void;
   /** Render as a composer panel instead of a full-chat overlay. */
   attached?: boolean;
 }) {

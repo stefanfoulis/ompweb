@@ -1940,5 +1940,16 @@
   "askDialog.answered": "回答済み",
   "askDialog.unansweredWarning.one": "{count} 件の質問が未回答です。送信は可能です。",
   "askDialog.unansweredWarning.other": "{count} 件の質問が未回答です。送信は可能です。",
-  "askDialog.cancel": "キャンセル"
+  "askDialog.cancel": "キャンセル",
+  "askDialog.fixErrors": "送信する前に、いくつかの回答を修正してください。",
+  "askDialog.errorRequired": "必須です",
+  "askDialog.errorSelectOne": "1 つ以上選択してください",
+  "askDialog.errorNumber": "数値を入力してください",
+  "askDialog.errorMin": "{min} 以上にしてください",
+  "askDialog.errorMax": "{max} 以下にしてください",
+  "askDialog.errorMinLength": "{count} 文字以上必要です",
+  "askDialog.errorMaxLength": "{count} 文字以内にしてください",
+  "askDialog.errorEmail": "メールアドレスを入力してください",
+  "askDialog.errorUrl": "完全な URL を入力してください",
+  "askDialog.errorPattern": "{pattern} に一致する必要があります"
 }
