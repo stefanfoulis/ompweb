@@ -154,6 +154,9 @@ export type PromptSubmissionResult =
 const MAX_HANDLED_EDIT_HISTORY_MARKERS = 64;
 // A running-channel lookup that failed is retried after 1 s, 2 s and 4 s, then waits for the next frame.
 const RUNNING_LOOKUP_RETRIES = 3;
+/** omp's builtin command that re-runs the last failed turn in place. */
+const RETRY_COMMAND = "/retry";
+const EMPTY_HELD_IDS: ReadonlySet<string> = new Set();
 
 /** Read the error carried by OMP's assistant/error frames without rendering
  * arbitrary payloads as [object Object]. OMP normally puts provider failures
@@ -217,6 +220,23 @@ function currentRunAssistant(context: SessionData["context"], previousEntryIds: 
     }
   }
   return null;
+}
+
+/**
+ * Boundary for a run that re-runs the transcript's last turn in place (omp's `/retry`) instead of adding one.
+ *
+ * A run's answer is recognised by `currentRunAssistant`: the last user message must be NEW relative to the
+ * boundary. An in-place rerun writes no user message, so the persisted boundary (which already contains that user
+ * entry) would leave the replaced assistant message unrecognised, and its error would be reported as a notice on
+ * top of the error banner the message already renders. Cutting the boundary just before the last user entry makes
+ * the re-run turn this run's turn, which is what omp does to it.
+ */
+function boundaryBeforeLastTurn(entryIds: string[], context: SessionData["context"] | null): string[] {
+  if (!context) return entryIds;
+  const userIndex = context.messages.findLastIndex((message) => message.role === "user");
+  const lastUserEntryId = userIndex >= 0 ? context.entryIds[userIndex] : undefined;
+  const cut = lastUserEntryId ? entryIds.indexOf(lastUserEntryId) : -1;
+  return cut < 0 ? entryIds : entryIds.slice(0, cut);
 }
 
 export interface UseAgentSessionOptions {
@@ -323,6 +343,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
    *  in flight — drives the advisor card's button label/disabled state only
    *  (sessionBusy already covers hiding it once the resumed run starts). */
   const [addressingAdvisor, setAddressingAdvisor] = useState(false);
+  /** True while the `/retry` prompt from handleRetryRun is in flight — drives
+   *  the failed turn's Retry button label/disabled state only (sessionBusy
+   *  already covers hiding it once the retried run starts). */
+  const [retryingRun, setRetryingRun] = useState(false);
+  const retryingRunRef = useRef(false);
+  /** Set between a `/retry` dispatch and the first command_output of that
+   *  prompt: omp announces the retry on that channel, and the run it starts is
+   *  the feedback, so the announcement would only be noise. */
+  const retryEchoPendingRef = useRef(false);
   const [pendingBash, setPendingBash] = useState<{ command: string; excludeFromContext: boolean } | null>(null);
   // `!` results from a running turn: omp holds them back until a later prompt
   // starts, so until the transcript has them they show from here, like the
@@ -360,10 +389,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const dispatchBaselineRef = useRef<string[] | null>(null);
   // Set once connectEvents exists: the state route's held messages, and a subscription to follow them.
   const applyStateOutboxRef = useRef<(sid: string, entries: OutboxEntry[], settledIds: string[]) => void>(() => {});
-  const heldMessages = useMemo(
-    () => mergeHeldMessages(session?.id ?? null, localOutbox, storedOutbox, serverOutbox),
-    [session?.id, localOutbox, storedOutbox, serverOutbox],
-  );
+  // Failed entries whose Retry is queuing a replacement: the same message must never show twice, so the failed
+  // bubble is held back until its replacement is stored (then its entry is dropped) or the outbox refuses it.
+  const [resendingHeldIds, setResendingHeldIds] = useState<ReadonlySet<string>>(EMPTY_HELD_IDS);
+  const heldMessages = useMemo(() => {
+    const merged = mergeHeldMessages(session?.id ?? null, localOutbox, storedOutbox, serverOutbox);
+    return resendingHeldIds.size ? merged.filter((entry) => !resendingHeldIds.has(entry.id)) : merged;
+  }, [session?.id, localOutbox, storedOutbox, serverOutbox, resendingHeldIds]);
   // False once this hook instance unmounts: background loops (prompt/bash
   // settlement polling) must not keep firing on a dead instance.
   const hookAliveRef = useRef(true);
@@ -2601,6 +2633,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       case "command_output": {
         const text = (event.text as string | undefined)?.trim() ?? "";
+        // A `/retry` dispatch claims this one line: "Retrying the last failed turn." says nothing the run starting
+        // right after it does not. Anything else omp answers (notably "Nothing to retry.") is the only feedback
+        // there is, so it must still reach the user.
+        const retryEcho = retryEchoPendingRef.current && /^retrying the last failed turn/i.test(text);
+        retryEchoPendingRef.current = false;
+        if (retryEcho) break;
         if (/^xd:\/\/:\s*mounted\s+mcp__/i.test(text)) toast.info("MCP tools updated", text, { clamp: true });
         else if (text) {
           addNotice({ type: "info", message: text });
@@ -3132,7 +3170,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   /** Holds a message in the outbox (docs/specs/2026-11-04-message-outbox-design.md): true once this browser has
    * stored it, after which omp-web delivers it whatever this tab does next. It shows as a held bubble until omp has it. */
-  const holdMessage = useCallback(async (sid: string, mode: OutboxMode, message: string, images?: AttachedImage[], uploads?: string[], uploadProofs?: Record<string, string>) => {
+  const holdMessage = useCallback(async (sid: string, mode: OutboxMode, message: string, images?: readonly { data: string; mimeType: string }[], uploads?: string[], uploadProofs?: Record<string, string>) => {
     try {
       await addToOutbox({
         id: newOutboxId(),
@@ -4258,7 +4296,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const heldMessagesRef = useRef(heldMessages);
   heldMessagesRef.current = heldMessages;
+  // The browser's own entries carry the upload proofs the server wants back when it re-snapshots staged files.
+  const localOutboxRef = useRef(localOutbox);
+  localOutboxRef.current = localOutbox;
   const heldDeletionsRef = useRef(new Set<string>());
+  const heldResendsRef = useRef(new Set<string>());
   /** Delete of a held bubble: one this browser still holds leaves IndexedDB; the server's only until dispatched (omp
    * may have it from then on, answered 409 outbox_dispatched). */
   const deleteHeldMessage = useCallback(async (id: string) => {
@@ -4276,21 +4318,53 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [addNotice]);
 
-  /** Resumes the agent on the hidden `continue` directive so it acts on the
-   *  advisor notes already visible in the transcript. No optimistic user
-   *  bubble is created (the directive stays hidden), so this mirrors
-   *  handleSend's existing-session branch — same run-id bookkeeping reset,
-   *  same optimistic agentRunning before the network round-trip (so the UI
-   *  reacts exactly like a normal prompt instead of waiting on agent_start),
-   *  same ensureEventsConnected (an idle session's SSE stream is not
-   *  auto-connected — see the mount effect above — so without this the
-   *  resumed turn's frames would arrive on a connection nobody opened) —
-   *  minus the pieces that only exist to render a typed prompt
-   *  (buildOutgoingPrompt, the optimistic user bubble, new-session
-   *  bootstrapping, slash commands). */
-  const handleAddressAdvisor = useCallback(async () => {
+  /** Resend of a held bubble the outbox refused (an expired key, a login omp cannot renew): the same message is
+   * queued as a new entry and the refused one is dropped afterwards, never before — a resend the outbox refuses in
+   * turn would otherwise take the only copy of the message with it. Staged uploads outlive their entry, so the new
+   * entry attaches the same ones. A lost reply (`mayHaveBeenSent`) is not a refusal: omp may be running that
+   * message, and a resend would be a second turn. */
+  const retryHeldMessage = useCallback(async (id: string) => {
     const sid = sessionIdRef.current;
-    if (!sid || agentRunningRef.current || bashRunningRef.current || initialHydrationPendingRef.current) return;
+    const held = heldMessagesRef.current.find((entry) => entry.id === id);
+    if (!sid || !held || held.state !== "failed" || held.mayHaveBeenSent
+      || heldDeletionsRef.current.has(id) || heldResendsRef.current.has(id)) return;
+    heldResendsRef.current.add(id);
+    setResendingHeldIds(new Set(heldResendsRef.current));
+    try {
+      const proofs = held.local ? localOutboxRef.current.find((entry) => entry.id === id)?.uploadProofs : undefined;
+      if (!await holdMessage(sid, held.mode, held.message, held.images, held.uploads, proofs)) return;
+      if (held.local) await dropFromOutbox(id);
+      else await sendAgentCommand(sid, { type: "outbox_remove", id });
+    } catch (e) {
+      if (hookAliveRef.current && sessionIdRef.current === sid) addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      heldResendsRef.current.delete(id);
+      setResendingHeldIds(heldResendsRef.current.size ? new Set(heldResendsRef.current) : EMPTY_HELD_IDS);
+    }
+  }, [addNotice, holdMessage]);
+
+  /** Starts a turn the user never typed (the advisor `continue` directive, omp's `/retry`): no optimistic user
+   *  bubble, but otherwise handleSend's existing-session branch — same run-id bookkeeping reset, same optimistic
+   *  agentRunning before the network round-trip (so the UI reacts exactly like a normal prompt instead of waiting
+   *  on agent_start), same ensureEventsConnected (an idle session's SSE stream is not auto-connected — see the
+   *  mount effect above — so without this the turn's frames would arrive on a connection nobody opened) — minus
+   *  the pieces that only exist to render a typed prompt (buildOutgoingPrompt, the optimistic user bubble,
+   *  new-session bootstrapping).
+   *
+   *  `slashCommand` marks a builtin omp command, which may answer without running the agent at all: its optimistic
+   *  run then ends on the settlement poll, as a typed slash command's does. `replacesLastTurn` is for a command
+   *  that re-runs the transcript's last turn instead of adding one. `mapError` renames a refusal the user cannot
+   *  be expected to read. Returns false when the command never went out. */
+  const startHiddenRun = useCallback(async (
+    command: { type: string } & Record<string, unknown>,
+    { slashCommand = false, replacesLastTurn = false, mapError }: {
+      slashCommand?: boolean;
+      replacesLastTurn?: boolean;
+      mapError?: (message: string) => string;
+    } = {},
+  ): Promise<boolean> => {
+    const sid = sessionIdRef.current;
+    if (!sid || agentRunningRef.current || bashRunningRef.current || initialHydrationPendingRef.current) return false;
 
     const promptRunId = promptRunIdRef.current + 1;
     clearTerminalReconcileTimer();
@@ -4304,12 +4378,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     lastRunErrorRef.current = null;
     runPreviousEntryIdsRef.current = null;
     agentRunningRef.current = true;
-    slashCommandRunRef.current = false;
+    slashCommandRunRef.current = slashCommand;
     reconcileGuardRef.current?.reset();
     clearLiveToolResults();
-    setAddressingAdvisor(true);
     setAgentRunning(true);
-    setAgentPhase({ kind: "waiting_model" });
+    setAgentPhase(slashCommand ? { kind: "running_command" } : { kind: "waiting_model" });
     setAdvisorActiveAt(0);
     dispatch({ type: "start" });
     pendingScrollToUserRef.current = true;
@@ -4324,21 +4397,20 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       void registerHostUriSchemes(sid);
       const previousEntryIds = await snapshotRunEntries(sid);
       if (promptRunIdRef.current === promptRunId && sessionIdRef.current === sid) {
-        runPreviousEntryIdsRef.current = previousEntryIds;
+        runPreviousEntryIdsRef.current = replacesLastTurn
+          ? boundaryBeforeLastTurn(previousEntryIds, catchUp.history())
+          : previousEntryIds;
       }
-      await sendAgentCommand(sid, { type: "continue", reason: "advisor" });
+      await sendAgentCommand(sid, command);
       if (promptRunIdRef.current === promptRunId) promptDispatchPendingRef.current = false;
+      if (slashCommand) void waitForPromptSettlement(sid, promptRunId);
+      return true;
     } catch (e) {
-      if (promptRunIdRef.current !== promptRunId) return;
+      if (promptRunIdRef.current !== promptRunId) return false;
       promptDispatchPendingRef.current = false;
-      console.error("Failed to address advisor notes:", e);
+      console.error(`Failed to run ${command.type}:`, e);
       const message = e instanceof Error ? e.message : String(e);
-      addNotice({
-        type: "error",
-        message: /unknown command|unsupported command/i.test(message)
-          ? translate("messageView.advisorContinueUnsupported")
-          : message,
-      });
+      addNotice({ type: "error", message: mapError ? mapError(message) : message });
       agentRunningRef.current = false;
       catchUp.invalidate();
       eventCoalescer.reset();
@@ -4348,10 +4420,42 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       lastQuotaErrorRef.current = null;
       lastRunErrorRef.current = null;
       dispatch({ type: "end" });
+      return false;
+    }
+  }, [addNotice, catchUp, eventCoalescer, ensureEventsConnected, refreshSubagentRoster, registerHostTools, registerHostUriSchemes, snapshotRunEntries, clearLiveToolResults, clearTerminalReconcileTimer, waitForPromptSettlement]);
+
+  /** Resumes the agent on the hidden `continue` directive so it acts on the advisor notes already visible in the
+   *  transcript. */
+  const handleAddressAdvisor = useCallback(async () => {
+    setAddressingAdvisor(true);
+    try {
+      await startHiddenRun({ type: "continue", reason: "advisor" }, {
+        mapError: (message) => /unknown command|unsupported command/i.test(message)
+          ? translate("messageView.advisorContinueUnsupported")
+          : message,
+      });
     } finally {
       setAddressingAdvisor(false);
     }
-  }, [addNotice, catchUp, eventCoalescer, ensureEventsConnected, refreshSubagentRoster, registerHostTools, registerHostUriSchemes, snapshotRunEntries, clearLiveToolResults, clearTerminalReconcileTimer]);
+  }, [startHiddenRun]);
+
+  /** Runs omp's `/retry` on the last failed turn. omp replaces that turn in place and creates no user message, so
+   *  the command goes out as a prompt without an optimistic bubble — the prompt text is machinery, not something
+   *  the user said. */
+  const handleRetryRun = useCallback(async () => {
+    if (retryingRunRef.current) return;
+    retryingRunRef.current = true;
+    setRetryingRun(true);
+    retryEchoPendingRef.current = true;
+    try {
+      if (!await startHiddenRun({ type: "prompt", message: RETRY_COMMAND }, { slashCommand: true, replacesLastTurn: true })) {
+        retryEchoPendingRef.current = false;
+      }
+    } finally {
+      retryingRunRef.current = false;
+      setRetryingRun(false);
+    }
+  }, [startHiddenRun]);
 
   const handleAbortCompaction = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -4818,7 +4922,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     isCompacting, compactError, compactResult, tokensPerSecond, currentModel, displayModel, isAutoModelSelection: !displayModel, sessionStats, agentPhase,
     slashCommands, slashCommandsLoading, queuedMessages, hostStatus,
     notices: noticeState.visible, dismissNotice, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
-    advisorActive: advisorActiveAt > 0, advisorEnabled, handleAdvisorChange, addressingAdvisor, handleAddressAdvisor,
+    advisorActive: advisorActiveAt > 0, advisorEnabled, handleAdvisorChange, addressingAdvisor, handleAddressAdvisor, retryingRun, handleRetryRun,
     subagents, subagentEvents, subagentTranscriptVersions, activeSubagentCount, currentTodoPhase, todoPhases,
     activeGoal, activePlan,
     isNew,
@@ -4829,7 +4933,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     handleSend, handleAbort, handleFork, handleEdit, handleModelChange, handleFastModeChange, handleSlowModeChange, handleAutoRetryChange, handleInterruptModeChange, handleAutoCompactionChange, handleSteeringModeChange, handleFollowUpModeChange, handleCycleModel, handleCycleThinkingLevel, handleAbortRetry, handleInterruptAndReply, setSkillStartupDiagnostics,
     retrySession: () => { const sid = sessionIdRef.current; if (sid) void loadSession(sid, true, true); },
     handleCompact, handleHandoff, handleSteer, handleFollowUp, handleAbortCompaction,
-    heldMessages, deleteHeldMessage,
+    heldMessages, deleteHeldMessage, retryHeldMessage,
     handleBuiltinSlashCommand, togglePreCompactionHistory,
     handleToolPresetChange, handleThinkingLevelChange, loadSlashCommands, removeQueuedMessage, promoteQueuedToSteer, setActiveLeafId, setData, setMessages,
     dispatch, setAgentRunning, setForkingEntryId,

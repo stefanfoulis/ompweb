@@ -5,10 +5,10 @@ import React from "react";
 const { act, cleanup, fireEvent, render, waitFor } = await import("@testing-library/react/pure.js");
 import { renderToStaticMarkup } from "react-dom/server";
 
-const { HeldMessageView, MessageView, SafeMarkdownBody, TaskResultPanel, isInterruptedMessage } = await import("./MessageView.tsx");
+const { HeldMessageView, MessageView, SafeMarkdownBody, TaskResultPanel } = await import("./MessageView.tsx");
 const { CodeBlock } = await import("./MermaidBlock.tsx");
 const { buildSessionContext } = await import("../lib/session-reader.ts");
-const { collectToolResults, planTranscriptRows } = await import("../lib/chat-transcript-plan.ts");
+const { collectToolResults, isInterruptedMessage, lastRetryableErrorIndex, planTranscriptRows } = await import("../lib/chat-transcript-plan.ts");
 afterEach(cleanup);
 
 test("held messages name every delivery leg and only offer Delete before dispatch", () => {
@@ -1240,4 +1240,87 @@ test("a synthetic developer directive (continue RPC) renders as the muted resume
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Expand" })); });
   assert.ok(view.getByText(DIRECTIVE_TEXT));
   view.unmount();
+});
+
+const RETRY_LABEL = "Retry";
+const failedTurn = { role: "assistant", errorMessage: "401 invalid x-api-key", content: [] };
+
+test("a failed turn marked by ChatWindow offers Retry in its error banner and fires the handler", async () => {
+  const calls = [];
+  const view = render(React.createElement(MessageView, {
+    message: failedTurn,
+    canRetryRun: true,
+    onRetryRun: () => calls.push(true),
+  }));
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: RETRY_LABEL })); });
+  assert.deepEqual(calls, [true]);
+  view.unmount();
+});
+
+test("Retry is absent unless the row is the failed turn ChatWindow marked", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    message: failedTurn,
+    onRetryRun: () => {},
+  }));
+  assert.doesNotMatch(html, /aria-label="Retry"/);
+});
+
+test("Retry never appears on a turn the user interrupted, nor on one that succeeded", () => {
+  for (const message of [
+    { role: "assistant", errorMessage: "Interrupted by user", content: [] },
+    { role: "assistant", content: [{ type: "text", text: "Answered." }] },
+  ]) {
+    const html = renderToStaticMarkup(React.createElement(MessageView, { message, canRetryRun: true, onRetryRun: () => {} }));
+    assert.doesNotMatch(html, /aria-label="Retry"/, message.errorMessage ?? "no error");
+  }
+});
+
+test("Retry shows the in-flight label and disables while the /retry prompt is in flight", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    message: failedTurn,
+    canRetryRun: true,
+    onRetryRun: () => {},
+    retryingRun: true,
+  }));
+  assert.match(html, /Retrying…/);
+  assert.match(html, /<button[^>]*disabled/);
+});
+
+test("lastRetryableErrorIndex points at the last failed turn, and at nothing once a newer turn owns the tail", () => {
+  const user = { role: "user", content: "question" };
+  const failed = { role: "assistant", errorMessage: "connection error", content: [] };
+  const answered = { role: "assistant", content: [{ type: "text", text: "answer" }] };
+  const interrupted = { role: "assistant", errorMessage: "Interrupted by user", content: [] };
+  assert.equal(lastRetryableErrorIndex([user, failed]), 1);
+  assert.equal(lastRetryableErrorIndex([user, failed, { role: "custom", customType: "advisor", content: "note" }]), 1);
+  assert.equal(lastRetryableErrorIndex([user, failed, user, answered]), -1);
+  assert.equal(lastRetryableErrorIndex([user, failed, user]), -1);
+  assert.equal(lastRetryableErrorIndex([user, answered]), -1);
+  assert.equal(lastRetryableErrorIndex([user, interrupted]), -1);
+  assert.equal(lastRetryableErrorIndex([]), -1);
+});
+
+test("a refused held message offers Retry next to Delete, and reports which entry to resend", async () => {
+  const held = { id: "held-1", mode: "prompt", message: "Keep this safe.", createdAt: Date.now(), local: false, state: "failed", error: "No API key found for anthropic" };
+  const resent = [];
+  const view = render(React.createElement(HeldMessageView, { held, onDelete() {}, onRetry: (id) => resent.push(id) }));
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: "Send this message again" })); });
+  assert.deepEqual(resent, ["held-1"]);
+  assert.ok(view.getByRole("button", { name: "Delete this held message" }));
+  view.unmount();
+});
+
+test("held messages offer Retry only once the outbox refused them outright", () => {
+  const base = { id: "held", mode: "prompt", message: "Keep this safe.", createdAt: Date.now(), local: false };
+  for (const [held, offered] of [
+    [{ state: "failed" }, true],
+    [{ state: "failed", mayHaveBeenSent: true }, false],
+    [{ state: "held" }, false],
+    [{ state: "waiting_host" }, false],
+    [{ state: "sending" }, false],
+    [{ state: "delivering" }, false],
+  ]) {
+    const html = renderToStaticMarkup(React.createElement(HeldMessageView, { held: { ...base, ...held }, onDelete() {}, onRetry() {} }));
+    assert.equal(html.includes("Send this message again"), offered, JSON.stringify(held));
+  }
 });

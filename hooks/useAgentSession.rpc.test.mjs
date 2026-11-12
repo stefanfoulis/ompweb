@@ -7355,3 +7355,151 @@ test("handleAddressAdvisor surfaces a localized notice when this omp build does 
   );
   assert.equal(w.latest.agentRunning, false, "a failed continue must roll back the optimistic running state");
 });
+
+/** Mount a session whose last turn failed, then click Retry on it. */
+async function startRetry(sid = "retry-run") {
+  primeSession(sid, [
+    userMsg("u0", "question"),
+    { ...assistantMsg("a1", ""), content: [], stopReason: "error", errorMessage: "401 invalid x-api-key" },
+  ]);
+  const w = await mountSession(sid);
+  let retryPromise;
+  await act(async () => {
+    retryPromise = w.latest.handleRetryRun();
+    await sleep(30); // let the pre-connect get_state POST settle
+  });
+  const es = lastEs();
+  assert.ok(es, "an EventSource must have been created");
+  await act(async () => {
+    es.open();
+    await retryPromise;
+  });
+  return { w, es };
+}
+
+test("handleRetryRun runs omp's /retry as a prompt with no user bubble and the run bookkeeping of a normal prompt", async () => {
+  resetWorld();
+  const { w, es } = await startRetry();
+  assert.equal(w.latest.agentRunning, true, "optimistic running state, same as a normal prompt");
+  const prompts = callsTo("POST", "/api/agent/retry-run").filter((c) => c.body?.type === "prompt");
+  assert.deepEqual(prompts.map((c) => c.body), [{ type: "prompt", message: "/retry" }]);
+  // omp replaces the failed turn instead of recording a new user message, so the transcript must not grow one.
+  assert.equal(w.latest.messages.some((message) => message.role === "user" && message.content === "/retry"), false);
+  assert.equal(w.latest.streamState.streamingMessage?.role === "user", false);
+
+  await act(async () => {
+    es.emit({ type: "agent_start" });
+    es.emit({ type: "agent_end", isTerminal: true });
+  });
+  await settle();
+  assert.equal(w.latest.agentRunning, false);
+});
+
+test("a /retry that fails again leaves the error to the replaced assistant message, with no notice beside it", async () => {
+  resetWorld();
+  const sid = "retry-fails-again";
+  const { w, es } = await startRetry(sid);
+  const failure = "401 invalid x-api-key";
+  // omp replaces the failed turn: the same user entry keeps its place and the assistant entry is a new one.
+  const replacement = { ...assistantMsg("a2", ""), content: [], timestamp: 99, stopReason: "error", errorMessage: failure };
+  await act(async () => {
+    es.emit({ type: "agent_start" });
+    es.emit({ type: "message_end", message: replacement }, { persist: false });
+    saveSession(sid, [userMsg("u0", "question"), replacement], ["e0", "e2"]);
+    publishSessionsChanged([sid]);
+  });
+  await settle();
+  await act(() => es.emit({ type: "agent_end", isTerminal: true }));
+  await settle();
+  assert.equal(w.latest.messages.at(-1).errorMessage, failure, "the retried turn carries the failure inline");
+  assert.deepEqual(w.latest.notices.filter((notice) => notice.type === "error"), [],
+    "the inline banner is the message: a run whose failure is saved must not also raise a notice");
+});
+
+test("the /retry announcement is not repeated as a notice; the run is the feedback", async () => {
+  resetWorld();
+  const { w, es } = await startRetry();
+  await act(() => {
+    es.emit({ type: "command_output", text: "Retrying the last failed turn." });
+    es.emit({ type: "agent_start" });
+  });
+  assert.deepEqual(w.latest.notices, []);
+  await act(() => es.emit({ type: "agent_end", isTerminal: true }));
+  await settle();
+});
+
+test("a /retry omp cannot act on reaches the user and ends the optimistic run", async () => {
+  resetWorld();
+  const { w } = await startRetry("retry-nothing");
+  await act(() => lastEs().emit({ type: "command_output", text: "Nothing to retry." }));
+  assert.ok(w.latest.notices.some((notice) => notice.message === "Nothing to retry."));
+  // omp answered without starting a run: the settlement poll ends the optimistic one (it is a builtin command, so
+  // no "the agent stopped without returning a response" error follows).
+  await settle(1600);
+  assert.equal(w.latest.agentRunning, false);
+  assert.equal(w.latest.notices.some((notice) => notice.type === "error"), false);
+});
+
+test("retrying a refused held message queues the same message again and only then drops the refused entry", async () => {
+  resetWorld();
+  const sid = "outbox-retry";
+  primeSession(sid, [userMsg("u0", "before")]);
+  const entry = {
+    id: "refused", sessionId: sid, mode: "followUp", message: "resend me",
+    images: [{ type: "image", data: "aGk=", mimeType: "image/png" }], uploads: ["staged-upload"],
+    state: "failed", error: "No API key found for anthropic", createdAt: 1,
+  };
+  world.holds.push({
+    match: (method, url) => method === "GET" && url === `/api/sessions/${sid}/state`,
+    produce: async () => ({ value: { running: false, outbox: [entry], outboxScope: "test-scope" } }),
+  });
+  const w = await mountSession(sid);
+  assert.equal(w.latest.heldMessages.length, 1);
+  world.outboxHold = true; // keep the replacement held, so it can be inspected instead of being dispatched
+  let queuedBeforeRemove = false;
+  world.holds.push({
+    match: (method, _url, body) => method === "POST" && body?.type === "outbox_remove",
+    produce: async () => {
+      queuedBeforeRemove = world.outbox.some((held) => held.id !== entry.id && held.message === entry.message);
+      return { value: { success: true, data: { removed: true, entry } } };
+    },
+  });
+  // Hold the worker's durable commit: the refused bubble must already be gone while its replacement is in flight,
+  // so the same message is never on screen twice.
+  let commit = null;
+  world.outboxCommit = (complete) => { commit = complete; };
+  let retrying;
+  await act(async () => { retrying = w.latest.retryHeldMessage(entry.id); await sleep(10); });
+  assert.deepEqual(w.latest.heldMessages.map((held) => held.id), [], "the refused bubble is held back while its replacement is queued");
+  await act(async () => { const complete = commit; commit = null; complete(); await retrying; });
+
+  const queued = world.lastOutboxAdd.entry;
+  assert.notEqual(queued.id, entry.id, "the resend is a new outbox entry");
+  assert.equal(queued.message, entry.message);
+  assert.equal(queued.mode, entry.mode);
+  assert.deepEqual(queued.images, entry.images);
+  assert.deepEqual(queued.uploads, entry.uploads);
+  assert.ok(queuedBeforeRemove, "the replacement is stored before the refused entry is dropped");
+  assert.deepEqual(
+    callsTo("POST", `/api/agent/${sid}`).filter((call) => call.body?.type === "outbox_remove").map((call) => call.body),
+    [{ type: "outbox_remove", id: entry.id }],
+  );
+});
+
+test("a resend the outbox refuses keeps the failed bubble and drops nothing", async () => {
+  resetWorld();
+  const sid = "outbox-retry-refused";
+  primeSession(sid, [userMsg("u0", "before")]);
+  const entry = { id: "local-refused", sessionId: sid, scope: "test-scope", mode: "prompt", message: "still mine", state: "failed", error: "No API key found for anthropic", createdAt: 1 };
+  world.outbox.push(entry);
+  await act(() => workerPort.onmessage({ data: { outbox: [entry] } }));
+  const w = await mountSession(sid);
+  assert.equal(w.latest.heldMessages.length, 1);
+  world.outboxCommit = () => {
+    workerPort.onmessage({ data: { outboxAdded: world.lastOutboxAdd.n, error: "IndexedDB write failed" } });
+  };
+  await act(async () => { await w.latest.retryHeldMessage(entry.id); });
+  assert.deepEqual(w.latest.heldMessages.map((held) => held.id), [entry.id], "the only copy of the message stays");
+  assert.ok(w.latest.notices.some((notice) => notice.type === "error" && /IndexedDB write failed/.test(notice.message)));
+  assert.equal(world.outbox.filter((held) => held.id !== entry.id).length, 0);
+});
