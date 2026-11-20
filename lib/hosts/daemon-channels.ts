@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { SpawnRequest, SpawnResult } from "./host";
 import type { RpcTransport } from "../omp/rpc-transport";
+import { STDERR_TAIL_LIMIT } from "../omp/rpc-process";
 import { encodeRpcCommand, RpcFrameDecoder, type RpcFrameRecord } from "../omp/rpc-frame";
 import { readSessionHeaderSync } from "../omp/session-files";
 import { isValidSessionId } from "../session-file-references-core";
@@ -48,6 +49,31 @@ type ChannelDeps = {
 };
 const collision = () => new HostOpError(409, "session_running_elsewhere", "This session is already running on another link");
 const invalid = (message = "Invalid channel request") => new HostOpError(400, "invalid_request", message);
+const REASON_LIMIT = 300;
+const ANSI = /\x1b\[[0-9;]*m/g;
+const ERROR_HEADER = /^\s*(?:[A-Z]\w*)?Error: \S/;
+const STACK_FRAME = /^\s*at\s+\S/;
+const SOURCE_FRAME = /^\s*\d+\s*\|/;
+const CARET_LINE = /^\s*\^+\s*$/;
+/** omp's fatal handler prints `Bun.inspect(error)`: a numbered source line, a caret
+ * pointing at the failure, the error's `Name: message` header, then a stack trace
+ * (and sometimes recovery hints after it). The header is the one line worth
+ * surfacing as "why"; fall back to the last line that is neither a stack frame
+ * nor a source frame when no header is present. */
+function stderrExitReason(tail: string): string | null {
+  const lines = tail.replace(ANSI, "").split("\n");
+  let header: string | null = null;
+  let lastUsable: string | null = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (ERROR_HEADER.test(line)) header = trimmed;
+    else if (!STACK_FRAME.test(line) && !SOURCE_FRAME.test(line) && !CARET_LINE.test(line)) lastUsable = trimmed;
+  }
+  const reason = header ?? lastUsable;
+  if (!reason) return null;
+  return reason.length > REASON_LIMIT ? `${reason.slice(0, REASON_LIMIT)}…` : reason;
+}
 
 export class ChannelTable {
   private readonly channels = new Map<string, Channel>();
@@ -246,7 +272,8 @@ export class ChannelTable {
           write: (frame, onReply) => { void this.command(channel, frame, onReply).catch(error => this.deps.log(`channel ${ch}: ${String(error)}`)); } });
       }
       spawned.transport.onLine(line => this.stdout(channel, line));
-      spawned.transport.onStderr(chunk => this.broadcast(channel, { type: "stderr", ch, chunk }));
+      let stderrTail = "";
+      spawned.transport.onStderr(chunk => { stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_LIMIT); this.broadcast(channel, { type: "stderr", ch, chunk }); });
       spawned.transport.onExit((code, signal) => {
         channel.exited = true; clearTimeout(channel.readyTimer); channel.noteReady(null); clearTimeout(channel.forceTimer);
         channel.lifecycle?.dispose(); channel.snapshot.clear();
@@ -261,7 +288,10 @@ export class ChannelTable {
       if (legacy === null) channel.startup = this.configure(channel).finally(() => channel.lifecycle?.setStartup(false));
       else { clearTimeout(readyTimer); noteReady(null); }
       await channel.startup;
-      if (channel.exited) throw new HostOpError(502, "host_process_exited", "omp exited during startup");
+      if (channel.exited) {
+        const reason = stderrExitReason(stderrTail);
+        throw new HostOpError(502, "host_process_exited", `omp exited during startup${reason ? `: ${reason}` : ""}`);
+      }
       this.deps.sessionsChanged?.();
       return channel;
     } finally { this.spawningCount--; }

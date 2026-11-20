@@ -86,7 +86,7 @@ export interface RpcProcessOptions {
   };
 }
 
-const STDERR_TAIL_LIMIT = 8 * 1024;
+export const STDERR_TAIL_LIMIT = 8 * 1024;
 
 /** A stdout line as JSON; undefined when blank or not JSON (omp guards stdout in RPC mode, but never let a stray line kill the reader). */
 function parseLine(line: string): unknown {
