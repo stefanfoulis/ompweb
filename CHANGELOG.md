@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ## [Unreleased]
 
+### Fixed
+
+- **A session that fails to start says why.** When omp exits during startup, "This machine" and linked hosts alike now show the reason from omp's own stderr (for example the model it could not restore) instead of only "omp exited during startup".
+
 ## [v0.7.4] - 2026-11-20
 
 ### Fixed

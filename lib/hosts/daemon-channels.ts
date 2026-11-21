@@ -50,6 +50,32 @@ type ChannelDeps = {
 };
 const collision = () => new HostOpError(409, "session_running_elsewhere", "This session is already running on another link");
 const invalid = (message = "Invalid channel request") => new HostOpError(400, "invalid_request", message);
+const REASON_LIMIT = 300;
+const ANSI = /\x1b\[[0-9;]*m/g;
+const ERROR_HEADER = /^\s*(?:[A-Z]\w*)?Error: \S/;
+const STACK_FRAME = /^\s*at\s+\S/;
+const SOURCE_FRAME = /^\s*\d+\s*\|/;
+const CARET_LINE = /^\s*\^+\s*$/;
+/** omp's fatal handler prints `Bun.inspect(error)`: a numbered source line, a caret
+ * pointing at the failure, the error's `Name: message` header, then a stack trace
+ * (and sometimes recovery hints after it). The header is the one line worth
+ * surfacing as "why"; fall back to the last line that is neither a stack frame
+ * nor a source frame when no header is present. */
+function stderrExitReason(tail: string): string | null {
+  const lines = tail.replace(ANSI, "").split("\n");
+  let header: string | null = null;
+  let lastUsable: string | null = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (ERROR_HEADER.test(line)) header = trimmed;
+    else if (!STACK_FRAME.test(line) && !SOURCE_FRAME.test(line) && !CARET_LINE.test(line)) lastUsable = trimmed;
+  }
+  const reason = header ?? lastUsable;
+  if (!reason) return null;
+  return reason.length > REASON_LIMIT ? `${reason.slice(0, REASON_LIMIT)}…` : reason;
+}
+
 /** A process start's launch, from what its opener asked: the wire never names the credentials server (it is the opening
  * link's own, and only when the hub asks), and a configuration version passes only in its one valid form. */
 function forStart(launch: SpawnRequest, link: DaemonLink, opener: SpawnRequest): SpawnRequest {
@@ -276,7 +302,8 @@ export class ChannelTable {
         deliver: (id, lines) => { const member = channel.members.get(id); if (member) for (const line of lines) this.deliver(channel, member, { type: "stdout", ch, line }); },
         write: (op, args, onReply) => { void this.command(channel, op, args, onReply).catch(error => this.deps.log(`channel ${ch}: ${String(error)}`)); } });
       spawned.transport.onLine(line => this.stdout(channel, line));
-      // The last 500 bytes omp writes before startup settles, for the daemon's own log if it exits meanwhile; never sent on.
+      // The last 500 bytes omp writes before startup settles: the daemon's own log names it on a
+      // crash there, and stderrExitReason picks the failure out of it for the open rejection's reason.
       let startupStderr: Buffer | null = Buffer.alloc(0);
       spawned.transport.onStderr(chunk => {
         if (startupStderr) startupStderr = Buffer.concat([startupStderr, Buffer.from(chunk.slice(-500))]).subarray(-500);
@@ -296,8 +323,9 @@ export class ChannelTable {
       });
       channel.startup = this.configure(channel).finally(() => channel.lifecycle?.setStartup(false));
       await channel.startup;
+      const reason = startupStderr ? stderrExitReason(startupStderr.toString("utf8")) : null;
       startupStderr = null;
-      if (channel.exited) throw new HostOpError(502, "host_process_exited", "omp exited during startup");
+      if (channel.exited) throw new HostOpError(502, "host_process_exited", `omp exited during startup${reason ? `: ${reason}` : ""}`);
       this.deps.sessionsChanged?.();
       return channel;
     } finally { this.spawningCount--; }
