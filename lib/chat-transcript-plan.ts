@@ -302,3 +302,43 @@ export function lastUnaddressedAdvisorIndex(messages: AgentMessage[]): number {
   }
   return -1;
 }
+
+/**
+ * True when an assistant turn ended because the user stopped it, rather than
+ * because something failed: the message then carries a stop note, not an error
+ * worth retrying.
+ */
+export function isInterruptedMessage(errorMessage?: string | null, stopReason?: string): boolean {
+  if (stopReason === "aborted") return true;
+  if (!errorMessage) return false;
+  const lower = errorMessage.toLowerCase().trim();
+  return (
+    lower === "interrupted by user" ||
+    lower === "interrupted" ||
+    lower === "generation stopped by user" ||
+    lower.startsWith("interrupted by user") ||
+    lower.startsWith("interrupted:") ||
+    lower === "aborted" ||
+    lower === "request aborted"
+  );
+}
+
+/**
+ * Index of the failed assistant message the "Retry" button belongs on, or -1
+ * if none qualifies. omp's `/retry` re-runs the last failed turn, so only the
+ * transcript's last assistant message can be it, and only when it failed for
+ * a reason the user did not cause (an interrupted turn is not retried). A
+ * later user message means a newer turn owns the tail. Callers still gate on
+ * session idle separately — this only reads structure.
+ */
+export function lastRetryableErrorIndex(messages: AgentMessage[]): number {
+  for (let idx = messages.length - 1; idx >= 0; idx--) {
+    const message = messages[idx];
+    if (message.role === "user") return -1;
+    if (message.role === "assistant") {
+      const error = (message as AssistantMessage).errorMessage?.trim();
+      return error && !isInterruptedMessage(error, (message as AssistantMessage).stopReason) ? idx : -1;
+    }
+  }
+  return -1;
+}

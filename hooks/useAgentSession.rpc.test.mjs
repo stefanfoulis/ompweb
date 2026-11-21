@@ -8659,3 +8659,87 @@ test("handleAddressAdvisor surfaces a localized notice when this omp build does 
   );
   assert.equal(w.latest.agentRunning, false, "a failed continue must roll back the optimistic running state");
 });
+
+/** Mount a session whose last turn failed, then click Retry on it. */
+async function startRetry(sid = "retry-run") {
+  primeSession(sid, [
+    userMsg("u0", "question"),
+    { ...assistantMsg("a1", ""), content: [], stopReason: "error", errorMessage: "401 invalid x-api-key" },
+  ]);
+  const w = await mountSession(sid);
+  let retryPromise;
+  await act(async () => {
+    retryPromise = w.latest.handleRetryRun();
+    await sleep(30); // let the pre-connect get_state POST settle
+  });
+  const es = lastEs();
+  assert.ok(es, "an EventSource must have been created");
+  await act(async () => {
+    es.open();
+    await retryPromise;
+  });
+  return { w, es };
+}
+
+test("handleRetryRun runs omp's /retry as a prompt with no user bubble and the run bookkeeping of a normal prompt", async () => {
+  resetWorld();
+  const { w, es } = await startRetry();
+  assert.equal(w.latest.agentRunning, true, "optimistic running state, same as a normal prompt");
+  const prompts = callsTo("POST", "/api/agent/retry-run").filter((c) => c.body?.type === "prompt");
+  assert.deepEqual(prompts.map((c) => c.body), [{ type: "prompt", message: "/retry" }]);
+  // omp replaces the failed turn instead of recording a new user message, so the transcript must not grow one.
+  assert.equal(w.latest.messages.some((message) => message.role === "user" && message.content === "/retry"), false);
+  assert.equal(w.latest.streamState.streamingMessage?.role === "user", false);
+
+  await act(async () => {
+    es.emit({ type: "agent_start" });
+    es.emit({ type: "agent_end", isTerminal: true });
+  });
+  await settle();
+  assert.equal(w.latest.agentRunning, false);
+});
+
+test("a /retry that fails again leaves the error to the replaced assistant message, with no notice beside it", async () => {
+  resetWorld();
+  const sid = "retry-fails-again";
+  const { w, es } = await startRetry(sid);
+  const failure = "401 invalid x-api-key";
+  // omp replaces the failed turn: the same user entry keeps its place and the assistant entry is a new one.
+  const replacement = { ...assistantMsg("a2", ""), content: [], timestamp: 99, stopReason: "error", errorMessage: failure };
+  await act(async () => {
+    es.emit({ type: "agent_start" });
+    es.emit({ type: "message_end", message: replacement }, { persist: false });
+    saveSession(sid, [userMsg("u0", "question"), replacement], ["e0", "e2"]);
+    publishSessionsChanged([sid]);
+  });
+  await settle();
+  await act(() => es.emit({ type: "agent_end", isTerminal: true }));
+  await settle();
+  assert.equal(w.latest.messages.at(-1).errorMessage, failure, "the retried turn carries the failure inline");
+  assert.deepEqual(w.latest.notices.filter((notice) => notice.type === "error"), [],
+    "the inline banner is the message: a run whose failure is saved must not also raise a notice");
+});
+
+test("the /retry announcement is not repeated as a notice; the run is the feedback", async () => {
+  resetWorld();
+  const { w, es } = await startRetry();
+  await act(() => {
+    es.emit({ type: "command_output", text: "Retrying the last failed turn." });
+    es.emit({ type: "agent_start" });
+  });
+  assert.deepEqual(w.latest.notices, []);
+  await act(() => es.emit({ type: "agent_end", isTerminal: true }));
+  await settle();
+});
+
+test("a /retry omp cannot act on reaches the user and ends the optimistic run", async () => {
+  resetWorld();
+  const { w } = await startRetry("retry-nothing");
+  await act(() => lastEs().emit({ type: "command_output", text: "Nothing to retry." }));
+  assert.ok(w.latest.notices.some((notice) => notice.message === "Nothing to retry."));
+  // omp answered without starting a run: the settlement poll ends the optimistic one (it is a builtin command, so
+  // no "the agent stopped without returning a response" error follows).
+  await settle(1600);
+  assert.equal(w.latest.agentRunning, false);
+  assert.equal(w.latest.notices.some((notice) => notice.type === "error"), false);
+});

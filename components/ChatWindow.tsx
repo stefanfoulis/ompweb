@@ -5,7 +5,7 @@ import { Fragment, memo, useCallback, useEffect, useMemo, useReducer, useRef, us
 import { ArrowDown, ChevronDown, ChevronUp, Paperclip, Square } from "lucide-react";
 import type { AgentMessage, AssistantMessage, SessionInfo, SessionTreeNode, ToolResultMessage, UiCustomFrame } from "@/lib/types";
 import { translate, useI18n } from "@/lib/i18n";
-import { collectToolResults, isGroupAnchor, lastUnaddressedAdvisorIndex, planTranscriptRows, type TranscriptRow } from "@/lib/chat-transcript-plan";
+import { collectToolResults, isGroupAnchor, lastRetryableErrorIndex, lastUnaddressedAdvisorIndex, planTranscriptRows, type TranscriptRow } from "@/lib/chat-transcript-plan";
 import { isReplyBlock } from "@/lib/message-display";
 import { resolveForkTargets } from "@/lib/chat-fork";
 import { renderTranscriptGroupRow, type RenderMessage } from "./ChatWindow-transcript-group-row";
@@ -242,6 +242,11 @@ interface CommittedTranscriptProps {
   onAddressAdvisor?: () => void;
   /** True while a request started by onAddressAdvisor is in flight. */
   addressingAdvisor?: boolean;
+  /** Handler for the failed-turn banner's "Retry" button (omp's `/retry`);
+   *  undefined hides the button entirely. */
+  onRetryRun?: () => void;
+  /** True while the `/retry` prompt started by onRetryRun is in flight. */
+  retryingRun?: boolean;
   sessionId: string | undefined;
   toolCallsDefaultCollapsed: boolean;
   /** Fold a running turn's tool calls; off restores the flat live tail. */
@@ -270,7 +275,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
   messages, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, isCompacting, externalRunActive, isNew, forkingEntryId, editingEntryId,
   handleFork, handleEdit, modelNames, messageCwd, onOpenFile, sessionId,
   toolCallsDefaultCollapsed, hideToolActivity, neverFoldActivity, showToolCallsUnfolded, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
-  onAddressAdvisor, addressingAdvisor,
+  onAddressAdvisor, addressingAdvisor, onRetryRun, retryingRun,
 }: CommittedTranscriptProps) {
   const { t } = useI18n();
   const { toolResultsMap, lastAnchorIdx, visibleRefIndexByMessage } = conversationMeta;
@@ -281,6 +286,13 @@ const CommittedTranscript = memo(function CommittedTranscript({
   // idle — a running/streaming turn means the agent is already acting (or
   // about to), so address-again would race it.
   const addressableAdvisorIdx = !sessionBusy && !isStreaming ? lastUnaddressedAdvisorIndex(messages) : -1;
+  // The failed-turn Retry button appears only on the transcript's last failed
+  // assistant message, and only while the session is idle and no history edit
+  // is pending: omp's `/retry` replaces that turn in place, so a run, a
+  // compaction or a fork/edit in flight would race it.
+  const retryableErrorIdx = !sessionBusy && !isStreaming && !isCompacting && !isNew && forkingEntryId === null && editingEntryId === null
+    ? lastRetryableErrorIndex(messages)
+    : -1;
 
   const attachVisibleRef = (idx: number, refIndex: number) => (el: HTMLDivElement | null) => {
     messageRefs.current[refIndex] = el;
@@ -329,6 +341,9 @@ const CommittedTranscript = memo(function CommittedTranscript({
         canAddressAdvisor={idx === addressableAdvisorIdx}
         onAddressAdvisor={onAddressAdvisor}
         addressingAdvisor={addressingAdvisor}
+        canRetryRun={idx === retryableErrorIdx}
+        onRetryRun={onRetryRun}
+        retryingRun={retryingRun}
         onEdit={canOfferEdit ? handleEdit : undefined}
         editing={editingEntryId === entryIds[idx]}
         editDisabled={historyMutationPending}
@@ -490,7 +505,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, newSessio
     liveModelMeta,
     retryInfo, contextUsage, forkingEntryId, editingEntryId,
     isCompacting, compactResult, tokensPerSecond, displayModel: displayModelValue, sessionStats,
-    slashCommands, slashCommandsLoading, queuedMessages, advisorActive, advisorEnabled, handleAdvisorChange, addressingAdvisor, handleAddressAdvisor,
+    slashCommands, slashCommandsLoading, queuedMessages, advisorActive, advisorEnabled, handleAdvisorChange, addressingAdvisor, handleAddressAdvisor, retryingRun, handleRetryRun,
     notices, dismissNotice, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
     isAutoModelSelection,
     agentPhase, activeGoal, activePlan,
@@ -1360,6 +1375,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, newSessio
               onOpenFile={onOpenFile}
               onAddressAdvisor={handleAddressAdvisor}
               addressingAdvisor={addressingAdvisor}
+              onRetryRun={handleRetryRun}
+              retryingRun={retryingRun}
               sessionId={session?.id ?? sessionIdRef.current ?? undefined}
               toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
               hideToolActivity={hideToolActivity}

@@ -11,7 +11,7 @@ import { ClickableImage } from "./ImageLightbox";
 import { translate, useI18n, type Locale } from "@/lib/i18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
 import { DEVELOPER_MARKER_CUSTOM_TYPE, isEmptyThinkingBlock, isReplyBlock } from "@/lib/message-display";
-import { isPassiveToolContext } from "@/lib/chat-transcript-plan";
+import { isInterruptedMessage, isPassiveToolContext } from "@/lib/chat-transcript-plan";
 import { Tooltip, Collapsible, CollapsibleTrigger } from "./ui/primitives";
 import { ConfirmDialog } from "./ui/field";
 import { useCopyFeedback } from "@/hooks/useCopyFeedback";
@@ -197,6 +197,14 @@ interface Props {
   onAddressAdvisor?: () => void;
   /** True while a `continue` RPC triggered by this button is in flight. */
   addressingAdvisor?: boolean;
+  /** True only for the one failed assistant message omp's `/retry` would
+   *  re-run — ChatWindow computes the predicate (lastRetryableErrorIndex)
+   *  plus the session-idle gate and passes it down per row, as for the
+   *  advisor button. */
+  canRetryRun?: boolean;
+  onRetryRun?: () => void;
+  /** True while the `/retry` prompt triggered by this button is in flight. */
+  retryingRun?: boolean;
 }
 
 function formatTime(ts: number | undefined, locale: Locale): string | null {
@@ -258,17 +266,20 @@ export function areMessageViewPropsEqual(prev: Props, next: Props): boolean {
     && Object.is(prev.canAddressAdvisor, next.canAddressAdvisor)
     && Object.is(prev.onAddressAdvisor, next.onAddressAdvisor)
     && Object.is(prev.addressingAdvisor, next.addressingAdvisor)
+    && Object.is(prev.canRetryRun, next.canRetryRun)
+    && Object.is(prev.onRetryRun, next.onRetryRun)
+    && Object.is(prev.retryingRun, next.retryingRun)
     && (!prev.isStreaming || Object.is(prev.liveTokensPerSecond, next.liveTokensPerSecond));
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkEditsPrompt, onFork, forking, forkDisabled, onEdit, editing, editDisabled, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond, canAddressAdvisor, onAddressAdvisor, addressingAdvisor }: Props) {
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkEditsPrompt, onFork, forking, forkDisabled, onEdit, editing, editDisabled, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond, canAddressAdvisor, onAddressAdvisor, addressingAdvisor, canRetryRun, onRetryRun, retryingRun }: Props) {
   if (message.role === "user") {
     const user = message as UserMessage;
     if (user.origin) return <OriginMessageView message={user} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} entryId={entryId} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
     return <UserMessageView message={user} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} entryId={entryId} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
   }
   if (message.role === "assistant") {
-    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} forkEditsPrompt={forkEditsPrompt} onFork={onFork} forking={forking} forkDisabled={forkDisabled} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} expandThinkingByDefault={expandThinkingByDefault} hideThinking={hideThinking} sourceBlockIndices={sourceBlockIndices} liveTokensPerSecond={liveTokensPerSecond} />;
+    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} forkEditsPrompt={forkEditsPrompt} onFork={onFork} forking={forking} forkDisabled={forkDisabled} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} expandThinkingByDefault={expandThinkingByDefault} hideThinking={hideThinking} sourceBlockIndices={sourceBlockIndices} liveTokensPerSecond={liveTokensPerSecond} canRetryRun={canRetryRun} onRetryRun={onRetryRun} retryingRun={retryingRun} />;
   }
   if (message.role === "toolResult") {
     // Rendered inline under its toolCall — skip standalone rendering if paired
@@ -408,6 +419,47 @@ function AddressAdvisorButton({ onAddressAdvisor, addressing }: {
         onMouseLeave={(e) => { if (!addressing) e.currentTarget.style.color = "var(--text-dim)"; }}
       >
         <CornerDownLeft size={11} strokeWidth={1.8} />
+        {label}
+      </button>
+    </Tooltip>
+  );
+}
+
+/**
+ * Runs omp's builtin `/retry` on the failed turn this banner belongs to, so a
+ * prompt stopped by an expired key or a dropped connection does not have to be
+ * typed again. ChatWindow passes a truthy `onRetryRun` only to the one row
+ * `/retry` would re-run (lastRetryableErrorIndex + session-idle), so the
+ * banner just renders when asked.
+ */
+function RetryRunButton({ onRetryRun, retrying }: {
+  onRetryRun: () => void;
+  retrying?: boolean;
+}) {
+  const { t } = useI18n();
+  const label = retrying ? t("messageView.retrying") : t("messageView.retryTurn");
+  return (
+    <Tooltip content={t("messageView.retryTurnTooltip")}>
+      <button
+        type="button"
+        onClick={onRetryRun}
+        disabled={retrying}
+        aria-label={label}
+        style={{
+          display: "flex", alignItems: "center", gap: 4,
+          flexShrink: 0,
+          padding: "2px 8px", height: 22, minHeight: 22,
+          background: "none",
+          border: "1px solid color-mix(in srgb, var(--status-error) 35%, var(--border))",
+          borderRadius: 5,
+          color: "inherit",
+          cursor: retrying ? "not-allowed" : "pointer",
+          opacity: retrying ? 0.6 : 1,
+          fontSize: 11, fontWeight: 400,
+          whiteSpace: "nowrap",
+        }}
+      >
+        <RotateCcw size={11} strokeWidth={1.8} aria-hidden="true" />
         {label}
       </button>
     </Tooltip>
@@ -704,20 +756,6 @@ export function HeldMessageView({ held, hostLabel, onDelete, onRetry }: {
     </div>
   );
 }
-export function isInterruptedMessage(errorMessage?: string | null, stopReason?: string): boolean {
-  if (stopReason === "aborted") return true;
-  if (!errorMessage) return false;
-  const lower = errorMessage.toLowerCase().trim();
-  return (
-    lower === "interrupted by user" ||
-    lower === "interrupted" ||
-    lower === "generation stopped by user" ||
-    lower.startsWith("interrupted by user") ||
-    lower.startsWith("interrupted:") ||
-    lower === "aborted" ||
-    lower === "request aborted"
-  );
-}
 
 function AssistantMessageView({
   message,
@@ -740,6 +778,9 @@ function AssistantMessageView({
   hideThinking,
   sourceBlockIndices,
   liveTokensPerSecond,
+  canRetryRun,
+  onRetryRun,
+  retryingRun,
 }: {
   message: AssistantMessage;
   isStreaming?: boolean;
@@ -762,6 +803,14 @@ function AssistantMessageView({
   hideThinking: boolean;
   sourceBlockIndices?: number[];
   liveTokensPerSecond?: number | null;
+  /** True only for the one failed assistant message omp's `/retry` would
+   *  re-run — ChatWindow computes the predicate (lastRetryableErrorIndex)
+   *  plus the session-idle gate and passes it down per row, as for the
+   *  advisor button. */
+  canRetryRun?: boolean;
+  onRetryRun?: () => void;
+  /** True while the `/retry` prompt triggered by this button is in flight. */
+  retryingRun?: boolean;
 }) {
   const { t, locale } = useI18n();
   const { isSupported: ttsSupported, isSpeaking: ttsSpeaking, speakingId: ttsSpeakingId, toggle: ttsToggle } = useSpeechContext();
@@ -980,7 +1029,8 @@ function AssistantMessageView({
               }}
             >
               <CircleAlert size={14} strokeWidth={1.8} aria-hidden="true" style={{ flexShrink: 0, marginTop: 1 }} />
-              <span>{t(errorMessage)}</span>
+              <span style={{ flex: 1, minWidth: 0 }}>{t(errorMessage)}</span>
+              {canRetryRun && onRetryRun && <RetryRunButton onRetryRun={onRetryRun} retrying={retryingRun} />}
             </div>
           )
         )}
