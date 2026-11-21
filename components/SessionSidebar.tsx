@@ -10,7 +10,8 @@ import { ProviderUsageBar } from "./ProviderUsageBar";
 import { Tooltip } from "./ui/primitives";
 import { toast } from "./ui/toast";
 import { clearLastOpenSession, setLastOpenSession, workspaceKeyOf } from "@/lib/workspace-memory";
-import { LOCAL_HOST_ID, foldedHostProjectKey, groupProjectsByHost, groupSessionsByProject, hostProjectKey, projectIdentity, projectTargetId, nextPinOrder, orderProjects, projectActivityCounts, remoteHostId, type ProjectSortMode } from "@/lib/project-ordering";
+import { LOCAL_HOST_ID, collapseChatProjects, foldedHostProjectKey, groupProjectsByHost, groupSessionsByProject, hostProjectKey, projectIdentity, projectTargetId, nextPinOrder, orderProjects, projectActivityCounts, remoteHostId, type ProjectSortMode } from "@/lib/project-ordering";
+import { isChatDirectory } from "@/lib/chats";
 import { isLinkUp } from "@/lib/hosts/host";
 import { useHostRows } from "@/hooks/useHostRows";
 import { HOST_STATUS_COLOR, hostName, hostStatusText } from "./host-status";
@@ -18,7 +19,7 @@ import { comparableProjectPath } from "@/lib/comparable-path";
 import { initialSessionMatches } from "@/lib/initial-navigation";
 import type { SearchMatchTarget } from "./SessionSearchMatches";
 import { compileSearchQuery, FIRST_MESSAGE_WEIGHT, scoreSearchFields, searchField, TITLE_WEIGHT } from "@/lib/session-search";
-import { Archive, ArrowDownUp, ArrowLeft, ArrowRight, Check, ChevronRight, FileUp, Loader2, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, X } from "lucide-react";
+import { Archive, ArrowDownUp, ArrowLeft, ArrowRight, Check, ChevronRight, FileUp, Loader2, MessageSquarePlus, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, X } from "lucide-react";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 import { openEventStream } from "@/lib/event-stream";
 import {
@@ -80,6 +81,8 @@ interface Props {
   optimisticSession?: SessionInfo | null;
   onSelectSession: (session: SessionInfo, isRestore?: boolean) => void;
   onNewSession?: (sessionId: string, cwd: string | null, hostId?: string, project?: ManagedProject) => void;
+  /** Start a chat that needs no workspace: a fresh directory of its own. */
+  onNewChat?: () => void;
   initialSessionId?: string | null;
   initialSessionHostId?: string;
   skipInitialProjectSelection?: boolean;
@@ -149,7 +152,7 @@ function loadCollapsedHosts(): Set<string> {
   }
 }
 
-export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, initialSessionHostId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, selectedHostId: selectedHostIdProp, selectedLogicalProjectKey, onCwdChange, onWorkspaceOptionsChange, onWorktreeContextChange, addProjectOpen, addProjectHostId = LOCAL_HOST_ID, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, navigation, updateAvailable, settingsOpen = false, onClose, onSearchQueryChange, onOpenSearchMatch }: Props) {
+export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, onNewChat, initialSessionId, initialSessionHostId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, selectedHostId: selectedHostIdProp, selectedLogicalProjectKey, onCwdChange, onWorkspaceOptionsChange, onWorktreeContextChange, addProjectOpen, addProjectHostId = LOCAL_HOST_ID, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, navigation, updateAvailable, settingsOpen = false, onClose, onSearchQueryChange, onOpenSearchMatch }: Props) {
 
 
   const { t } = useI18n();
@@ -825,8 +828,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         knownFolded.add(foldedHostProjectKey(hostId, phPath));
       }
     }
-    return base;
-  }, [optimisticProjectRoot, projects, runningSessionIds, runningSessionPlaces, exitedSessions, allSessions, optimisticSession, projectRootFor, selectedCwd, selectedHostId]);
+    return collapseChatProjects(base, t("sessionSidebar.chats"));
+  }, [optimisticProjectRoot, projects, runningSessionIds, runningSessionPlaces, exitedSessions, allSessions, optimisticSession, projectRootFor, selectedCwd, selectedHostId, t]);
 
   // ---- Derived project list ---------------------------------------------------
   const selectedProject = useMemo(() => selectedPoolKey ?? projectRootFor(selectedCwd, selectedHostId), [selectedPoolKey, projectRootFor, selectedCwd, selectedHostId]);
@@ -1020,8 +1023,11 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   }, [projects]);
   const workspaceLabelFor = useCallback((session: SessionInfo) => {
     const root = session.projectRoot || session.cwd;
+    // A chat's directory name is a date and a random suffix; the flat views
+    // name it like the tree's one row for all of them.
+    if (isChatDirectory(root)) return t("sessionSidebar.chats");
     return workspaceAliases.get(comparableProjectPath(root)) ?? projectLabel(root);
-  }, [workspaceAliases]);
+  }, [workspaceAliases, t]);
 
   const treesByProject = useMemo(() => {
     const m = new Map<string, ReturnType<typeof buildSessionTree>>();
@@ -1635,6 +1641,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             void handleImportSession(file);
           }}
         />
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
         <button
           onClick={handleNewSession}
           disabled={!selectedCwd && !selectedPoolProject}
@@ -1643,7 +1650,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
           className="sidebar-new-session"
           title={newSessionBlockedReason ?? (selectedPoolProject ? t("sessionSidebar.newSessionIn", { cwd: selectedPoolProject.alias ?? selectedPoolProject.name ?? selectedPoolProject.origin ?? "" }) : selectedCwd ? t("sessionSidebar.newSessionIn", { cwd: selectedCwd }) : t("sessionSidebar.selectProjectFirst"))}
           style={{
-            width: "100%",
+            flex: 1,
+            minWidth: 0,
             height: 38,
             boxSizing: "border-box",
             display: "flex",
@@ -1675,6 +1683,44 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
           <span>{t("sessionSidebar.new")}</span>
           {newSessionBlockedReason && <span id="sidebar-new-session-reason" style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0, 0, 0, 0)", whiteSpace: "nowrap" }}>{newSessionBlockedReason}</span>}
         </button>
+        {/* A chat needs no workspace of its own: it starts in a fresh
+            directory, so the button above can stay bound to the selected
+            workspace and still be the obvious way to start one here. */}
+        {onNewChat && (
+          <Tooltip content={t("sessionSidebar.newChat")} side="bottom">
+            <button
+              type="button"
+              onClick={onNewChat}
+              aria-label={t("sessionSidebar.newChat")}
+              style={{
+                width: 38,
+                height: 38,
+                flexShrink: 0,
+                boxSizing: "border-box",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "var(--bg-hover)",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--radius-control)",
+                color: "var(--text)",
+                cursor: "pointer",
+                transition: SIDEBAR_BUTTON_TRANSITION,
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "var(--bg-selected)";
+                e.currentTarget.style.borderColor = "color-mix(in srgb, var(--accent) 30%, transparent)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "var(--bg-hover)";
+                e.currentTarget.style.borderColor = "var(--border)";
+              }}
+            >
+              <MessageSquarePlus size={16} strokeWidth={1.9} style={{ color: "var(--accent)" }} aria-hidden="true" />
+            </button>
+          </Tooltip>
+        )}
+        </div>
       </div>
 
       {/* Section header: the Current / Pinned / All switch + search / sort / filter / add.

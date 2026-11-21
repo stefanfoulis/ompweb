@@ -10,6 +10,7 @@ import { HostOpError } from "./link-protocol";
 import type { WorkspaceOwner } from "../workspace-types";
 import { resolveProject } from "../worktree";
 import { isValidSessionId } from "../session-file-references-core";
+import { CHATS_ROOT_DIRNAME } from "../chats";
 
 const grants = new Set<string>();
 let cached: { roots: Set<string>; until: number } | null = null;
@@ -44,11 +45,15 @@ export async function getWorkspaceRoots(owner?: WorkspaceOwner): Promise<Set<str
     if (!project.hidden) roots.add(normalizeSlashes(project.path));
   }
   for (const grant of grants) roots.add(grant);
+  // Every chat's own directory (`defaultCwd`): a restart drops the in-memory
+  // grants, and a chat whose session file is not written yet has no other
+  // root to be found under.
+  const chatsRoot = join(homedir(), CHATS_ROOT_DIRNAME);
   try {
-    for (const entry of readdirSync(homedir(), { withFileTypes: true })) {
-      if (entry.isDirectory() && /^omp-cwd-\d{8}$/.test(entry.name)) roots.add(normalizeSlashes(join(homedir(), entry.name)));
+    for (const entry of readdirSync(chatsRoot, { withFileTypes: true })) {
+      if (entry.isDirectory()) roots.add(normalizeSlashes(join(chatsRoot, entry.name)));
     }
-  } catch { /* A missing home does not authorize any scratch directory. */ }
+  } catch { /* No chats root yet: there is no chat directory to authorize. */ }
   for (const root of getConfigAgentRoots()) roots.add(root);
   cached = { roots, until: Date.now() + 5_000 };
   return roots;

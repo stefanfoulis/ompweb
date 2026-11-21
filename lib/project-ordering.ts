@@ -1,3 +1,4 @@
+import { chatsRootOf } from "./chats";
 import { comparableProjectPath } from "./comparable-path";
 import type { ManagedProject, SessionInfo } from "./types";
 import { workspaceKeyOf } from "./workspace-memory";
@@ -36,9 +37,12 @@ export function newChatDraftKey(cwd: string, hostId: string | undefined): string
   return `new:${hostProjectKey(hostId, cwd)}`;
 }
 
-/** `hostProjectKey` over the case-folded comparable path (how sessions find their project). */
+/** `hostProjectKey` over the case-folded comparable path (how sessions find
+ *  their project). A chat directory answers with its chats root: every chat
+ *  started without a workspace belongs to the one "Chats" row, not to a
+ *  workspace of its own. */
 export function foldedHostProjectKey(hostId: string | undefined, path: string): string {
-  return path.startsWith("pool:") ? path : hostProjectKey(hostId, comparableProjectPath(path));
+  return path.startsWith("pool:") ? path : hostProjectKey(hostId, comparableProjectPath(chatsRootOf(path) ?? path));
 }
 
 /** Logical project keys remain case-sensitive and independent of physical ownership. */
@@ -165,6 +169,27 @@ export function projectActivityCounts(
     result.set(folded, current);
   }
   return result;
+}
+
+/** Replace every chat directory with its chats root, named `label`, keeping
+ *  the position of the first chat in the list: chats started without a
+ *  workspace share one sidebar row instead of adding a workspace each.
+ *  Registered workspaces, the chats root among them, pass through. */
+export function collapseChatProjects(projects: ManagedProject[], label: string): ManagedProject[] {
+  const collapsed: ManagedProject[] = [];
+  const roots = new Set<string>();
+  for (const project of projects) {
+    const root = project.poolId ? null : chatsRootOf(project.path);
+    if (root === null) {
+      collapsed.push(project);
+      continue;
+    }
+    const key = foldedHostProjectKey(project.hostId, root);
+    if (roots.has(key)) continue;
+    roots.add(key);
+    collapsed.push({ path: root, name: label, ...(project.hostId ? { hostId: project.hostId } : {}) });
+  }
+  return collapsed;
 }
 
 /** Group sessions by logical project identity, or by host-bound physical path.

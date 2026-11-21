@@ -1266,6 +1266,8 @@
   "sessionSidebar.mainBadge": "main",
   "sessionSidebar.new": "新しいセッション",
   "sessionSidebar.newActivity": "新しいアクティビティ",
+  "sessionSidebar.chats": "チャット",
+  "sessionSidebar.newChat": "新しいチャット",
   "sessionSidebar.newSessionActivity": "新しいセッションアクティビティ",
   "sessionSidebar.newSessionIn": "{cwd} で新しいセッション",
   "sessionSidebar.newWorktree": "新しいワークツリー…",

@@ -139,7 +139,7 @@ app/api/
   notifications/history/route.ts  GET entries | PATCH { ids } mark read | DELETE ?id= remove one, ?all=1 clear
   auth/**                         provider list, login/logout, API keys (via channel commands)
   cwd/validate/route.ts           POST validate/select a cwd
-  default-cwd/route.ts            POST create ~/omp-cwd-YYYYMMDD
+  default-cwd/route.ts            POST create a fresh chat directory `~/.omp-chats/<date>-<id>` (one per call; `lib/chats.ts`)
   files/[...path]/route.ts        GET file contents for viewer
   github-repo/route.ts            GET ?cwd= — GitHub owner/repo of the checkout (for #N links)
   media/[hash]/route.ts           GET tool-result image by sha256 (?thumb=1 → 480px WebP preview)
@@ -203,6 +203,7 @@ lib/
   agent-command.ts     `runAgentCommand`: the one command path behind POST /api/agent/[id] and a browser link's `cmd`
   browser-link.ts      `/api/events/link`: Bun `websocket` handler for the browser link (sequencing, pieces, resume, `(session, rid)` dedupe)
   btw.ts               /btw side-question records + pure frame/snapshot merge (order-safe)
+  chats.ts             pure: the chats root (`CHATS_ROOT_DIRNAME`) and what a chat directory is (`chatsRootOf`, `isChatDirectory`, `isChatsRoot`); browser and daemon
   draft-store.ts       local draft persistence helpers
   event-stream.ts      tab-side EventSource-shaped streams over the shared worker
   event-stream-worker.ts  the shared worker: the one EventSource or browser link per browser (bundled by server/client-env.ts)
@@ -222,7 +223,7 @@ lib/
   npx.ts               npx runner used by skill install
   pi-types.ts          local structural types for agent/RPC objects
   project-command-env.ts  child-process environments: strips PORT/NODE_ENV/NEXT_* and omp-web's secrets
-  project-ordering.ts  pure project sort/group/activity helpers (client + tests)
+  project-ordering.ts  pure project sort/group/activity helpers (client + tests); chat directories group under their chats root (`collapseChatProjects`)
   project-registry.ts  on-disk managed-project registry (~/.omp/agent/projects.json)
   notification-events.ts  shared: event/prefs/history-entry types, frame→event detector, renderNotification()
   notification-hub.ts  server: presence, routing, Web Push, recording published notifications

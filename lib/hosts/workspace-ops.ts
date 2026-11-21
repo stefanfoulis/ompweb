@@ -14,6 +14,7 @@ import { documentPreviewKind, getAudioMime, getDocumentMime, getFileLanguage, ge
 import { MAX_INLINE_BASH_OUTPUT_BYTES, openRegularFileNoFollow, readUtf8FileWithinLimit, resolveBashOutputPath } from "../bash-output";
 import { isBashOutputPathReferencedBySession } from "../session-file-references";
 import { isRecord } from "../type-guards";
+import { CHATS_ROOT_DIRNAME } from "../chats";
 import type { GitOrigin, WorkspaceFileEvent, WorkspaceFileInfo, WorkspaceFileRequest, WorkspaceOps } from "../workspace-types";
 import { HostOpError } from "./link-protocol";
 import type { OpResult } from "./session-ops";
@@ -171,11 +172,14 @@ export function createWorkspaceService(uploads: StagedUploads, emit: (id: string
       if (!fs.statSync(directory).isDirectory()) throw new HostOpError(400, "not_a_directory", "Path is not a directory");
       return { path: directory, parentPath: getParentDirectory(directory), directories: await listDirectories(directory) };
     }),
+    // Every call opens a chat of its own: a shared directory would carry the
+    // files of earlier chats into the next chat's context. `mkdtemp` picks the
+    // suffix, so two chats started in the same moment never collide.
     defaultCwd: () => result(async () => {
-      const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-      const directory = path.join(homedir(), `omp-cwd-${date}`);
-      fs.mkdirSync(directory, { recursive: true });
-      const cwd = fs.realpathSync(directory);
+      const root = path.join(homedir(), CHATS_ROOT_DIRNAME);
+      fs.mkdirSync(root, { recursive: true });
+      const date = new Date().toISOString().slice(0, 10);
+      const cwd = fs.realpathSync(fs.mkdtempSync(path.join(root, `${date}-`)));
       grantWorkspaceRoot(cwd);
       return { cwd };
     }),

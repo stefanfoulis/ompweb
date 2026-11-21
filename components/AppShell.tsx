@@ -43,6 +43,7 @@ import { findSessionTarget, getInitialNavigation, sameSessionTarget, sessionNavi
 import { buildAppUrl } from "@/lib/app-url";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { foldedHostProjectKey, hostProjectKey, LOCAL_HOST_ID, remoteHostId, projectIdentity, projectTargetId } from "@/lib/project-ordering";
+import { isChatDirectory, isChatsRoot } from "@/lib/chats";
 import { isClusterTarget } from "@/lib/hosts/cluster";
 import { useHostRows } from "@/hooks/useHostRows";
 import { LocalDaemonBanner } from "./LocalDaemonBanner";
@@ -1377,7 +1378,7 @@ export function AppShell({ appName }: { appName: string }) {
     }
   }, [router, isMobile, selectedSession, buildUrl]);
 
-  const handleNewSession = useCallback((creationId: string, cwd: string | null, hostId?: string, project?: ManagedProject, initialization?: string) => {
+  const openNewSession = useCallback((creationId: string, cwd: string | null, hostId?: string, project?: ManagedProject, initialization?: string) => {
     setSettingsTab(null);
     setSelectedSession(null);
     const target = project ?? (cwd === activeCwd ? activePoolProject : null);
@@ -1426,6 +1427,37 @@ export function AppShell({ appName }: { appName: string }) {
       ...(!navSessionId && newSessionPoolProject && newSessionCreation.initialization ? { initialization: newSessionCreation.initialization } : {}),
     });
   }, [navSessionId, navSessionCwd, navHostId, newSessionCwd, newSessionPoolProject, newSessionCreation, newSessionCreationId, recordNavigationView]);
+
+  // Starting a chat needs no workspace: the host hands out a fresh directory
+  // (POST /api/default-cwd), so the files of one chat never reach the next
+  // one's context. `/move <path>` takes such a chat into a real workspace.
+  const startChatSession = useCallback((hostId?: string) => {
+    const targetHost = hostId ?? LOCAL_HOST_ID;
+    const sourceVersion = navViewVersionRef.current;
+    void fetch(`/api/default-cwd?${new URLSearchParams({ hostId: targetHost })}`, { method: "POST" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = (await response.json()) as { cwd?: string };
+        if (!data.cwd) throw new Error("Empty cwd returned");
+        return data.cwd;
+      })
+      .then((cwd) => {
+        // The user moved on while the directory was being created.
+        if (navViewVersionRef.current === sourceVersion) openNewSession(randomUUID(), cwd, targetHost);
+      })
+      .catch(() => toast.error(translate("errors.generic")));
+  }, [openNewSession]);
+
+  const handleNewSession = useCallback((creationId: string, cwd: string | null, hostId?: string, project?: ManagedProject, initialization?: string) => {
+    // The sidebar's "Chats" row stands for every chat directory under the
+    // chats root; starting a session from it means a new chat, never the
+    // shared root itself.
+    if (cwd && isChatsRoot(cwd)) {
+      startChatSession(hostId);
+      return;
+    }
+    openNewSession(creationId, cwd, hostId, project, initialization);
+  }, [openNewSession, startChatSession]);
 
   // Resolves a history entry's session id against the live list. `null`
   // means the id is gone (entry should be dropped); "unavailable" means the
@@ -1859,6 +1891,8 @@ export function AppShell({ appName }: { appName: string }) {
   const currentHostId = selectedSession ? remoteHostId(selectedSession.hostId) : newSessionCwd !== null ? newSessionHostId : activeHostId;
   const remoteHost = currentHostId !== undefined;
   const workspaceHostId = currentHostId ?? LOCAL_HOST_ID;
+  // The sidebar's New chat button: a chat on the host the user is looking at.
+  const handleNewChat = useCallback(() => startChatSession(currentHostId), [startChatSession, currentHostId]);
   const sidebarCwd = (activeHostId ?? LOCAL_HOST_ID) === workspaceHostId ? activeCwd : null;
   const explorerCwd = selectedSession
     ? (sessionWorktreeRemoved ? sidebarCwd : sessionCwd)
@@ -2069,6 +2103,7 @@ export function AppShell({ appName }: { appName: string }) {
       optimisticSession={selectedSession?.path === "" ? selectedSession : null}
       onSelectSession={handleSelectSession}
       onNewSession={handleNewSession}
+      onNewChat={handleNewChat}
       initialSessionId={initialSessionId}
       initialSessionHostId={initialNavigation.hostId}
       skipInitialProjectSelection={initialNavigation.requestedCwd !== null}
@@ -2131,25 +2166,12 @@ export function AppShell({ appName }: { appName: string }) {
         onNewSession={() => {
           // An empty cwd is truthy, so showChat would render the shell while
           // useAgentSession refuses to start — every send a silent no-op.
-          // Fall back to the server's default cwd (~/omp-cwd-<date>) instead.
+          // Start a workspace-less chat instead.
           if (activeCwd || activePoolProject) {
             handleNewSession(randomUUID(), activeCwd, activeHostId, activePoolProject ?? undefined);
             return;
           }
-          const targetHost = currentHostId ?? LOCAL_HOST_ID;
-          const sourceVersion = navViewVersionRef.current;
-          void fetch(`/api/default-cwd?${new URLSearchParams({ hostId: targetHost })}`, { method: "POST" })
-            .then(async (response) => {
-              if (!response.ok) throw new Error(`HTTP ${response.status}`);
-              const data = (await response.json()) as { cwd?: string };
-              if (!data.cwd) throw new Error("Empty cwd returned");
-              return data;
-            })
-            .then((data) => {
-              if (!data.cwd) throw new Error("Empty cwd returned");
-              if (navViewVersionRef.current === sourceVersion) handleNewSession(randomUUID(), data.cwd, targetHost);
-            })
-            .catch(() => toast.error(translate("errors.generic")));
+          startChatSession(currentHostId);
         }}
         currentModel={null}
       />
@@ -2522,7 +2544,10 @@ export function AppShell({ appName }: { appName: string }) {
                         }}
                         title={effectiveProject}
                       >
-                        {projectLabel(effectiveProject)}
+                        {/* A chat's directory is named after its date and a
+                            random suffix: the breadcrumb names it as the
+                            sidebar does. */}
+                        {isChatDirectory(effectiveProject) ? t("sessionSidebar.chats") : projectLabel(effectiveProject)}
                       </span>
                       <span style={{ color: "var(--text-dim)", flexShrink: 0, opacity: 0.5 }}>/</span>
                     </span>
@@ -2764,7 +2789,7 @@ export function AppShell({ appName }: { appName: string }) {
                       }}
                       options={[
                         ...(!effectivePoolProject && effectiveNewSessionCwd && !hostProjects.some((project) => foldedHostProjectKey(project.hostId, project.path) === foldedHostProjectKey(newSessionHost, newSessionProject))
-                          ? [{ value: newSessionWorkspaceValue, label: projectLabel(effectiveNewSessionCwd) }] : []),
+                          ? [{ value: newSessionWorkspaceValue, label: isChatDirectory(effectiveNewSessionCwd) ? t("sessionSidebar.chats") : projectLabel(effectiveNewSessionCwd) }] : []),
                         ...hostProjects.map((project) => {
                           const name = project.alias ?? project.name ?? projectLabel(project.path);
                           // A member's pinned project: its option names the node.

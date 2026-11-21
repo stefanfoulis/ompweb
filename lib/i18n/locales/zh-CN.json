@@ -1266,6 +1266,8 @@
   "sessionSidebar.mainBadge": "main",
   "sessionSidebar.new": "新建会话",
   "sessionSidebar.newActivity": "新活动",
+  "sessionSidebar.chats": "聊天",
+  "sessionSidebar.newChat": "新建聊天",
   "sessionSidebar.newSessionActivity": "新的会话活动",
   "sessionSidebar.newSessionIn": "在 {cwd} 新建会话",
   "sessionSidebar.newWorktree": "新建工作树…",
