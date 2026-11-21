@@ -1,0 +1,60 @@
+import type { RpcTransport } from "../omp/rpc-transport";
+import type { SessionOps } from "./session-ops";
+import type { WorkspaceOps } from "../workspace-types";
+
+export type HostStatus = "online" | "offline" | "needs-upgrade" | "omp-missing";
+
+/** The link carries traffic: sends, ops and children work. An omp-missing host
+ * is linked too; only spawning there fails, with its own error. */
+export function isLinkUp(status: HostStatus): boolean {
+  return status === "online" || status === "omp-missing";
+}
+
+export interface SpawnRequest {
+  /** Stable identity of one independent start; retries must preserve its spawn arguments. */
+  creationId?: string;
+  /** Hub → daemon (v9): run this process with the opening server's provider logins. */
+  shareCredentials?: true;
+  /** Daemon only: the server URL whose link supplies the credentials. Never trusted from the wire. */
+  credentialsServer?: string;
+  /** Hub → daemon (v10): the master's configuration version this process must run with; the daemon applies it first. Never recorded for resume. */
+  configVersion?: string;
+  cwd: string;
+  recordedCwd: string | null;
+  sessionFile: string;
+  toolNames?: string[];
+  advisor: boolean;
+  /** `provider/modelId` bound at spawn (--model); resume only. */
+  spawnModel?: string;
+}
+
+export interface SpawnResult {
+  transport: RpcTransport;
+  cwd: string;
+  fellBack: boolean;
+  /** The host's project launch config forces --advisor. */
+  launchAdvisor: boolean;
+  /** Actual --advisor flag on a shared channel, independent of this link's requested mode. */
+  advisorSpawned?: boolean;
+  /** Existing shared channel: startup/ready already completed on the daemon. */
+  joined?: boolean;
+  pending?: string[];
+  streaming?: string | null;
+}
+
+/** A machine omp sessions run on. Every machine-local action of a session goes through it. */
+export interface Host {
+  readonly id: string;
+  readonly label: string;
+  status(): HostStatus;
+  onStatus(listener: (status: HostStatus) => void): () => void;
+  /** `env`: extra child environment, over the agentEnv setting; only this machine's host honours it. */
+  spawnRpc(request: SpawnRequest, sessionId?: string | null, options?: { replaceAdvisor?: boolean; preparing?: boolean; expectedChannel?: string; env?: Record<string, string> }): Promise<SpawnResult>;
+  sessionFileExists(path: string): Promise<boolean>;
+  invalidateSessionLists(sessionFile?: string): void;
+  autoApproveExtension(): boolean;
+  /** Session and project file operations, run on this host. */
+  readonly sessionOps: SessionOps;
+  readonly workspaceOps: WorkspaceOps;
+  supportsWorkspaceOp(name: keyof WorkspaceOps): boolean;
+}

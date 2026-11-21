@@ -1,4 +1,11 @@
-import type { AssistantContentBlock, AssistantMessage, ThinkingContent, ToolCallContent } from "./types";
+import type { AssistantContentBlock, AssistantMessage, ThinkingContent } from "./types";
+
+/** CustomMessage.customType for omp's `continue` RPC directive (a hidden
+ *  role:"developer", `synthetic: true` message that resumes the agent).
+ *  Shared by lib/session-reader.ts (reload) and hooks/useAgentSession.ts
+ *  (live SSE) so both paths tag it the same way; rendered as the collapsed
+ *  "hidden" marker row (see MessageView's friendlyHiddenLabel). */
+export const DEVELOPER_MARKER_CUSTOM_TYPE = "developer-marker";
 
 interface DisplayOptions {
   isStreaming?: boolean;
@@ -8,32 +15,14 @@ export function isEmptyThinkingBlock(block: AssistantContentBlock, options: Disp
   return block.type === "thinking" && !block.deferred && !options.isStreaming && block.thinking.trim() === "";
 }
 
+/** Reply content (non-blank text or an image), as opposed to thinking and tool activity. */
+export function isReplyBlock(block: AssistantContentBlock): boolean {
+  return block.type === "image" || (block.type === "text" && block.text.trim().length > 0);
+}
+
 export function getDisplayableAssistantBlocks(
   message: AssistantMessage,
   options: DisplayOptions = {},
 ): AssistantContentBlock[] {
   return (message.content ?? []).filter((block) => !isEmptyThinkingBlock(block, options));
-}
-
-function isFinalAnswerBlock(block: AssistantContentBlock): boolean {
-  return block.type === "text" || block.type === "image";
-}
-
-export function splitFinalAssistantBlocks(
-  message: AssistantMessage,
-  options: DisplayOptions = {},
-): { answerBlocks: AssistantContentBlock[]; processBlocks: AssistantContentBlock[] } {
-  const blocks = getDisplayableAssistantBlocks(message, options);
-  const lastProcessIndex = blocks.findLastIndex((block) => !isFinalAnswerBlock(block));
-  if (lastProcessIndex === -1) {
-    return { answerBlocks: blocks, processBlocks: [] };
-  }
-  return {
-    answerBlocks: blocks.slice(lastProcessIndex + 1),
-    processBlocks: blocks.slice(0, lastProcessIndex + 1),
-  };
-}
-
-export function countToolCallBlocks(blocks: AssistantContentBlock[]): number {
-  return blocks.filter((block): block is ToolCallContent => block.type === "toolCall").length;
 }

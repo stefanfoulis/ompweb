@@ -1,6 +1,8 @@
 import { closeSync, existsSync, fstatSync, openSync, readSync, statSync, type Stats } from "fs";
 import { normalize as normalizePath } from "path";
 import { getAgentDir } from "./omp/paths";
+import { parseMessageOrigin, type MessageOrigin } from "./message-origin";
+import { isClientMessageId } from "./client-message-ids";
 import {
   containsBlobRef,
   invalidateAllSessionScanCaches,
@@ -25,11 +27,14 @@ import type {
 } from "./types";
 import { normalizeToolCalls } from "./normalize";
 import { isRecord } from "./type-guards";
+import { DEVELOPER_MARKER_CUSTOM_TYPE } from "./message-display";
+import { toolResultContentAsUrls } from "./media-cache";
 import { taskResultRetryFailure, taskResultStructuredOutput, taskResultUsageCost } from "./task-result-details";
 import type { TodoPhase } from "./pi-types";
 import { projectIdentityKey, sessionPathKey } from "./paths";
 import { resolveProject, type ProjectInfo } from "./worktree";
 import { selectHistoryRange, type SessionHistoryCursor, type SessionHistoryPage } from "./session-sync";
+import { PASSIVE_TOOL_CONTEXT } from "./chat-transcript-plan";
 
 export { getAgentDir };
 
@@ -85,6 +90,7 @@ async function loadAllSessions(): Promise<SessionInfo[]> {
         ? s.created.toISOString()
         : s.modified.toISOString(),
       modified: s.modified.toISOString(),
+      ...(s.lastMessageAt ? { lastMessageAt: s.lastMessageAt.toISOString() } : {}),
       messageCount: s.messageCount,
       firstMessage: s.firstMessage || "(no messages)",
       parentSessionId: s.parentSessionPath
@@ -466,7 +472,7 @@ function toDisplayEntries(entries: SessionEntry[], options: ResolveBlobOptions):
       entry.type === "message" &&
       ((entry.message as { role?: string } | null | undefined)?.role === "toolResult")
     ) {
-      // Caller omits these images anyway — share the entry without blob work.
+      // Caller turns these images into media URLs — share the entry without blob work.
       out[i] = entry;
       continue;
     }
@@ -559,6 +565,8 @@ interface HistoryEntryRange {
   length: number;
   firstKeptEntryId?: string;
   legacyCustom?: boolean;
+  clientMessageId?: string;
+  origin?: MessageOrigin;
 }
 
 interface SessionHistoryIndex {
@@ -594,6 +602,7 @@ function historyEntryMetadata(entry: SessionEntry): SessionEntry {
   const compact: Record<string, unknown> = {
     type: entry.type, id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp,
   };
+  if (isClientMessageId(entry.clientMessageId)) compact.clientMessageId = entry.clientMessageId;
   if (entry.type === "message" && isRecord(entry.message)) {
     const message = entry.message;
     compact.message = {
@@ -615,6 +624,19 @@ function historyEntryMetadata(entry: SessionEntry): SessionEntry {
   } else if (entry.type === "custom" && entry.customType === "user_todo_edit") {
     compact.customType = entry.customType;
     compact.data = isRecord(entry.data) ? { phases: entry.data.phases } : undefined;
+  } else if (entry.type === "custom" && entry.customType === "client-message-entry") {
+    compact.customType = entry.customType;
+    const data = isRecord(entry.data) ? entry.data : {};
+    const origin = parseMessageOrigin(data.origin);
+    compact.data = {
+      clientMessageId: data.clientMessageId,
+      entryId: data.entryId,
+      ...(origin ? { origin } : {}),
+    };
+  } else if (entry.type === "custom" && entry.customType === "client-message-resolution") {
+    compact.customType = entry.customType;
+    compact.data = { clientMessageIds: isRecord(entry.data) && Array.isArray(entry.data.clientMessageIds)
+      ? entry.data.clientMessageIds.filter(isClientMessageId) : [] };
   }
   return compact as unknown as SessionEntry;
 }
@@ -631,13 +653,17 @@ function buildHistoryIndex(
     },
   });
   if (loaded.error === "too_large") throw new SessionFileTooLargeError(filePath);
-  const { selected, compactionId, ...metadata } = selectSessionContext(loaded.entries, leafId, { includePreCompaction });
-  const rows = selected.map((entry): HistoryEntryRange => ({
-    id: entry.id,
-    ...ranges.get(entry)!,
-    ...(entry.type === "compaction" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}),
-    ...(entry.type === "message" && entry.message.role === "custom" ? { legacyCustom: true } : {}),
-  }));
+  const { selected, compactionId, entryClientIds, ...metadata } = selectSessionContext(loaded.entries, leafId, { includePreCompaction });
+  const rows = selected.map((entry): HistoryEntryRange => {
+    const correlation = entryClientIds.get(entry.id);
+    return {
+      id: entry.id,
+      ...ranges.get(entry)!,
+      ...(entry.type === "compaction" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}),
+      ...(correlation ? { clientMessageId: correlation.clientMessageId, origin: correlation.origin } : {}),
+      ...(entry.type === "message" && entry.message.role === "custom" ? { legacyCustom: true } : {}),
+    };
+  });
   const tipId = loaded.entries.at(-1)?.id ?? null;
   // Detach metadata strings from the parser's JSON source: an ID represented
   // by a sliced V8 string must not pin a multi-megabyte message body.
@@ -732,6 +758,7 @@ export function getSessionHistoryPage(
           const message = entry.message as unknown as Record<string, unknown>;
           if (message.role === "hookMessage") message.role = "custom";
         }
+        if (row.clientMessageId) entry.clientMessageId = row.clientMessageId;
         rawEntries.push(entry);
       }
       if (historyFileVersion(fstatSync(fd)) !== version || historyFileVersion(statSync(filePath)) !== version) {
@@ -750,9 +777,9 @@ export function getSessionHistoryPage(
     context: {
       ...index.metadata,
       entryIds: index.entryIds.slice(start, end),
-      messages: entries.map((entry) => entry.type === "compaction"
+      messages: entries.map((entry, offset) => entry.type === "compaction"
         ? compactionUiMessage(entry, entry.id === index.compactionId)
-        : entryToUiMessage(entry, options)!),
+        : entryToUiMessage(entry, { ...options, origin: index.rows[start + offset]?.origin })!),
     },
   };
   return { history, leafId: index.leafId, tipId: index.tipId };
@@ -824,13 +851,19 @@ export function buildSessionContext(
   leafId?: string | null,
   options: { deferThinking?: boolean; deferToolResultImages?: boolean; includePreCompaction?: boolean } = {},
 ): SessionContext {
-  const { selected, compactionId, ...metadata } = selectSessionContext(entries, leafId, options);
+  const { selected, compactionId, entryClientIds, ...metadata } = selectSessionContext(entries, leafId, options);
   return {
     ...metadata,
     entryIds: selected.map((entry) => entry.id),
-    messages: selected.map((entry) => entry.type === "compaction"
-      ? compactionUiMessage(entry, entry.id === compactionId)
-      : entryToUiMessage(entry, options)!),
+    messages: selected.map((entry) => {
+      if (entry.type === "compaction") return compactionUiMessage(entry, entry.id === compactionId);
+      const correlation = entryClientIds.get(entry.id);
+      const message = entryToUiMessage(
+        correlation ? { ...entry, clientMessageId: correlation.clientMessageId } as SessionEntry : entry,
+        options,
+      )!;
+      return correlation?.origin && message.role === "user" ? { ...message, origin: correlation.origin } : message;
+    }),
   };
 }
 
@@ -840,7 +873,7 @@ function selectSessionContext(
   leafId?: string | null,
   options: { includePreCompaction?: boolean } = {},
 ) {
-  const empty = { selected: [] as SessionEntry[], compactionId: null as string | null, thinkingLevel: "off", model: null as SessionContext["model"], todoPhases: [] as TodoPhase[] };
+  const empty = { selected: [] as SessionEntry[], compactionId: null as string | null, thinkingLevel: "off", model: null as SessionContext["model"], todoPhases: [] as TodoPhase[], entryClientIds: new Map<string, { clientMessageId: string; origin?: MessageOrigin }>() };
   const byId = new Map<string, SessionEntry>();
   for (const e of entries) byId.set(e.id, e);
   if (leafId === null) return empty;
@@ -863,7 +896,36 @@ function selectSessionContext(
   // Explicit defaults take precedence over temporary assistant fallbacks.
   let hasExplicitDefaultModel = false;
   let compaction: CompactionEntry | null = null;
+  const persistedClientMessageIds = new Set<string>();
+  const resolvedClientMessageIds = new Set<string>();
+  // The journal names its message by id, so only entries on the active path count: an abandoned branch's are never visited.
+  const journaled = new Map<string, { clientMessageId: string; origin?: MessageOrigin }>();
   for (const entry of path) {
+    if (entry.type === "custom" && entry.customType === "client-message-entry" && isRecord(entry.data)
+      && isClientMessageId(entry.data.clientMessageId) && typeof entry.data.entryId === "string") {
+      const origin = parseMessageOrigin(entry.data.origin);
+      journaled.set(entry.data.entryId, {
+        clientMessageId: entry.data.clientMessageId,
+        ...(origin ? { origin } : {}),
+      });
+    }
+  }
+  const entryClientIds = new Map<string, { clientMessageId: string; origin?: MessageOrigin }>();
+  for (const entry of path) {
+    if (entry.type === "message" || entry.type === "custom_message") {
+      const journal = journaled.get(entry.id);
+      const clientMessageId = isClientMessageId(entry.clientMessageId) ? entry.clientMessageId : journal?.clientMessageId;
+      if (clientMessageId) {
+        entryClientIds.set(entry.id, {
+          clientMessageId,
+          ...(journal?.origin ? { origin: journal.origin } : {}),
+        });
+        persistedClientMessageIds.add(clientMessageId);
+      }
+    } else if (entry.type === "custom" && entry.customType === "client-message-resolution"
+      && isRecord(entry.data) && Array.isArray(entry.data.clientMessageIds)) {
+      for (const id of entry.data.clientMessageIds) if (isClientMessageId(id)) resolvedClientMessageIds.add(id);
+    }
     if (entry.type === "thinking_level_change") {
       thinkingLevel = entry.thinkingLevel ?? "off";
     } else if (entry.type === "model_change") {
@@ -915,7 +977,12 @@ function selectSessionContext(
       ? { provider: defaultModel.slice(0, separator), modelId: defaultModel.slice(separator + 1) }
       : { provider: "", modelId: defaultModel };
   }
-  return { selected, compactionId: compaction?.id ?? null, thinkingLevel, model, todoPhases: getTodoPhasesFromEntries(entries, leafId) };
+  return {
+    selected, compactionId: compaction?.id ?? null, thinkingLevel, model, todoPhases: getTodoPhasesFromEntries(entries, leafId),
+    ...(persistedClientMessageIds.size ? { persistedClientMessageIds: [...persistedClientMessageIds] } : {}),
+    entryClientIds,
+    ...(resolvedClientMessageIds.size ? { resolvedClientMessageIds: [...resolvedClientMessageIds] } : {}),
+  };
 }
 
 function parseEntryTimestamp(timestamp: string): number | undefined {
@@ -940,24 +1007,6 @@ function withNormalizedTimestamp(message: AgentMessage): AgentMessage {
   return timestamp === raw ? message : { ...message, timestamp };
 }
 
-function base64ImageInfo(block: unknown): { bytes: number; mime?: string } | null {
-  if (!isRecord(block) || block.type !== "image") return null;
-
-  let data: string | undefined;
-  let mime: string | undefined;
-  if (typeof block.data === "string") {
-    data = block.data;
-    mime = typeof block.mimeType === "string" ? block.mimeType : undefined;
-  } else if (isRecord(block.source) && block.source.type === "base64" && typeof block.source.data === "string") {
-    data = block.source.data;
-    mime = typeof block.source.media_type === "string" ? block.source.media_type : undefined;
-  }
-  if (!data) return null;
-
-  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
-  return { bytes: Math.max(0, Math.floor(data.length * 3 / 4) - padding), mime };
-}
-
 /**
  * toolResult `details` is provider/tool-internal metadata that dominates real
  * history payloads (measured 643KB of a 1.34MB context on a 533-entry session),
@@ -966,8 +1015,9 @@ function base64ImageInfo(block: unknown): { bytes: number; mime?: string } | nul
  * allowlists those keys — extend the allowlist if MessageView ever reads more.
  * Task toolResults additionally keep a SIZE-BOUNDED subset of their
  * results/progress (telemetry, no full output) so the message flow can render
- * a per-subagent summary. On-disk parsing (loadSessionFile/getSessionEntries)
- * keeps full details.
+ * a per-subagent summary. Ask toolResults keep a bounded subset of their
+ * form answers (components/AskResultCard.tsx). On-disk parsing
+ * (loadSessionFile/getSessionEntries) keeps full details.
  */
 const TASK_DETAIL_MAX_TEXT = 240;
 const TASK_DETAIL_MAX_ROWS = 50;
@@ -1108,6 +1158,56 @@ function hubDetailTargets(value: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
+const ASK_FORM_ANSWER_STRING_KEYS = ["name", "question", "answer"] as const;
+
+/** A form-based ask answer row (omp's `FormAnswer`); `null` when the required question/answer are missing. */
+function keepAskFormAnswerRow(raw: unknown): Record<string, unknown> | null {
+  if (!isRecord(raw)) return null;
+  const out: Record<string, unknown> = {};
+  for (const key of ASK_FORM_ANSWER_STRING_KEYS) {
+    if (typeof raw[key] === "string") out[key] = truncateTaskDetailText(raw[key]);
+  }
+  if (typeof out.question !== "string" || typeof out.answer !== "string") return null;
+  if (typeof out.name !== "string") out.name = "";
+  return out;
+}
+
+const ASK_OPTION_NOTE_STRING_KEYS = ["name", "option", "text"] as const;
+
+/** A selected-option note row (omp's `OptionNote`); `null` when the required option/text are missing.
+ * Pasted images are never kept — `imageCount` is all components/AskResultCard.tsx renders. */
+function keepAskOptionNoteRow(raw: unknown): Record<string, unknown> | null {
+  if (!isRecord(raw)) return null;
+  const out: Record<string, unknown> = {};
+  for (const key of ASK_OPTION_NOTE_STRING_KEYS) {
+    if (typeof raw[key] === "string") out[key] = truncateTaskDetailText(raw[key]);
+  }
+  if (typeof out.option !== "string" || typeof out.text !== "string") return null;
+  if (typeof out.name !== "string") out.name = "";
+  if (Array.isArray(raw.images) && raw.images.length > 0) out.imageCount = raw.images.length;
+  return out;
+}
+
+/** Bounds the ask tool's result details — omp's `AskToolDetails`
+ * (`{ answers: FormAnswer[], notes?: OptionNote[], timedOut? }`, plus a `chatRedirect`
+ * our runner branch adds) — to what components/AskResultCard.tsx renders. */
+export function keepAskToolResultDetails(details: Record<string, unknown>): Record<string, unknown> {
+  const answerRows = Array.isArray(details.answers) ? details.answers.slice(0, TASK_DETAIL_MAX_ROWS) : [];
+  const kept: Record<string, unknown> = {
+    answers: answerRows.map((raw) => keepAskFormAnswerRow(raw)).filter((entry): entry is Record<string, unknown> => entry !== null),
+  };
+  if (Array.isArray(details.notes)) {
+    const notes = details.notes
+      .slice(0, TASK_DETAIL_MAX_ROWS)
+      .map((raw) => keepAskOptionNoteRow(raw))
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+    if (notes.length > 0) kept.notes = notes;
+  }
+  if (typeof details.timedOut === "boolean") kept.timedOut = details.timedOut;
+  if (typeof details.chatRedirect === "boolean") kept.chatRedirect = details.chatRedirect;
+  return kept;
+}
+
 function stripToolResultDetails(message: AgentMessage): AgentMessage {
   if (message.role !== "toolResult" || message.details === undefined) return message;
   const { details, ...rest } = message;
@@ -1123,37 +1223,18 @@ function stripToolResultDetails(message: AgentMessage): AgentMessage {
       const hubDetails = keepHubToolResultDetails(details);
       if (hubDetails) Object.assign(kept, hubDetails);
     }
+    if (message.toolName === "ask") {
+      Object.assign(kept, keepAskToolResultDetails(details));
+    }
     if (Object.keys(kept).length > 0) return { ...rest, details: kept };
   }
   return rest;
 }
 
-function omitToolResultBase64Images(message: AgentMessage): AgentMessage {
+function toolResultImagesAsUrls(message: AgentMessage): AgentMessage {
   if (message.role !== "toolResult") return message;
-  // Shape-malformed-but-JSON-valid files can carry a string content here
-  // (import accepts arbitrary content); the loader tolerates such lines, so
-  // the converter must too instead of crashing the whole session view.
-  if (!Array.isArray(message.content)) return message;
-
-  let omitted = 0;
-  let bytes = 0;
-  const mimes = new Set<string>();
-  const content = message.content.filter((block) => {
-    const image = base64ImageInfo(block);
-    if (!image) return true;
-    omitted += 1;
-    bytes += image.bytes;
-    if (image.mime) mimes.add(image.mime);
-    return false;
-  });
-  if (omitted === 0) return message;
-
-  const mimeText = mimes.size > 0 ? `: ${[...mimes].join(", ")}` : "";
-  content.push({
-    type: "text",
-    text: `[${omitted} tool result image${omitted === 1 ? "" : "s"} omitted from initial history payload${mimeText}, ~${bytes} bytes]`,
-  });
-  return { ...message, content };
+  const content = toolResultContentAsUrls(message.content);
+  return content === message.content ? message : { ...message, content };
 }
 
 function compactionUiMessage(entry: CompactionEntry, active: boolean): CustomMessage {
@@ -1176,7 +1257,7 @@ function compactionUiMessage(entry: CompactionEntry, active: boolean): CustomMes
 // Returns null for entries that do not map to chat history (metadata, non-message types).
 export function entryToUiMessage(
   entry: SessionEntry,
-  options: { deferThinking?: boolean; deferToolResultImages?: boolean },
+  options: { deferThinking?: boolean; deferToolResultImages?: boolean; origin?: MessageOrigin },
 ): AgentMessage | null {
   switch (entry.type) {
     case "message": {
@@ -1184,15 +1265,26 @@ export function entryToUiMessage(
       // object is missing; skip them like any other unmappable entry instead
       // of crashing every reader of the file.
       if (!isRecord(entry.message)) return null;
-      const raw = entry.message;
+      const nativeMessage = { ...entry.message };
+      delete (nativeMessage as Record<string, unknown>).origin;
+      const raw = isClientMessageId(entry.clientMessageId) ? { ...nativeMessage, clientMessageId: entry.clientMessageId } : nativeMessage;
       // omp-only roles are folded into displayable custom messages so the
       // existing role-keyed UI renders them without new components.
       if (raw.role === "developer") {
+        // Passive tool context is display-only: it rides on its tool card
+        // (collectToolResults), never as a row or in copied transcripts.
+        const passive = raw.passiveToolContext === true;
+        // omp's `continue` RPC command resumes the agent via a hidden,
+        // synthetic directive (the only client trigger is the advisor-card
+        // button) — render it as the collapsed "hidden" marker row instead of
+        // the full custom-message card other role:"developer" content (e.g.
+        // steering envelopes) still gets.
+        const synthetic = raw.synthetic === true;
         return {
           role: "custom",
-          customType: "developer",
+          customType: passive ? PASSIVE_TOOL_CONTEXT : synthetic ? DEVELOPER_MARKER_CUSTOM_TYPE : "developer",
           content: raw.content,
-          display: true,
+          display: !passive && !synthetic,
           timestamp: normalizeMessageTimestamp(raw.timestamp),
         };
       }
@@ -1226,17 +1318,18 @@ export function entryToUiMessage(
         };
       }
       const normalized = options.deferToolResultImages
-        ? omitToolResultBase64Images(normalizeToolCalls(raw))
+        ? toolResultImagesAsUrls(normalizeToolCalls(raw))
         : normalizeToolCalls(raw);
       const message = stripToolResultDetails(normalized);
-      if (!options.deferThinking || message.role !== "assistant") return withNormalizedTimestamp(message);
+      const displayMessage = options.origin && message.role === "user" ? { ...message, origin: options.origin } : message;
+      if (!options.deferThinking || displayMessage.role !== "assistant") return withNormalizedTimestamp(displayMessage);
       // Guard like the loader does for bad lines: normalizeToolCalls passes
       // non-array content through unchanged, so a string-content assistant
       // entry must not 500 the whole context route.
-      if (!Array.isArray(message.content)) return withNormalizedTimestamp(message);
+      if (!Array.isArray(displayMessage.content)) return withNormalizedTimestamp(displayMessage);
       const deferred = {
-        ...message,
-        content: message.content.map((block) => (
+        ...displayMessage,
+        content: displayMessage.content.map((block) => (
           block.type === "thinking" && typeof block.thinking === "string" && block.thinking.trim() !== ""
             ? { ...block, thinking: "", deferred: true }
             : block
@@ -1250,6 +1343,7 @@ export function entryToUiMessage(
         role: "user",
         content: `*The conversation briefly explored another branch and returned with this summary:*\n\n${entry.summary}`,
         timestamp: parseEntryTimestamp(entry.timestamp),
+        branchSummary: true,
       };
     case "custom_message":
       return {
@@ -1259,6 +1353,7 @@ export function entryToUiMessage(
         display: entry.display,
         details: entry.details,
         timestamp: parseEntryTimestamp(entry.timestamp),
+        ...(isClientMessageId(entry.clientMessageId) ? { clientMessageId: entry.clientMessageId } : {}),
       };
     default:
       // model_change, thinking_level_change, service_tier_change, label,

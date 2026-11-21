@@ -1,19 +1,23 @@
 "use client";
 
 import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, memo, KeyboardEvent } from "react";
-import { ChevronDown, ListChecks, Loader2, Mic, Paperclip, Plus, Shrink, Sparkles, Wrench, X, Zap } from "lucide-react";
-import { getSubmitDuringRunBehavior } from "@/lib/composer-prefs";
-import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
+import { createPortal } from "react-dom";
+import { ChevronDown, ClipboardPaste, CornerDownRight, ListChecks, Loader2, Mic, Paperclip, Plus, RotateCw, Shrink, Snail, Sparkles, Terminal, Wrench, X, Zap } from "lucide-react";
+import { getSubmitDuringRunBehavior, isWordCompletionEnabled } from "@/lib/composer-prefs";
+import type { BuiltinSlashCommandResult, CompactResultInfo, PromptSendOptions, PromptSubmissionResult, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { ActiveGoal, ActivePlan } from "@/lib/web-mode-state";
 import { toast } from "@/components/ui/toast";
 import { ConfirmDialog } from "@/components/ui/field";
 import { useDictation } from "@/hooks/useDictation";
-import type { GenerationSpeedInfo, SessionStatsInfo } from "@/lib/pi-types";
+import { toastBtwError } from "@/hooks/useBtw";
+import type { GenerationSpeedInfo, SessionStatsInfo, SlowModeScope, UsageLimitState } from "@/lib/pi-types";
+import type { SttAfter } from "@/lib/stt";
 import { formatCompactNumber, formatPercent } from "@/lib/format";
 import { ContextDetailPanel } from "./ComposerPanels";
 import { RecordingDeck } from "./RecordingDeck";
-import { clearDraft, getDraft, setDraft } from "@/lib/draft-store";
+import { beginDraftSubmission, clearDraft, consumeDraft, endDraftSubmission, getDraft, getDraftRevision, isSameDraft, markDraftEdited, mergeRecoveredText, moveDraftSubmissions, recoverDraft, requiresPromptMode, setDraft, subscribeDraftConsumption, subscribeDraftRecovery, type ChatDraft, type ChatDraftImage } from "@/lib/draft-store";
 import { expandWebSlashCommand } from "@/lib/web-slash-commands";
+import { WorkspaceFileContext } from "@/lib/workspace-file-context";
 import type { AttachedImage, AttachedTextFile } from "./ChatInput-draft-attachments";
 import {
   draftFilesToAttachedFiles,
@@ -22,6 +26,20 @@ import {
   revokeImagePreview,
   textFileToDraftFile,
 } from "./ChatInput-draft-attachments";
+import {
+  attachedUploadsToDraftUploads,
+  draftUploadsToAttachedUploads,
+  ImageChip,
+  UploadChip,
+  uploadArgs,
+  uploadErrorMessage,
+  uploadRecovery,
+  type AttachedUpload,
+} from "./ChatInput-uploads";
+import { discardUpload, uploadFile, UploadFailedError, type UploadHandle } from "@/lib/event-stream";
+import { randomUUID } from "@/lib/random-uuid";
+import { MAX_UPLOAD_BYTES, MAX_UPLOADS_PER_MESSAGE } from "@/lib/upload-limits";
+import { hostProjectKey, LOCAL_HOST_ID } from "@/lib/project-ordering";
 import {
   BUILTIN_SLASH_COMMAND_DEFS,
   CLIENT_BUILTIN_COMMAND_NAMES,
@@ -46,25 +64,105 @@ import { ComposerModeStatus, ModelErrorBanner, QueuedActionButton } from "./Chat
 import { CHAT_COLUMN_MAX_WIDTH } from "@/lib/chat-layout";
 import {
   composeMessageWithTextAttachments,
-  describeTextAttachmentSkip,
-  formatAttachmentBytes,
   MAX_ATTACHED_TEXT_FILES,
   selectTextAttachments,
 } from "@/lib/chat-attachments";
 import {
-  MAX_ATTACHED_IMAGE_BYTES,
+  attachedImageBytes,
   MAX_ATTACHED_IMAGES,
+  MAX_TOTAL_ATTACHED_IMAGE_BYTES,
   validateOutgoingPrompt,
 } from "@/lib/image-attachments";
 import {
   buildEntriesFromFiles, buildAtInsertText, extractAtQuery, filterFileEntries,
   type AtQueryMatch, type FileIndexEntry,
 } from "@/lib/file-fuzzy";
+import {
+  extractSlashQuery,
+  buildSlashInsertText,
+  type SlashQueryMatch,
+} from "@/lib/slash-autocomplete";
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useWordPrediction, type PredictWord, type PredictWordFeedback } from "@/hooks/useWordPrediction";
+import { acceptGhost } from "@/lib/word-prediction";
+import { GhostMirror } from "@/components/GhostMirror";
 import { useI18n } from "@/lib/i18n";
-import { selectableThinkingLevels } from "@/lib/thinking-levels";
+import { selectableThinkingLevels, DEFAULT_THINKING_LEVELS } from "@/lib/thinking-levels";
 import type { ToolPreset } from "@/lib/tool-presets";
+
+function ThinkingGlyph({ level }: { level: string }) {
+  if (!DEFAULT_THINKING_LEVELS.includes(level)) return null;
+  return (
+    <span className="composer-thinking-glyph" data-level={level} aria-hidden="true">
+      {level === "auto" ? <RotateCw strokeWidth={2} /> : null}
+    </span>
+  );
+}
+
+const SLOW_MODE_SAME_DAY_MS = 20 * 3_600_000;
+
+function formatSlowModeResetClock(resetsAtSec: number, now: number): string {
+  const date = new Date(resetsAtSec * 1000);
+  return resetsAtSec * 1000 - now > SLOW_MODE_SAME_DAY_MS
+    ? date.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/** A reset time we can actually put on screen, or null when omp gave us none.
+ *  omp may omit the field or send a non-number, and a reset already in the
+ *  past would render a plausible but wrong clock — both are worse than saying
+ *  no time at all, because the user would plan around them. */
+function usableSlowModeResetTime(
+  resetsAtSec: number | null | undefined,
+  now: number,
+): string | null {
+  if (typeof resetsAtSec !== "number" || !Number.isFinite(resetsAtSec)) return null;
+  if (resetsAtSec * 1000 <= now) return null;
+  return formatSlowModeResetClock(resetsAtSec, now);
+}
+
+function slowModeAllowancePercent(
+  allowanceLeftPercent: number | null | undefined,
+): number | null {
+  return typeof allowanceLeftPercent === "number" && Number.isFinite(allowanceLeftPercent)
+    ? allowanceLeftPercent
+    : null;
+}
+
+function formatUsageLimitLabel(
+  state: UsageLimitState,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+  now = Date.now(),
+): string {
+  const time = usableSlowModeResetTime(state.resetsAtSec, now);
+  if (state.stage === "low_priority") {
+    // Read inside the narrowing: allowanceLeftPercent is not on the wrap_up arm.
+    const percent = slowModeAllowancePercent(state.allowanceLeftPercent);
+    if (time === null) {
+      return percent === null
+        ? t("chatInput.slowMode.lowPriorityNoReset")
+        : t("chatInput.slowMode.lowPriorityAllowanceOnly", { percent });
+    }
+    return percent === null
+      ? t("chatInput.slowMode.lowPriority", { time })
+      : t("chatInput.slowMode.lowPriorityAllowance", { time, percent });
+  }
+  if (state.extraUsage) return t("chatInput.slowMode.wrapUpExtraUsage");
+  if (time === null) return t("chatInput.slowMode.wrapUp");
+  return t("chatInput.slowMode.wrapUpReset", { time });
+}
+
+/** A file's bytes as base64, without the data URL's prefix. */
+function readBase64(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    // result is "data:<mime>;base64,<data>"
+    reader.onload = () => resolve((reader.result as string).split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
 
 export type { AttachedImage, AttachedTextFile } from "./ChatInput-draft-attachments";
 export { filterModelOptions } from "./ChatInput-model-options";
@@ -77,23 +175,42 @@ const TOOL_PRESET_OPTIONS: Array<{ value: ToolPreset; descriptionKey: string }> 
 ];
 
 interface Props {
-  onSend: (message: string, images?: AttachedImage[]) => void;
+  /** Without `outbox`, only a rejected submission is restored; completed/superseded runs must not be replayed.
+   *  `uploads`: the ids of files sent As file, passed only when there are some. `options` preserves explicit model-input
+   *  intent when attachments or prefills would otherwise leave a shell-looking string. */
+  onSend: (message: string, images?: AttachedImage[], uploads?: string[], uploadProofs?: Record<string, string>, options?: PromptSendOptions) => Promise<PromptSubmissionResult>;
+  /** Sends go through the message outbox (an existing session): the composer clears once `onSend` (or a queue
+   *  callback) reports the message stored, and keeps it otherwise. */
+  outbox?: boolean;
+  /** Ghost-text word completion for the draft (omp `predict_word`); absent = no ghost text. */
+  onPredictWord?: PredictWord;
+  onPredictWordFeedback?: PredictWordFeedback;
   onAbort: () => void;
-  onSteer?: (message: string, images?: AttachedImage[]) => void;
-  onFollowUp?: (message: string, images?: AttachedImage[]) => void;
-  onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => void;
+  /** Steer/follow-up during a run (slash commands too): resolve true once the outbox has the message. */
+  onSteer?: (message: string, images?: AttachedImage[], uploads?: string[], uploadProofs?: Record<string, string>) => Promise<boolean>;
+  onFollowUp?: (message: string, images?: AttachedImage[], uploads?: string[], uploadProofs?: Record<string, string>) => Promise<boolean>;
   isStreaming: boolean;
+  /** Refuse submission without treating a pending history edit as a model run. */
+  submissionBlocked?: boolean;
   model?: { provider: string; modelId: string } | null;
   isAutoModelSelection?: boolean;
   modelNames?: Record<string, string>;
-  modelList?: { id: string; name: string; provider: string; supportsFastMode?: boolean }[];
+  modelList?: { id: string; name: string; provider: string; supportsFastMode?: boolean; identity?: { class: string; family?: string; revision?: string }; costOutput?: number }[];
   modelError?: string | null;
   modelsLoading?: boolean;
   onModelChange?: (provider: string, modelId: string) => void;
   fastModeEnabled?: boolean;
   fastModeActive?: boolean;
+  /** omp's structured provider usage-limit state, shown as a warning chip. */
+  usageLimit?: UsageLimitState;
   fastModeSupported?: boolean;
   onFastModeChange?: (enabled: boolean) => void;
+  /** omp reports `/slow` applies to the active model (absent on older omp). */
+  slowModeSupported?: boolean;
+  slowModeEnabled?: boolean;
+  /** `global` = shared persisted omp setting; `session` = this session only. */
+  slowModeScope?: SlowModeScope;
+  onSlowModeChange?: (enabled: boolean) => void;
   onAbortCompaction?: () => void;
   isCompacting?: boolean;
   compactResult?: CompactResultInfo | null;
@@ -106,7 +223,7 @@ interface Props {
   onToolPresetChange?: (preset: ToolPreset) => void;
   /** Display name for the current model when the catalog does not know it. */
   modelNameOverride?: string | null;
-  retryInfo?: { attempt: number; maxAttempts: number; errorMessage?: string } | null;
+  retryInfo?: { attempt: number; maxAttempts: number; delayMs?: number; startedAt?: number; errorMessage?: string } | null;
   onAbortRetry?: () => void;
   queuedMessages?: QueuedMessages | null;
   inputHistory?: string[];
@@ -114,26 +231,35 @@ interface Props {
   advisorActive?: boolean;
   /** Resolved advisor role (display model + reasoning) for the composer tooltips. */
   advisorModel?: { name: string; reasoning: string | null } | null;
-  /** Compact the session context from the composer toolbar. */
+  /** Compact the session context from the session information panel. */
   onCompact?: () => void;
-  /** Live context totals feeding the composer context ring. */
+  /** Live context totals feeding the session information ring. */
   contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null;
   /** Session stats shown in the context ring popover. */
   sessionStats?: SessionStatsInfo | null;
+  /** Mobile top-bar mount point for the session information control. */
+  sessionInfoContainer?: HTMLDivElement | null;
   /** Model capacity shown in the context ring popover. */
   modelCapacity?: { contextWindow?: number; maxTokens?: number } | null;
   /** Generation speed shown in the context ring popover. */
   generationSpeed?: GenerationSpeedInfo | null;
-  /** Remove one queued message from the queue panel (Edit/Delete/Steer). */
-  onRemoveQueuedMessage?: (text: string) => void;
-  /** Relabel the first queued follow-up as a steering message. */
-  onPromoteQueuedToSteer?: (text: string) => void;
+  /** Cancel one pending message in omp before removing it from the queue
+   *  panel; resolves to its images once omp confirms, else false. */
+  onRemoveQueuedMessage?: (text: string, queue: "steering" | "followUp") => Promise<ChatDraftImage[] | false>;
+  /** Promote the first matching native follow-up into steering. */
+  onPromoteQueuedToSteer?: (text: string) => void | Promise<void>;
   slashCommands?: SlashCommandInfo[];
   slashCommandsLoading?: boolean;
   onLoadSlashCommands?: () => Promise<SlashCommandInfo[]> | SlashCommandInfo[];
   onBuiltinCommand?: (message: string) => Promise<BuiltinSlashCommandResult>;
   onAudioUnlock?: () => void;
   draftKey?: string;
+  /** Owning host for file uploads and the @ file index (this machine when absent). */
+  uploadHostId?: string;
+  /** Lazily bind a pool's real owner before staging any file bytes. Failure never falls back locally. */
+  resolveUploadHost?: () => Promise<string>;
+  /** Backend-confirmed ownership relocation, distinct from navigating to a draft. */
+  draftIdentityMove?: { from: string; to: string; sourceDraft?: ChatDraft };
   /** Session working directory — enables the @ file autocomplete menu */
   cwd?: string | null;
   activeGoal?: ActiveGoal | null;
@@ -152,10 +278,12 @@ interface Props {
 export interface ChatInputHandle {
   focus: () => void;
   insertText: (text: string) => void;
-  insertIfEmpty: (text: string) => void;
+  insertIfEmpty: (text: string, options?: PromptSendOptions) => void;
   prependText: (text: string) => void;
   addFiles: (files: File[]) => void;
   openContextPanel: () => void;
+  /** Retarget captured queue recoveries before a confirmed move can render. */
+  retargetPendingRecovery: (from: string, to: string) => void;
 }
 const COMPOSITION_END_ENTER_GRACE_MS = 100;
 
@@ -234,9 +362,8 @@ function menuDropStyle(placement: MenuPlacement, maxHeight: number | null): Reac
   };
 }
 
-
 export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onSend, onAbort, onSteer, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, modelError, modelsLoading, onModelChange, fastModeEnabled, fastModeActive, fastModeSupported, onFastModeChange,
+  onSend, onPredictWord, onPredictWordFeedback, onAbort, onSteer, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, modelError, modelsLoading, onModelChange, fastModeEnabled, fastModeActive, usageLimit, fastModeSupported, onFastModeChange, slowModeSupported, slowModeEnabled, slowModeScope, onSlowModeChange,
   onAbortCompaction, isCompacting, compactResult,
   thinkingLevel, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap, modelNameOverride,
   toolPreset, onToolPresetChange,
@@ -244,17 +371,22 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   slashCommands, slashCommandsLoading, onLoadSlashCommands,
   onBuiltinCommand,
   onAudioUnlock,
-  onPromptWithStreamingBehavior,
+  outbox = false,
+  submissionBlocked = false,
   advisorActive,
   advisorModel,
   onCompact,
   contextUsage,
   sessionStats,
+  sessionInfoContainer,
   modelCapacity,
   generationSpeed,
   onRemoveQueuedMessage,
   onPromoteQueuedToSteer,
   draftKey = "new:unassigned",
+  uploadHostId = LOCAL_HOST_ID,
+  resolveUploadHost,
+  draftIdentityMove,
   cwd,
   activeGoal,
   activePlan,
@@ -265,6 +397,13 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   onOpenProviders,
 }: Props, ref) {
   const isMobile = useIsMobile();
+  // Read per render so a Settings change applies on the next keystroke.
+  const wordCompletionOn = isWordCompletionEnabled();
+  const wordPrediction = useWordPrediction(
+    wordCompletionOn ? onPredictWord : undefined,
+    wordCompletionOn ? onPredictWordFeedback : undefined,
+  );
+  const ghostMirrorRef = useRef<HTMLDivElement>(null);
   const composerId = React.useId();
   const historyListboxId = `${composerId}-history`;
   const slashListboxId = `${composerId}-slash`;
@@ -288,19 +427,34 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     items[next]?.focus();
   }, []);
   const { t, tn, locale } = useI18n();
+  const usageLimitLabel = usageLimit
+    ? formatUsageLimitLabel(usageLimit, t)
+    : undefined;
   const modelCollator = React.useMemo(
     () => new Intl.Collator(locale, { numeric: true, sensitivity: "base" }),
     [locale],
   );
-  const [value, setValue] = useState(() => (draftKey ? getDraft(draftKey)?.value ?? "" : ""));
+  const [value, setRawValue] = useState(() => (draftKey ? getDraft(draftKey)?.value ?? "" : ""));
+  const [promptOnly, setPromptOnlyState] = useState(() => Boolean(draftKey && getDraft(draftKey)?.promptOnly));
+  const promptOnlyRef = useRef(promptOnly);
+  const setPromptOnly = useCallback((next: boolean) => {
+    promptOnlyRef.current = next;
+    setPromptOnlyState(next);
+  }, []);
   const [queuedDeleteTarget, setQueuedDeleteTarget] = useState<{
     text: string;
+    kind: "follow-up" | "steer";
     draftKey: string | undefined;
     queue: Props["queuedMessages"];
   } | null>(null);
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [thinkingDropdownOpen, setThinkingDropdownOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
+  // Desktop context popover height cap: the room above its trigger, so it only
+  // scrolls when the window is genuinely too short for it.
+  const [contextMaxHeight, setContextMaxHeight] = useState<number>();
+  const [composerContextContainer, setComposerContextContainer] = useState<HTMLDivElement | null>(null);
+  const contextContainer = isMobile ? sessionInfoContainer : composerContextContainer;
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
   const [plusExpanded, setPlusExpanded] = useState<"tools" | "advisor" | null>(null);
   const [modelSearchQuery, setModelSearchQuery] = useState("");
@@ -310,20 +464,49 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const [attachedTextFiles, setAttachedTextFiles] = useState<AttachedTextFile[]>(() => (
     draftKey ? draftFilesToAttachedFiles(getDraft(draftKey)?.files) : []
   ));
+  const [attachedUploads, setAttachedUploads] = useState<AttachedUpload[]>(() => (
+    draftKey ? draftUploadsToAttachedUploads(getDraft(draftKey)?.uploads) : []
+  ));
+  useLayoutEffect(() => {
+    if (promptOnly && !value && !attachedImages.length && !attachedTextFiles.length && !attachedUploads.length) {
+      setPromptOnly(false);
+    }
+  }, [promptOnly, value, attachedImages.length, attachedTextFiles.length, attachedUploads.length, setPromptOnly]);
   const [attachError, setAttachError] = useState<string | null>(null);
+  /** An informational note about the last batch (images that went As file). */
+  const [attachNotice, setAttachNotice] = useState<string | null>(null);
   const trimmedValue = value.trimStart();
-  const bashMode = attachedImages.length === 0 && attachedTextFiles.length === 0 && trimmedValue.startsWith("!");
+  const bashMode = !promptOnly && attachedImages.length === 0 && attachedTextFiles.length === 0 && attachedUploads.length === 0 && trimmedValue.startsWith("!");
   const bashExcluded = bashMode && trimmedValue.startsWith("!!");
+  // "!" shares output with the model (riskier, root-style warning); "!!" stays local (plain terminal).
+  const shellMode = bashMode ? (bashExcluded ? "local" : "model") : undefined;
+  // Side questions stay separate from the main run's queue and Stop action. Without builtin dispatch `/btw` is
+  // ordinary text, so the composer keeps its Queue fallback.
+  const btwMode = Boolean(onBuiltinCommand) && /^\/btw(\s|$)/.test(trimmedValue);
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
+  const [slashMatch, setSlashMatch] = useState<SlashQueryMatch | null>(null);
+  const updateSlashQuery = useCallback((text: string, cursor: number | null) => {
+    const pos = cursor ?? text.length;
+    setSlashMatch(extractSlashQuery(text.slice(0, pos)));
+  }, []);
   const [atQuery, setAtQuery] = useState<AtQueryMatch | null>(null);
   const [atMenuOpen, setAtMenuOpen] = useState(false);
   const [atActiveIndex, setAtActiveIndex] = useState(0);
   const [historyMenuOpen, setHistoryMenuOpen] = useState(false);
   const [historyActiveIndex, setHistoryActiveIndex] = useState(0);
-  const [fileIndex, setFileIndex] = useState<{ cwd: string; entries: FileIndexEntry[]; truncated: boolean } | null>(null);
+  const [fileIndex, setFileIndex] = useState<{ workspaceKey: string; entries: FileIndexEntry[]; truncated: boolean } | null>(null);
   const [fileIndexLoading, setFileIndexLoading] = useState(false);
-  const [atServerResult, setAtServerResult] = useState<{ cwd: string; query: string; matches: FileIndexEntry[] } | null>(null);
+  const [atServerResult, setAtServerResult] = useState<{ workspaceKey: string; query: string; matches: FileIndexEntry[] } | null>(null);
+  const [retryNow, setRetryNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!retryInfo?.delayMs || !retryInfo?.startedAt) return;
+    setRetryNow(Date.now());
+    const interval = setInterval(() => {
+      setRetryNow(Date.now());
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [retryInfo?.delayMs, retryInfo?.startedAt]);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -333,6 +516,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const modelSearchInputRef = useRef<HTMLInputElement>(null);
   const thinkingDropdownRef = useRef<HTMLDivElement>(null);
   const contextWrapRef = useRef<HTMLDivElement>(null);
+  const contextReturnFocusRef = useRef<HTMLElement | null>(null);
   const plusMenuRef = useRef<HTMLDivElement>(null);
   const historyMenuRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
@@ -344,25 +528,85 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const slashItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const atItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const historyItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const fileIndexMetaRef = useRef<{ cwd: string; fetchedAt: number } | null>(null);
-  const fileIndexFetchingRef = useRef<string | null>(null);
+  const fileIndexMetaRef = useRef<{ workspaceKey: string; fetchedAt: number } | null>(null);
+  const fileIndexFetchingRef = useRef<{ workspaceKey: string; controller: AbortController } | null>(null);
+  const fileSource = React.useContext(WorkspaceFileContext);
+  const sourceSessionId = fileSource?.sessionId;
+  const fileIndexOwner = `${sourceSessionId ?? ""}:${hostProjectKey(uploadHostId, cwd ?? "")}`;
+  const fileIndexOwnerRef = useRef(fileIndexOwner);
+  fileIndexOwnerRef.current = fileIndexOwner;
   const draftKeyRef = useRef(draftKey);
+  /** Every user/programmatic text input goes through here; only draft hydration and identity transfer use `setRawValue`.
+   *  The edit is recorded at admission, before React batches state or flushes the persist effect, so an equal final
+   *  value (clear then retype in one batch) still invalidates an older outbox commit. */
+  const markInputEdited = useCallback(() => {
+    // A confirmed move can hand off the identity before React commits the draftKey prop. Edits in that window belong
+    // to the new owner, just like pending queue recovery; marking the old display key would miss its pending commit.
+    const key = draftRecoveryIdentityRef.current.key;
+    if (key) markDraftEdited(key);
+  }, []);
+  const setValue: React.Dispatch<React.SetStateAction<string>> = useCallback((next) => {
+    markInputEdited();
+    setRawValue(next);
+  }, [markInputEdited]);
+  const consumedIdentityMoveRef = useRef<typeof draftIdentityMove>(undefined);
+  // Pending queue edits retain this identity across confirmed moves only.
+  // Navigation starts a new identity, even when a draft key is later reused.
+  const draftRecoveryIdentityRef = useRef({ key: draftKey });
+  const persistedDraftRef = useRef<ChatDraft | null>(null);
+  // Async dictation and slash-command completions must see the latest edit gate.
+  const submissionBlockedRef = useRef(submissionBlocked);
   const valueRef = useRef(value);
+  // An outbox send waiting to be stored: a second Enter must not send the same text again.
+  const holdingRef = useRef(false);
+  const composerAliveRef = useRef(true);
+  useLayoutEffect(() => {
+    composerAliveRef.current = true;
+    return () => { composerAliveRef.current = false; };
+  }, []);
   const attachedImagesRef = useRef(attachedImages);
   const attachedTextFilesRef = useRef(attachedTextFiles);
   // Bumped whenever the user clears/sends the composer: in-flight FileReader
   // and file.text() reads must not re-append their results afterwards.
   const attachmentRevisionRef = useRef(0);
+  const attachmentIdentityRevisionRef = useRef(0);
   const pendingImageCountRef = useRef(0);
   const pendingTextFileCountRef = useRef(0);
   const pendingTextFileBytesRef = useRef(0);
+  const pendingImageBytesRef = useRef(0);
+  const attachedUploadsRef = useRef(attachedUploads);
+  /** Uploads in flight, by id: a chip's removal aborts its handle. */
+  const uploadHandlesRef = useRef(new Map<string, UploadHandle>());
+  const uploadHostIdRef = useRef(uploadHostId);
+  const resolveUploadHostRef = useRef(resolveUploadHost);
+  submissionBlockedRef.current = submissionBlocked;
   valueRef.current = value;
   attachedImagesRef.current = attachedImages;
   attachedTextFilesRef.current = attachedTextFiles;
+  attachedUploadsRef.current = attachedUploads;
+  uploadHostIdRef.current = uploadHostId;
+  resolveUploadHostRef.current = resolveUploadHost;
+
+  const captureDraft = useCallback((): ChatDraft => {
+    const uploads = attachedUploadsRef.current;
+    const draft: ChatDraft = {
+      value: valueRef.current,
+      images: attachedImagesRef.current.map(imageToDraftImage),
+      files: attachedTextFilesRef.current.map(textFileToDraftFile),
+      ...(promptOnlyRef.current ? { promptOnly: true } : {}),
+      uploads,
+    };
+    // Establish intent from every live chip before unfinished upload payloads are omitted.
+    if (requiresPromptMode(draft)) draft.promptOnly = true;
+    draft.uploads = attachedUploadsToDraftUploads(uploads);
+    return draft;
+  }, []);
 
   const insertTextAtCursor = useCallback((text: string) => {
     const ta = textareaRef.current;
     if (!ta) {
+      const current = valueRef.current;
+      valueRef.current = current + (current ? " " : "") + text;
       setValue((v) => v + (v ? " " : "") + text);
       return;
     }
@@ -372,8 +616,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const after = ta.value.slice(end);
     const sep = before.length > 0 && !before.endsWith(" ") ? " " : "";
     const newVal = before + sep + text + after;
+    valueRef.current = newVal;
     setValue(newVal);
     setAtQuery(null);
+    setSlashMatch(null);
     requestAnimationFrame(() => {
       if (!ta) return;
       const pos = start + sep.length + text.length;
@@ -382,19 +628,21 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       ta.style.height = "auto";
       ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
     });
-  }, []);
+  }, [setValue]);
 
 
   useImperativeHandle(ref, () => ({
     focus() {
       textareaRef.current?.focus();
     },
-    insertIfEmpty(text: string) {
+    insertIfEmpty(text: string, options?: PromptSendOptions) {
       const ta = textareaRef.current;
       const current = ta ? ta.value : value;
       if (current.trim()) return;
+      if (options?.promptOnly && text.trim()) setPromptOnly(true);
       setValue(text);
       setAtQuery(null);
+      setSlashMatch(null);
       requestAnimationFrame(() => {
         if (!ta) return;
         ta.focus();
@@ -411,6 +659,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       const combined = [text, current].filter((t) => t.trim()).join("\n\n");
       setValue(combined);
       setAtQuery(null);
+      setSlashMatch(null);
       requestAnimationFrame(() => {
         if (!ta) return;
         ta.focus();
@@ -426,47 +675,128 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     openContextPanel() {
       setContextOpen(true);
     },
+    retargetPendingRecovery(from, to) {
+      const identity = draftRecoveryIdentityRef.current;
+      if (identity.key === from) {
+        // The hook has transferred the stored draft, but React may not have committed the new key yet. Retarget active
+        // submissions here too: an ACK in that gap must find its draft, including one sent by an earlier mount.
+        moveDraftSubmissions(from, to);
+        identity.key = to;
+      }
+    },
   }));
 
-  const processImageFiles = useCallback(async (files: File[]) => {
-    const remaining = Math.max(
-      0,
-      MAX_ATTACHED_IMAGES - attachedImagesRef.current.length - pendingImageCountRef.current,
+  const patchUpload = useCallback((id: string, patch: Partial<AttachedUpload>) => {
+    setAttachedUploads((prev) => prev.map((upload) => (upload.id === id ? { ...upload, ...patch } : upload)));
+  }, []);
+
+  /** Uploads the chip's file to its host; a retry resumes at the host's offset (same id). While a transient failure
+   *  waits to resume by itself, the chip keeps `uploading` and shows the failure in `error`. */
+  const runUpload = useCallback((upload: AttachedUpload) => {
+    if (!upload.file) return;
+    const { id, size } = upload;
+    let shownPercent = -1;
+    let active: UploadHandle | undefined;
+    let aborted = false;
+    const resolveOwner = resolveUploadHostRef.current;
+    const promise = (async () => {
+      const hostId = upload.hostId || (resolveOwner ? await resolveOwner() : uploadHostIdRef.current);
+      if (aborted) throw new DOMException("Upload cancelled", "AbortError");
+      if (!hostId) throw new Error(t("agentSession.uploadOwnerUnavailable"));
+      patchUpload(id, { hostId });
+      active = uploadFile(upload.file!, hostId, (received) => {
+        // One render per whole percent: the host acks up to every 16 ms.
+        const percent = Math.floor((received * 100) / Math.max(1, size));
+        if (percent === shownPercent) return;
+        shownPercent = percent;
+        patchUpload(id, { received });
+      }, id, (error) => patchUpload(id, { error: error === null ? null : uploadErrorMessage(error) }));
+      return await active.promise;
+    })();
+    const handle: UploadHandle = { id, promise, abort() { aborted = true; active?.abort(); } };
+    uploadHandlesRef.current.set(id, handle);
+    const settle = (patch: Partial<AttachedUpload>) => {
+      // Removed or switched meanwhile: its abort ended it.
+      if (uploadHandlesRef.current.get(id) !== handle) return;
+      uploadHandlesRef.current.delete(id);
+      patchUpload(id, patch);
+    };
+    handle.promise.then(
+      ({ proof }) => settle({ status: "done", received: size, error: null, proof }),
+      // 410: the worker already cancelled it on its host (the page went into the back/forward cache). A Retry under a
+      // new id starts over, so the cancel still pending for this one can never reach it.
+      (error: unknown) => settle({ status: "error", error: uploadErrorMessage(error), ...(error instanceof UploadFailedError && error.status === 410 ? { id: randomUUID(), proof: undefined } : {}) }),
     );
-    const imageFiles = files
-      .filter((file) => file.type.startsWith("image/") && file.size <= MAX_ATTACHED_IMAGE_BYTES)
-      .slice(0, remaining);
-    if (!imageFiles.length) {
-      if (files.length > 0) {
-        setAttachError(
-          remaining === 0
-            ? t("chatInput.attachmentImageLimit", { count: MAX_ATTACHED_IMAGES })
-            : t("chatInput.attachmentImagesSkipped", { count: files.length, size: formatAttachmentBytes(MAX_ATTACHED_IMAGE_BYTES) }),
-        );
-      }
-      return;
+  }, [patchUpload, t]);
+
+  /** Attaches files As file and starts their uploads: up to MAX_UPLOAD_BYTES each, MAX_UPLOADS_PER_MESSAGE in all
+   *  (the only refusals left, spec U2). `previewUrls[i]`: an image's thumbnail, made here when missing. Returns how
+   *  many were attached. */
+  const attachAsFiles = useCallback((files: File[], previewUrls: string[] = []): number => {
+    const room = Math.max(0, MAX_UPLOADS_PER_MESSAGE - attachedUploadsRef.current.length);
+    const fitting = files.flatMap((file, i) => (file.size <= MAX_UPLOAD_BYTES ? [{ file, previewUrl: previewUrls[i] }] : []));
+    const added = fitting.slice(0, room).map(({ file, previewUrl }): AttachedUpload => ({
+      id: randomUUID(),
+      name: file.name,
+      size: file.size,
+      hostId: resolveUploadHostRef.current ? "" : uploadHostIdRef.current,
+      file,
+      received: 0,
+      status: "uploading",
+      error: null,
+      previewUrl: previewUrl ?? (file.type.startsWith("image/") ? URL.createObjectURL(file) : null),
+    }));
+    if (fitting.length < files.length) {
+      setAttachError(t("chatInput.attachmentUploadTooLarge", { count: files.length - fitting.length, size: `${MAX_UPLOAD_BYTES / 1024 ** 3} GB` }));
+    } else if (added.length < fitting.length) {
+      setAttachError(t("chatInput.attachmentUploadLimit", { count: MAX_UPLOADS_PER_MESSAGE }));
     }
+    if (added.length === 0) return 0;
+    markInputEdited();
+    // Counted at once: another batch in the same tick sees these.
+    attachedUploadsRef.current = [...attachedUploadsRef.current, ...added];
+    setAttachedUploads((prev) => [...prev, ...added]);
+    added.forEach(runUpload);
+    return added.length;
+  }, [markInputEdited, runUpload, t]);
+
+  /** Whether `bytes` more of images (`extra` more of them) still fit the inline budget the send checks. */
+  const fitsInline = useCallback((bytes: number, extra = 0): boolean => {
+    const images = attachedImagesRef.current;
+    const used = images.reduce((total, image) => total + attachedImageBytes(image), 0) + pendingImageBytesRef.current;
+    return images.length + pendingImageCountRef.current + extra < MAX_ATTACHED_IMAGES && used + bytes <= MAX_TOTAL_ATTACHED_IMAGE_BYTES;
+  }, []);
+
+  /** Images go Inline while the message's inline budget has room; the rest go As file, with a notice. */
+  const processImageFiles = useCallback(async (files: File[]) => {
+    const imageFiles: File[] = [];
+    const asFiles: File[] = [];
+    let inlineBytes = 0;
+    for (const file of files) {
+      if (fitsInline(inlineBytes + file.size, imageFiles.length)) {
+        imageFiles.push(file);
+        inlineBytes += file.size;
+      } else {
+        asFiles.push(file);
+      }
+    }
+    const switched = attachAsFiles(asFiles);
+    if (switched > 0) setAttachNotice(t("chatInput.imagesAsFile", { count: switched }));
+    if (!imageFiles.length) return;
+    // Admission is a new composer edit now, not only when FileReader finishes: an older ACK must not invalidate it.
+    markInputEdited();
     const revision = attachmentRevisionRef.current;
+    const identityRevision = attachmentIdentityRevisionRef.current;
     pendingImageCountRef.current += imageFiles.length;
+    pendingImageBytesRef.current += inlineBytes;
     const created: AttachedImage[] = [];
     try {
       const newImages = await Promise.all(
-        imageFiles.map(
-          (file) =>
-            new Promise<AttachedImage>((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onload = () => {
-                const result = reader.result as string;
-                // result is "data:<mime>;base64,<data>"
-                const base64 = result.split(",")[1];
-                const image = { data: base64, mimeType: file.type, previewUrl: URL.createObjectURL(file) };
-                created.push(image);
-                resolve(image);
-              };
-              reader.onerror = reject;
-              reader.readAsDataURL(file);
-            })
-        )
+        imageFiles.map(async (file) => {
+          const image: AttachedImage = { data: await readBase64(file), mimeType: file.type, previewUrl: URL.createObjectURL(file), file };
+          created.push(image);
+          return image;
+        }),
       );
       // The composer was cleared/sent while the reads were in flight —
       // drop the batch instead of re-appending stale attachments.
@@ -475,7 +805,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         return;
       }
       setAttachedImages((prev) => {
-        const accepted = newImages.slice(0, Math.max(0, MAX_ATTACHED_IMAGES - prev.length));
+        // These reads already passed the picker budget before the move.
+        // A merged target must not take away their reserved slots.
+        const accepted = identityRevision !== attachmentIdentityRevisionRef.current
+          ? newImages
+          : newImages.slice(0, Math.max(0, MAX_ATTACHED_IMAGES - prev.length));
         newImages.slice(accepted.length).forEach(revokeImagePreview);
         return [...prev, ...accepted];
       });
@@ -486,30 +820,24 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       setAttachError(t("chatInput.attachmentImageReadFailed"));
     } finally {
       pendingImageCountRef.current -= imageFiles.length;
+      pendingImageBytesRef.current -= inlineBytes;
     }
-  }, []);
+  }, [attachAsFiles, fitsInline, markInputEdited, t]);
 
+  /** Text is inlined while it fits the text budget; past it, when it turns out binary, and always for a PDF (omp reads
+   *  it as a document; its decoded bytes are not text), it goes As file. */
   const processTextFiles = useCallback(async (files: File[]) => {
-    const remaining = Math.max(
-      0,
-      MAX_ATTACHED_TEXT_FILES - attachedTextFilesRef.current.length - pendingTextFileCountRef.current,
-    );
     // In-flight batches reserve their bytes too, so two overlapping drops
     // cannot each fit under the aggregate budget on their own.
-    const { accepted: textFiles, tooLarge, overBudget } = selectTextAttachments(files, {
+    const { accepted: textFiles } = selectTextAttachments(files.filter((file) => file.type !== "application/pdf" && !/\.pdf$/i.test(file.name)), {
       usedBytes: attachedTextFilesRef.current.reduce((total, file) => total + file.size, 0) + pendingTextFileBytesRef.current,
       usedSlots: attachedTextFilesRef.current.length + pendingTextFileCountRef.current,
     });
-    // Report every dropped candidate, not just an entirely rejected batch: a
-    // drop of several files can lose some to the budget while accepting others.
-    const limitMessage = remaining === 0 && files.length > 0
-      ? t("chatInput.attachmentTextFilesLimit", { count: MAX_ATTACHED_TEXT_FILES })
-      : describeTextAttachmentSkip({ tooLarge, overBudget });
-    if (!textFiles.length) {
-      if (files.length > 0) setAttachError(limitMessage ?? t("chatInput.attachmentFilesSkipped", { count: files.length }));
-      return;
-    }
+    attachAsFiles(files.filter((file) => !textFiles.includes(file)));
+    if (!textFiles.length) return;
+    markInputEdited();
     const revision = attachmentRevisionRef.current;
+    const identityRevision = attachmentIdentityRevisionRef.current;
     pendingTextFileCountRef.current += textFiles.length;
     pendingTextFileBytesRef.current += textFiles.reduce((total, file) => total + file.size, 0);
     try {
@@ -527,38 +855,68 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       // Binary content cannot be inlined into the prompt: NUL bytes, or
       // U+FFFD replacement characters left by mis-decoded binary (e.g.
       // UTF-16 text read as UTF-8).
-      const newFiles = readFiles.filter(
-        (file) => !file.content.includes("\u0000") && !file.content.includes("\uFFFD"),
-      );
-      const skipped = textFiles.length - newFiles.length;
+      const binary = readFiles.map((file) => file.content.includes("\u0000") || file.content.includes("\uFFFD"));
+      const newFiles = readFiles.filter((_, index) => !binary[index]);
+      attachAsFiles(textFiles.filter((_, index) => binary[index]));
       setAttachedTextFiles((prev) => [
         ...prev,
-        ...newFiles.slice(0, Math.max(0, MAX_ATTACHED_TEXT_FILES - prev.length)),
+        ...(identityRevision !== attachmentIdentityRevisionRef.current
+          ? newFiles
+          : newFiles.slice(0, Math.max(0, MAX_ATTACHED_TEXT_FILES - prev.length))),
       ]);
-      setAttachError(
-        limitMessage
-          ?? (skipped > 0 ? t("chatInput.attachmentBinarySkipped", { count: skipped }) : null),
-      );
     } catch {
       setAttachError(t("chatInput.attachmentTextReadFailed"));
     } finally {
       pendingTextFileCountRef.current -= textFiles.length;
       pendingTextFileBytesRef.current -= textFiles.reduce((total, file) => total + file.size, 0);
     }
-  }, []);
+  }, [attachAsFiles, markInputEdited, t]);
 
   const processFiles = useCallback((files: File[]) => {
-    if (isStreaming) {
-      setAttachError(t("chatInput.attachmentsDisabled"));
-      return;
-    }
     const imageFiles = files.filter((file) => file.type.startsWith("image/"));
     const otherFiles = files.filter((file) => !file.type.startsWith("image/"));
     void processImageFiles(imageFiles);
     void processTextFiles(otherFiles);
-  }, [isStreaming, processImageFiles, processTextFiles]);
+  }, [processImageFiles, processTextFiles]);
+
+  const processFilesRef = useRef(processFiles);
+  processFilesRef.current = processFiles;
+  const pasteClipboardImage = useCallback(async () => {
+    markInputEdited();
+    setPlusMenuOpen(false);
+    const revision = attachmentRevisionRef.current;
+    try {
+      // Start the read in the click gesture: Safari requires user activation.
+      const items = await navigator.clipboard.read();
+      const files: File[] = [];
+      for (const item of items) {
+        const type = item.types.find((type) => type.startsWith("image/"));
+        if (!type) continue;
+        try {
+          // One past the inline budget goes As file, as from the picker.
+          files.push(new File([await item.getType(type)], "clipboard-image", { type }));
+        } catch {
+          // One entry can disappear between the `types` snapshot and the read
+          // (NotFoundError). Keep whatever the other items yielded.
+        }
+      }
+      if (revision !== attachmentRevisionRef.current) return;
+      if (files.length) processFilesRef.current(files);
+      else setAttachError(t("chatInput.clipboardImageFailed"));
+    } catch {
+      if (revision === attachmentRevisionRef.current) setAttachError(t("chatInput.clipboardImageFailed"));
+    }
+  }, [markInputEdited, t]);
+
+  // The clipboard read API exists only in a secure context, so a plain-http LAN
+  // session (`npm run dev:lan` on http://192.168.x.x) cannot use this at all.
+  // Hide the item rather than offer an entry that can only fail. The plus menu
+  // is never open on the server, so reading navigator here cannot desync.
+  const canReadClipboardImages =
+    typeof navigator !== "undefined" && typeof navigator.clipboard?.read === "function";
 
   const removeImage = useCallback((index: number) => {
+    markInputEdited();
     setAttachedImages((prev) => {
       const next = [...prev];
       const [removed] = next.splice(index, 1);
@@ -566,12 +924,14 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       return next;
     });
     setAttachError(null);
-  }, []);
+    setAttachNotice(null);
+  }, [markInputEdited]);
 
   const removeTextFile = useCallback((index: number) => {
+    markInputEdited();
     setAttachedTextFiles((prev) => prev.filter((_, fileIndex) => fileIndex !== index));
     setAttachError(null);
-  }, []);
+  }, [markInputEdited]);
 
   const clearImages = useCallback(() => {
     setAttachedImages((prev) => {
@@ -584,67 +944,272 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     setAttachedTextFiles([]);
   }, []);
 
+  /** Removing a chip aborts its upload, or has the host delete what it staged. */
+  const removeUpload = useCallback((id: string) => {
+    markInputEdited();
+    const handle = uploadHandlesRef.current.get(id);
+    uploadHandlesRef.current.delete(id);
+    const hostId = attachedUploadsRef.current.find((upload) => upload.id === id)?.hostId;
+    if (handle) handle.abort();
+    else if (hostId) discardUpload(id, hostId);
+    setAttachedUploads((prev) => {
+      const removed = prev.find((upload) => upload.id === id);
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+      return prev.filter((upload) => upload.id !== id);
+    });
+    setAttachError(null);
+    setAttachNotice(null);
+  }, [markInputEdited]);
+
+  const retryUpload = useCallback((id: string) => {
+    const upload = attachedUploadsRef.current.find((each) => each.id === id);
+    if (!upload?.file || upload.status !== "error") return;
+    markInputEdited();
+    patchUpload(id, { status: "uploading", error: null });
+    runUpload(upload);
+  }, [markInputEdited, patchUpload, runUpload]);
+
+  /** Inline -> As file: the image's file (rebuilt from its bytes for one restored from a draft) is uploaded instead. */
+  const switchImageToFile = useCallback((image: AttachedImage) => {
+    const file = image.file ?? new File(
+      [Uint8Array.from(atob(image.data), (char) => char.charCodeAt(0))],
+      `image.${image.mimeType.slice("image/".length)}`,
+      { type: image.mimeType },
+    );
+    if (!attachAsFiles([file], [image.previewUrl])) return;
+    setAttachedImages((prev) => prev.filter((each) => each !== image));
+  }, [attachAsFiles]);
+
+  /** As file -> Inline, while it fits the inline budget: its upload is dropped. */
+  const switchUploadToInline = useCallback(async (upload: AttachedUpload) => {
+    const { id, file, previewUrl } = upload;
+    if (!file || !previewUrl || !fitsInline(file.size)) return;
+    markInputEdited();
+    const revision = attachmentRevisionRef.current;
+    pendingImageCountRef.current += 1;
+    pendingImageBytesRef.current += file.size;
+    try {
+      const data = await readBase64(file);
+      if (attachmentRevisionRef.current !== revision || !attachedUploadsRef.current.some((each) => each.id === id)) return;
+      const handle = uploadHandlesRef.current.get(id);
+      uploadHandlesRef.current.delete(id);
+      if (handle) handle.abort();
+      else if (upload.hostId) discardUpload(id, upload.hostId);
+      setAttachedUploads((prev) => prev.filter((each) => each.id !== id));
+      setAttachedImages((prev) => [...prev, { data, mimeType: file.type, previewUrl, file }]);
+    } catch {
+      setAttachError(t("chatInput.attachmentImageReadFailed"));
+    } finally {
+      pendingImageCountRef.current -= 1;
+      pendingImageBytesRef.current -= file.size;
+    }
+  }, [fitsInline, markInputEdited, t]);
+
+  /** After a send the uploads belong to the prompt: the chips go, what the host staged stays. Any still in flight
+   *  (a cleared composer) is aborted. */
+  const clearUploads = useCallback(() => {
+    for (const handle of uploadHandlesRef.current.values()) handle.abort();
+    uploadHandlesRef.current.clear();
+    setAttachedUploads((prev) => {
+      for (const upload of prev) if (upload.previewUrl) URL.revokeObjectURL(upload.previewUrl);
+      return [];
+    });
+  }, []);
+
   const clearInput = useCallback(() => {
     setValue("");
+    setPromptOnly(false);
     setAtQuery(null);
+    setSlashMatch(null);
     setHistoryMenuOpen(false);
     if (draftKey) clearDraft(draftKey);
     if (draftKeyRef.current && draftKeyRef.current !== draftKey) clearDraft(draftKeyRef.current);
     clearImages();
     clearTextFiles();
+    clearUploads();
+    setAttachNotice(null);
     // Invalidate any attachment reads still in flight.
     attachmentRevisionRef.current += 1;
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-  }, [clearImages, clearTextFiles, draftKey]);
+  }, [clearImages, clearTextFiles, clearUploads, draftKey, setValue, setPromptOnly]);
+
+  /** A stored submission may finish after navigation/remount: clear only the draft revision it was sent from, never a
+   * new composer's text or attachments, nor an equal-text retype made while the commit was pending. Capture before the
+   * asynchronous IndexedDB commit. */
+  const clearOnceStored = useCallback((raw: string) => {
+    const images = attachedImagesRef.current;
+    const files = attachedTextFilesRef.current;
+    const uploads = attachedUploadsRef.current;
+    const key = draftKeyRef.current;
+    // Dictation can submit before the layout persistence effect sees its inserted text.
+    if (key && draftRecoveryIdentityRef.current.key === key) {
+      setDraft(key, captureDraft());
+    }
+    const pending = beginDraftSubmission(draftKeyRef.current);
+    const commit = () => {
+      endDraftSubmission(pending);
+      // `pending.key` follows a confirmed identity move of an unchanged draft and is cleared if the move merged or the
+      // draft was edited first, so only the sent draft itself is ever consumed.
+      if (pending.edited) return;
+      if (composerAliveRef.current && draftKeyRef.current === pending.key
+        && (!pending.key || getDraftRevision(pending.key) === pending.revision)
+        && valueRef.current === raw
+        && attachedImagesRef.current === images && attachedTextFilesRef.current === files && attachedUploadsRef.current === uploads) clearInput();
+      else if (pending.key && pending.snapshot) consumeDraft(pending.key, pending.snapshot, pending.revision);
+    };
+    /** The submission settled without a commit (refused or failed): stop tracking it. */
+    commit.release = () => endDraftSubmission(pending);
+    return commit;
+  }, [clearInput, captureDraft]);
+
+  useLayoutEffect(() => subscribeDraftConsumption((key, snapshot) => {
+    if (draftKeyRef.current !== key) return;
+    const current = captureDraft();
+    if (isSameDraft(current, snapshot)) clearInput();
+  }), [clearInput, captureDraft]);
 
   useLayoutEffect(() => {
-    if (!draftKey || draftKeyRef.current !== draftKey) return;
-    setDraft(draftKey, {
-      value,
-      images: attachedImages.map(imageToDraftImage),
-      files: attachedTextFiles.map(textFileToDraftFile),
-    });
-  }, [attachedImages, attachedTextFiles, draftKey, value]);
+    // The synchronous ref handoff can precede the prop commit. Keep live deltas in React for the existing move merge,
+    // rather than recreating the obsolete key (which could evict an unrelated draft at capacity).
+    if (!draftKey || draftKeyRef.current !== draftKey || draftRecoveryIdentityRef.current.key !== draftKey) return;
+    const draft = captureDraft();
+    persistedDraftRef.current = draft;
+    setDraft(draftKey, draft);
+  }, [attachedImages, attachedTextFiles, attachedUploads, draftKey, value, promptOnly, captureDraft]);
 
   useLayoutEffect(() => {
     const previousDraftKey = draftKeyRef.current;
     if (previousDraftKey === draftKey) return;
 
+    if (draftIdentityMove !== consumedIdentityMoveRef.current
+      && draftIdentityMove?.from === previousDraftKey && draftIdentityMove.to === draftKey) {
+      consumedIdentityMoveRef.current = draftIdentityMove;
+      attachmentIdentityRevisionRef.current += 1;
+      draftRecoveryIdentityRef.current.key = draftKey;
+      // The hook's transfer may precede this batch's mounted state updates.
+      // Add only live deltas to its merged snapshot, not the source twice.
+      const source = draftIdentityMove.sourceDraft ?? persistedDraftRef.current;
+      const draft = getDraft(draftKey);
+      setPromptOnly(promptOnlyRef.current || Boolean(draft?.promptOnly));
+      draftKeyRef.current = draftKey;
+      // A pending outbox commit (possibly from an earlier mount) follows only its own unchanged draft to the new key.
+      moveDraftSubmissions(previousDraftKey, draftKey);
+      setRawValue((current) => {
+        const transferred = draft?.value ?? "";
+        if (!source || current === source.value) return transferred;
+        const destination = source.value && transferred.startsWith(source.value)
+          ? transferred.slice(source.value.length).replace(/^\n\n/, "")
+          : transferred;
+        return mergeRecoveredText(destination, { text: current });
+      });
+      setAttachedImages((current) => {
+        // Match occurrences, not a set: intentional identical attachments in
+        // the source or target must retain their original multiplicity.
+        const remaining = [...(source?.images ?? [])];
+        const added = current.filter((image) => {
+          const index = remaining.findIndex((item) => item.data === image.data && item.mimeType === image.mimeType);
+          if (index === -1 && source) return true;
+          if (index !== -1) remaining.splice(index, 1);
+          revokeImagePreview(image);
+          return false;
+        });
+        return [...draftImagesToAttachedImages(draft?.images), ...added];
+      });
+      setAttachedTextFiles((current) => {
+        const remaining = [...(source?.files ?? [])];
+        const added = current.filter((file) => {
+          const index = remaining.findIndex((item) => item.name === file.name && item.mimeType === file.mimeType
+            && item.content === file.content && item.size === file.size);
+          if (index === -1) return Boolean(source);
+          remaining.splice(index, 1);
+          return false;
+        });
+        return [...draftFilesToAttachedFiles(draft?.files), ...added];
+      });
+      // The same composer's uploads stay; the transferred draft's finished ones join them once.
+      setAttachedUploads((current) => [
+        ...draftUploadsToAttachedUploads(draft?.uploads).filter((upload) => !current.some((each) => each.id === upload.id)),
+        ...current,
+      ]);
+      setQueuedDeleteTarget(null);
+      return;
+    }
+
     // Invalidate any attachment reads still in flight for the old session so
     // they cannot append onto the new session's composer, and drop any stale
     // validation banner along with the old draft.
     attachmentRevisionRef.current += 1;
+    draftRecoveryIdentityRef.current = { key: draftKey };
     setAttachError(null);
+    setAttachNotice(null);
     setQueuedDeleteTarget(null);
 
     if (previousDraftKey) {
-      setDraft(previousDraftKey, {
-        value: valueRef.current,
-        images: attachedImagesRef.current.map(imageToDraftImage),
-        files: attachedTextFilesRef.current.map(textFileToDraftFile),
-      });
+      setDraft(previousDraftKey, captureDraft());
     }
 
     const draft = draftKey ? getDraft(draftKey) : null;
     draftKeyRef.current = draftKey;
-    setValue(draft?.value ?? "");
+    setRawValue(draft?.value ?? "");
+    setPromptOnly(Boolean(draft?.promptOnly));
     setAtQuery(null);
+    setSlashMatch(null);
     setHistoryMenuOpen(false);
     setAttachedImages((prev) => {
       prev.forEach(revokeImagePreview);
       return draftImagesToAttachedImages(draft?.images);
     });
     setAttachedTextFiles(draftFilesToAttachedFiles(draft?.files));
-  }, [draftKey]);
+    // shortcut: an upload still in flight is lost on a switch, as on a reload; keep its handle across drafts if users
+    // switch chats mid-upload often.
+    for (const handle of uploadHandlesRef.current.values()) handle.abort();
+    uploadHandlesRef.current.clear();
+    setAttachedUploads((prev) => {
+      for (const upload of prev) if (upload.previewUrl) URL.revokeObjectURL(upload.previewUrl);
+      return draftUploadsToAttachedUploads(draft?.uploads);
+    });
+  }, [draftKey, draftIdentityMove, setPromptOnly, captureDraft]);
+
+  useLayoutEffect(() => subscribeDraftRecovery((key, recovery) => {
+    if (draftKeyRef.current !== key) return;
+    const { text } = recovery;
+    if (recovery.promptOnly) setPromptOnly(true);
+    // Merge with pending edits rather than replacing them with a store snapshot.
+    setValue((current) => mergeRecoveredText(current, recovery));
+    const images = recovery.images ?? [];
+    if (images.length) {
+      setAttachedImages((prev) => [...prev, ...draftImagesToAttachedImages(images)]);
+    }
+    const files = draftFilesToAttachedFiles(recovery.files);
+    if (files.length) {
+      setAttachedTextFiles((prev) => [...prev, ...files]);
+    }
+    const uploads = draftUploadsToAttachedUploads(recovery.uploads);
+    if (uploads.length) {
+      setAttachedUploads((prev) => [...prev, ...uploads.filter((upload) => !prev.some((each) => each.id === upload.id))]);
+    }
+    setAtQuery(null);
+    setSlashMatch(null);
+    setHistoryMenuOpen(false);
+    requestAnimationFrame(() => {
+      if (draftKeyRef.current !== key) return;
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(text.length, text.length);
+      ta.style.height = "auto";
+      ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+    });
+  }), [setValue, setPromptOnly]);
 
   useLayoutEffect(() => {
     const ta = textareaRef.current;
     if (!ta) return;
     ta.style.height = "auto";
     if (value) ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
-  }, [value]);
+  }, [value, bashMode]); // the shell font changes the wrapping without changing the value
   useEffect(() => {
     return () => {
       // Drop any reads still in flight when the composer goes away entirely
@@ -654,8 +1219,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   }, []);
 
   useEffect(() => {
+    const uploadHandles = uploadHandlesRef.current;
     return () => {
       attachedImagesRef.current.forEach(revokeImagePreview);
+      for (const handle of uploadHandles.values()) handle.abort();
+      for (const upload of attachedUploadsRef.current) if (upload.previewUrl) URL.revokeObjectURL(upload.previewUrl);
     };
   }, []);
 
@@ -672,34 +1240,105 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     return error !== null;
   }, []);
 
+  /** Send waits for every upload (spec U2): refused with a banner while one is in flight or failed. */
+  const rejectsPendingUploads = useCallback((): boolean => {
+    const uploads = attachedUploadsRef.current;
+    const failed = uploads.filter((upload) => upload.status === "error").length;
+    const uploading = uploads.filter((upload) => upload.status === "uploading").length;
+    if (failed) setAttachError(t("chatInput.uploadsFailedBlock", { count: failed }));
+    else if (uploading) setAttachError(t("chatInput.uploadsWaiting", { count: uploading }));
+    return failed + uploading > 0;
+  }, [t]);
+
+  /** Run a client builtin. True once handled; the composer is cleared only on
+   * success and only if it still holds what was sent (the user may have
+   * started typing while the command ran). */
+  const runBuiltinCommand = useCallback(async (msg: string, overrideText?: string): Promise<boolean> => {
+    if (submissionBlockedRef.current || holdingRef.current || !onBuiltinCommand) return false;
+    const stored = clearOnceStored(overrideText ?? valueRef.current);
+    holdingRef.current = true;
+    try {
+      const result = await onBuiltinCommand(msg);
+      if (!result.handled) return false;
+      if (!submissionBlockedRef.current && !result.error && !result.retainInput) stored();
+      return true;
+    } finally {
+      stored.release();
+      holdingRef.current = false;
+    }
+  }, [onBuiltinCommand, clearOnceStored]);
+
+  /** `/btw` asks a side question beside any run: never a prompt, never
+   * queued. Attachments cannot ride along, so refuse and keep the draft
+   * rather than drop them. False when `msg` is not `/btw`. */
+  const sendSideQuestion = useCallback((msg: string, overrideText?: string): boolean => {
+    if (!/^\/btw(\s|$)/.test(msg) || !onBuiltinCommand) return false;
+    if (attachedImagesRef.current.length || attachedTextFilesRef.current.length || attachedUploadsRef.current.length) {
+      toast.error(t("btw.attachmentsUnsupported"));
+      return true;
+    }
+    runBuiltinCommand(msg, overrideText).catch(toastBtwError);
+    return true;
+  }, [onBuiltinCommand, runBuiltinCommand, t]);
+
   const handleSend = useCallback(async (overrideText?: string) => {
     const raw = overrideText ?? value;
     const msg = raw.trim();
-    if (!msg && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length) return;
-    if (isStreaming) return;
+    if (!msg && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length) return;
+    // `!cmd` runs right away during a run too, as in omp's terminal; it is never queued as text.
+    const shellCommand = !promptOnlyRef.current && msg.startsWith("!") && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length;
+    if (submissionBlockedRef.current || holdingRef.current) return;
     onAudioUnlock?.();
-    const composedMessage = composeMessageWithTextAttachments(msg, attachedTextFilesRef.current);
-    if (!attachedImagesRef.current.length && !attachedTextFilesRef.current.length && msg.startsWith("/") && onBuiltinCommand) {
+    if (sendSideQuestion(msg, overrideText)) return;
+    if (isStreaming && !shellCommand) return;
+    if (rejectsPendingUploads()) return;
+    const files = attachedTextFilesRef.current;
+    const composedMessage = composeMessageWithTextAttachments(msg, files);
+    if (!attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length && msg.startsWith("/") && onBuiltinCommand) {
       const expansion = expandWebSlashCommand(msg);
       if (expansion.kind === "expand" && rejectsOversizedPrompt(expansion.prompt, attachedImagesRef.current)) return;
-      const sentValue = overrideText ?? value;
-      const result = await onBuiltinCommand(msg);
-      if (result.handled) {
-        // The user may have started typing while the command ran; only clear
-        // if the composer still holds what was sent.
-        if (!result.error && !result.retainInput && (overrideText !== undefined || valueRef.current === sentValue)) clearInput();
-        return;
-      }
+      if (await runBuiltinCommand(msg, overrideText)) return;
     }
+    if (submissionBlockedRef.current) return;
     if (rejectsOversizedPrompt(composedMessage, attachedImagesRef.current)) return;
-    onSend(composedMessage, attachedImagesRef.current.length ? attachedImagesRef.current : undefined);
+    const key = draftKeyRef.current;
+    const images = attachedImagesRef.current.length ? attachedImagesRef.current : undefined;
+    const recovery = { text: msg, images: images?.map(imageToDraftImage), files: files.length ? files.map(textFileToDraftFile) : undefined, ...(promptOnlyRef.current ? { promptOnly: true } : {}), ...uploadRecovery(attachedUploadsRef.current) };
+    const stored = outbox && !shellCommand ? clearOnceStored(raw) : undefined;
+    // Preserve explicit prompt intent after inline files or native queue recovery lose their original structure.
+    const sendTail: [uploads?: string[], proofs?: Record<string, string>, options?: PromptSendOptions] = uploadArgs(attachedUploadsRef.current);
+    if (files.length || promptOnlyRef.current) sendTail[2] = { promptOnly: true };
+    let pending: Promise<PromptSubmissionResult>;
+    try {
+      pending = onSend(composedMessage, images, ...sendTail);
+    } catch (error) {
+      stored?.release();
+      throw error;
+    }
+    if (stored) {
+      // Stored in this browser once accepted: clear only then (a reload in between keeps the draft), and only if the
+      // composer still holds what was sent. A refused one stays where it is.
+      holdingRef.current = true;
+      try {
+        if ((await pending).status === "accepted") stored();
+      } finally {
+        stored.release();
+        holdingRef.current = false;
+      }
+      return;
+    }
     clearInput();
-  }, [value, isStreaming, onBuiltinCommand, onSend, clearInput, onAudioUnlock, rejectsOversizedPrompt]);
-  /** What happens to the composer after the transcript lands: null inserts it
-   *  for editing; "send" dispatches immediately; "steer"/"followup" queue it
-   *  into the running agent. */
-  type DictationAfterMode = "send" | "steer" | "followup";
-  const dictationAfterRef = useRef<DictationAfterMode | null>(null);
+    try {
+      const result = await pending;
+      if (result.status === "rejected") {
+        const destination = result.recoveryKey ?? key;
+        if (destination) recoverDraft(destination, recovery);
+      }
+    } catch (error) {
+      if (key) recoverDraft(key, recovery);
+      throw error;
+    }
+  }, [value, isStreaming, onBuiltinCommand, onSend, outbox, clearInput, clearOnceStored, onAudioUnlock, rejectsOversizedPrompt, rejectsPendingUploads, runBuiltinCommand, sendSideQuestion]);
   const {
     isRecording,
     isPaused,
@@ -720,17 +1359,28 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     seekPreview: seekPreviewDictation,
     confirmTranscribe: confirmTranscribeDictation,
   } = useDictation({
-    onTranscript: (text) => {
-      const after = dictationAfterRef.current;
-      dictationAfterRef.current = null;
+    scope: draftKey,
+    identityMove: draftIdentityMove,
+    // `after` comes back with the transcript from the server job, so a send or
+    // queue chosen before a session switch (which remounts this composer) holds.
+    // The run may have started or ended since: queue while the agent runs
+    // (Send becomes a follow-up), send when idle (nothing left to queue behind).
+    onTranscript: (text, after) => {
       const base = valueRef.current;
       const sep = base.length > 0 && !base.endsWith(" ") ? " " : "";
       const finalText = base + sep + text;
       insertTextAtCursor(text);
-      if (after === "send") {
+      // A send/queue chosen before Edit started now remains an unsent draft.
+      if (submissionBlockedRef.current) {
+        toast.success(t("chatInput.dictationSuccess"));
+        return;
+      }
+      if (after && sendSideQuestion(finalText.trim(), finalText)) {
+        return;
+      } else if (after && onFollowUp) {
+        sendQueued(after === "send" ? "followup" : after, finalText);
+      } else if (after && !isStreaming) {
         void handleSend(finalText);
-      } else if (after === "steer" || after === "followup") {
-        sendQueued(after, finalText);
       } else {
         toast.success(t("chatInput.dictationSuccess"));
       }
@@ -751,26 +1401,13 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       toast.error(msg);
     },
   });
-  const stopAndInsertDictation = useCallback(() => {
-    dictationAfterRef.current = null;
-    stopDictation();
-  }, [stopDictation]);
-  const stopAndSendDictation = useCallback(() => {
-    dictationAfterRef.current = "send";
-    stopDictation({ immediateSend: true });
-  }, [stopDictation]);
-  const stopAndQueueDictation = useCallback((mode: "steer" | "followup") => {
-    dictationAfterRef.current = mode;
-    stopDictation({ immediateSend: true });
-  }, [stopDictation]);
-  const cancelDictationAndReset = useCallback(() => {
-    dictationAfterRef.current = null;
-    cancelDictation();
-  }, [cancelDictation]);
-  const startFreshDictation = useCallback(() => {
-    dictationAfterRef.current = null;
-    toggleDictation();
-  }, [toggleDictation]);
+  // From the review deck the recorder has already stopped, so finishing with a
+  // send/queue choice transcribes the reviewed recording instead.
+  const stopAndFinishDictation = useCallback((after: SttAfter) => {
+    if (submissionBlockedRef.current) return;
+    if (isReviewing) confirmTranscribeDictation({ after });
+    else stopDictation({ after });
+  }, [isReviewing, confirmTranscribeDictation, stopDictation]);
   // While the recording deck replaces the textarea there is no focused input,
   // so Escape/Enter are handled at window level: Escape cancels/discard, Enter
   // retries after an error or converts the recording to text.
@@ -779,7 +1416,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        cancelDictationAndReset();
+        cancelDictation();
       } else if (e.key === "Enter" && !e.shiftKey && !isTranscribing) {
         // Let focused deck/toolbar controls keep their own activation;
         // only hijack Enter from the non-interactive page context.
@@ -788,34 +1425,35 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         e.preventDefault();
         if (transcribeError) retryDictation();
         else if (isReviewing) confirmTranscribeDictation();
-        else stopAndInsertDictation();
+        else stopDictation();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isRecording, isPaused, isReviewing, isTranscribing, transcribeError, cancelDictationAndReset, retryDictation, confirmTranscribeDictation, stopAndInsertDictation]);
+  }, [isRecording, isPaused, isReviewing, isTranscribing, transcribeError, cancelDictation, retryDictation, confirmTranscribeDictation, stopDictation]);
 
-  const slashQuery = value.startsWith("/") && !/\s/.test(value.slice(1))
-    ? value.slice(1).toLowerCase()
-    : null;
+  const slashQuery = slashMatch?.query ?? null;
+  const isMidPromptSkillLookup = slashMatch?.mode === "mid-prompt";
   const historyFlip = useDropdownFlip(historyMenuOpen && inputHistory.length > 0, historyMenuRef, 0.44, 360);
   const slashFlip = useDropdownFlip(slashMenuOpen && slashQuery !== null, slashMenuRef, 0.56, 460);
   const atFlip = useDropdownFlip(atMenuOpen && atQuery !== null, atMenuRef, 0.48, 400);
   const plusFlip = useDropdownFlip(plusMenuOpen, plusMenuRef, 0.44, 320);
   const [dormantSkillNames, setDormantSkillNames] = useState<Set<string>>(() => new Set());
 
+  const slashMenuOpenActive = slashQuery !== null;
   useEffect(() => {
-    if (slashQuery === null || !cwd) return;
+    if (uploadHostId !== LOCAL_HOST_ID) { setDormantSkillNames(new Set()); return; }
+    if (!slashMenuOpenActive || !cwd) return;
     const controller = new AbortController();
     void fetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`, { signal: controller.signal })
       .then((response) => response.ok ? response.json() as Promise<{ skills?: Array<{ name?: string; disableModelInvocation?: boolean }> }> : null)
       .then((data) => {
-        if (!data) return;
+        if (!data || controller.signal.aborted) return;
         setDormantSkillNames(new Set((data.skills ?? []).flatMap((skill) => skill.disableModelInvocation && skill.name ? [skill.name] : [])));
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [cwd, slashQuery]);
+  }, [cwd, uploadHostId, slashMenuOpenActive]);
 
   const builtinSlashCommands: SlashCommandPaletteItem[] = React.useMemo(
     () => BUILTIN_SLASH_COMMAND_DEFS
@@ -848,8 +1486,31 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   );
 
   const filteredSlashCommands = (() => {
-    if (slashQuery === null) return [];
-    const commands = [...(isStreaming ? [] : builtinSlashCommands), ...externalSlashCommands];
+    if (slashQuery === null || slashMatch === null) return [];
+    if (isMidPromptSkillLookup) {
+      return externalSlashCommands
+        .filter((command) => {
+          const isSkill = command.source === "skill" || command.name.startsWith("skill:");
+          if (!isSkill) return false;
+          const cleanName = command.name.replace(/^skill:/i, "").toLowerCase();
+          const fullName = command.name.toLowerCase();
+          const description = command.description?.toLowerCase() ?? "";
+          return cleanName.includes(slashQuery) || fullName.includes(slashQuery) || description.includes(slashQuery);
+        })
+        .sort((a, b) => {
+          const cleanA = a.name.replace(/^skill:/i, "");
+          const cleanB = b.name.replace(/^skill:/i, "");
+          const rankA = slashMatchRank({ ...a, name: cleanA }, slashQuery);
+          const rankB = slashMatchRank({ ...b, name: cleanB }, slashQuery);
+          const rankDelta = rankA - rankB;
+          if (rankDelta !== 0) return rankDelta;
+          const dormancyDelta = Number(isDormantSkillCommand(a, dormantSkillNames)) - Number(isDormantSkillCommand(b, dormantSkillNames));
+          if (dormancyDelta !== 0) return dormancyDelta;
+          return modelCollator.compare(a.name, b.name);
+        });
+    }
+    // During a run the other builtins would only be queued as text; /btw runs beside the main run.
+    const commands = [...(isStreaming ? builtinSlashCommands.filter((command) => command.name === "btw") : builtinSlashCommands), ...externalSlashCommands];
     return [...commands]
       .filter((command) => {
         const name = command.name.toLowerCase();
@@ -897,38 +1558,43 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
   const atQueryText = atQuery?.query ?? null;
   const atLocalMatches: FileIndexEntry[] = React.useMemo(() => (
-    atQueryText !== null && fileIndex && fileIndex.cwd === cwd
+    atQueryText !== null && fileIndex && fileIndex.workspaceKey === fileIndexOwner
       ? filterFileEntries(fileIndex.entries, atQueryText)
       : []
-  ), [atQueryText, fileIndex, cwd]);
+  ), [atQueryText, fileIndex, fileIndexOwner]);
 
   // When the client index is truncated (repo larger than the index cap),
   // local filtering cannot see deep files, so queries are also ranked
   // server-side against the full listing. Local matches render immediately
   // and are replaced when the (debounced) server result for the current
   // query arrives; stale responses are ignored via the query/cwd tag.
-  const needsServerSearch = Boolean(atQueryText && fileIndex?.truncated && fileIndex.cwd === cwd);
+  const needsServerSearch = Boolean(atQueryText && fileIndex?.truncated && fileIndex.workspaceKey === fileIndexOwner);
   useEffect(() => {
     if (!needsServerSearch || !cwd || !atQueryText) return;
-    const fetchCwd = cwd;
+    const workspaceKey = fileIndexOwner;
+    const controller = new AbortController();
     const query = atQueryText;
     const timer = setTimeout(() => {
-      fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}&q=${encodeURIComponent(query)}`)
+      const params = new URLSearchParams({ cwd, hostId: uploadHostId, q: query });
+      if (sourceSessionId) params.set("sessionId", sourceSessionId);
+      fetch(`/api/file-index?${params}`, { signal: controller.signal })
         .then((res) => {
           if (!res.ok) throw new Error(`file search failed: ${res.status}`);
           return res.json() as Promise<{ matches?: FileIndexEntry[] }>;
         })
-        .then((data) => setAtServerResult({ cwd: fetchCwd, query, matches: data.matches ?? [] }))
-        .catch(() => {
-          // Keep showing local matches; the next keystroke retries.
-        });
+        .then((data) => {
+          if (!controller.signal.aborted && fileIndexOwnerRef.current === workspaceKey) {
+            setAtServerResult({ workspaceKey, query, matches: data.matches ?? [] });
+          }
+        })
+        .catch(() => {});
     }, 150);
-    return () => clearTimeout(timer);
-  }, [needsServerSearch, atQueryText, cwd]);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [needsServerSearch, atQueryText, cwd, uploadHostId, sourceSessionId, fileIndexOwner]);
 
   const serverResultInUse = needsServerSearch
     && atServerResult !== null
-    && atServerResult.cwd === cwd
+    && atServerResult.workspaceKey === fileIndexOwner
     && atServerResult.query === atQueryText;
   const atMatches: FileIndexEntry[] = serverResultInUse ? atServerResult.matches : atLocalMatches;
   const historyMenuVisible = historyMenuOpen && inputHistory.length > 0;
@@ -967,38 +1633,40 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const atTokenActive = atQuery !== null;
   useEffect(() => {
     if (!atTokenActive || !cwd) return;
+    const workspaceKey = fileIndexOwner;
     const meta = fileIndexMetaRef.current;
-    if (meta && meta.cwd === cwd && Date.now() - meta.fetchedAt < 10_000) return;
-    if (fileIndexFetchingRef.current === cwd) return;
-    fileIndexFetchingRef.current = cwd;
-    const fetchCwd = cwd;
-    // Abort the previous fetch when the cwd changes or the menu closes, so a
-    // slow response for an old directory cannot flip the loading state after
-    // a newer one has taken over.
+    if (meta?.workspaceKey === workspaceKey && Date.now() - meta.fetchedAt < 10_000) return;
+    if (fileIndexFetchingRef.current?.workspaceKey === workspaceKey) return;
     const controller = new AbortController();
+    const request = { workspaceKey, controller };
+    fileIndexFetchingRef.current = request;
     setFileIndexLoading(true);
-    fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}`, { signal: controller.signal })
+    const params = new URLSearchParams({ cwd, hostId: uploadHostId });
+    if (sourceSessionId) params.set("sessionId", sourceSessionId);
+    fetch(`/api/file-index?${params}`, { signal: controller.signal })
       .then((res) => {
         if (!res.ok) throw new Error(`file index failed: ${res.status}`);
         return res.json() as Promise<{ files?: string[]; truncated?: boolean }>;
       })
       .then((data) => {
-        setFileIndex({ cwd: fetchCwd, entries: buildEntriesFromFiles(data.files ?? []), truncated: !!data.truncated });
-        fileIndexMetaRef.current = { cwd: fetchCwd, fetchedAt: Date.now() };
+        if (controller.signal.aborted || fileIndexOwnerRef.current !== workspaceKey) return;
+        setFileIndex({ workspaceKey, entries: buildEntriesFromFiles(data.files ?? []), truncated: !!data.truncated });
+        fileIndexMetaRef.current = { workspaceKey, fetchedAt: Date.now() };
       })
       .catch(() => {
-        // Leave any previous index in place; next open retries. Aborts land
-        // here too, which is exactly the desired no-op.
-        fileIndexMetaRef.current = null;
+        if (fileIndexFetchingRef.current === request && !controller.signal.aborted) fileIndexMetaRef.current = null;
       })
       .finally(() => {
-        if (fileIndexFetchingRef.current === fetchCwd) {
+        if (fileIndexFetchingRef.current === request) {
           fileIndexFetchingRef.current = null;
           setFileIndexLoading(false);
         }
       });
-    return () => controller.abort();
-  }, [atTokenActive, cwd]);
+    return () => {
+      controller.abort();
+      if (fileIndexFetchingRef.current === request) fileIndexFetchingRef.current = null;
+    };
+  }, [atTokenActive, cwd, uploadHostId, sourceSessionId, fileIndexOwner]);
 
   const applyAtCompletion = useCallback((entry: FileIndexEntry) => {
     if (!atQuery) return;
@@ -1028,7 +1696,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
     });
-  }, [atQuery, value]);
+  }, [atQuery, value, setValue]);
 
   useEffect(() => {
     if (atActiveIndex >= atMatches.length) {
@@ -1073,31 +1741,90 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       ta.style.height = "auto";
       ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
     });
-  }, []);
+  }, [setValue]);
 
   const applySlashCommand = useCallback((command: SlashCommandPaletteItem) => {
-    const nextValue = `/${command.name} `;
-    setValue(nextValue);
+    const ta = textareaRef.current;
+    const cursor = ta?.selectionStart ?? value.length;
+
+    if (!slashMatch) {
+      const nextValue = `/${command.name} `;
+      setValue(nextValue);
+      setSlashMatch(null);
+      setSlashMenuOpen(false);
+      setSlashActiveIndex(0);
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(nextValue.length, nextValue.length);
+        el.style.height = "auto";
+        el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+      });
+      return;
+    }
+
+    const before = value.slice(0, slashMatch.start);
+    const after = value.slice(cursor);
+    const insertText = buildSlashInsertText(command.name, slashMatch.mode);
+    const newValue = before + insertText + after;
+    const newPos = before.length + insertText.length;
+
+    setValue(newValue);
+    setSlashMatch(null);
     setSlashMenuOpen(false);
     setSlashActiveIndex(0);
+
     requestAnimationFrame(() => {
-      const ta = textareaRef.current;
-      if (!ta) return;
-      ta.focus();
-      ta.setSelectionRange(nextValue.length, nextValue.length);
-      ta.style.height = "auto";
-      ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(newPos, newPos);
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
     });
-  }, []);
+  }, [slashMatch, value, setValue]);
 
   const sendQueued = useCallback((mode: "steer" | "followup", overrideText?: string) => {
+    if (submissionBlockedRef.current || holdingRef.current) return;
     const raw = overrideText ?? value;
     const msg = raw.trim();
-    if (!msg && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length) return;
-    if (attachedImagesRef.current.length || attachedTextFilesRef.current.length) return;
+    if (!msg && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length) return;
+    if (sendSideQuestion(msg, overrideText)) return;
+    if (rejectsPendingUploads()) return;
+    if (!promptOnlyRef.current && msg.startsWith("!") && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length) {
+      void handleSend(overrideText);
+      return;
+    }
+    const queue = mode === "steer" ? onSteer : onFollowUp;
+    if (!queue) return;
+    const images = attachedImagesRef.current.length ? attachedImagesRef.current : undefined;
+    const uploads = uploadArgs(attachedUploadsRef.current);
+    // The outbox has it once the callback resolves true: clear only then, and only if the composer still holds what
+    // was sent. A refused one stays where it is.
+    const hold = (text: string) => {
+      const stored = clearOnceStored(raw);
+      holdingRef.current = true;
+      let queued: boolean | Promise<boolean>;
+      try {
+        queued = queue(text, images, ...uploads);
+      } catch (error) {
+        stored.release();
+        holdingRef.current = false;
+        throw error;
+      }
+      void Promise.resolve(queued)
+        .then((ok) => {
+          if (ok) stored();
+        })
+        .finally(() => {
+          stored.release();
+          holdingRef.current = false;
+        });
+    };
+    const files = attachedTextFilesRef.current;
     onAudioUnlock?.();
-    const streamingBehavior = mode === "steer" ? "steer" : "followUp";
-    if (msg.startsWith("/") && onPromptWithStreamingBehavior) {
+    if (msg.startsWith("/")) {
       const commandName = msg.slice(1).split(/\s+/)[0];
       // Same gate as the direct path (useAgentSession refuses /advisor while
       // disabled): queueing must not become a bypass around the toggle.
@@ -1111,9 +1838,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       // own ACP handlers can run them.
       const expansion = expandWebSlashCommand(msg);
       if (expansion.kind === "expand") {
-        if (rejectsOversizedPrompt(expansion.prompt, attachedImagesRef.current)) return;
-        onPromptWithStreamingBehavior(expansion.prompt, streamingBehavior, attachedImagesRef.current.length ? attachedImagesRef.current : undefined);
-        clearInput();
+        const prompt = composeMessageWithTextAttachments(expansion.prompt, files);
+        if (rejectsOversizedPrompt(prompt, attachedImagesRef.current)) return;
+        hold(prompt);
         return;
       }
       if (expansion.kind === "usage-error") {
@@ -1123,86 +1850,104 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         }));
         return;
       }
-      if (rejectsOversizedPrompt(msg, attachedImagesRef.current)) return;
-      onPromptWithStreamingBehavior(msg, streamingBehavior, attachedImagesRef.current.length ? attachedImagesRef.current : undefined);
-      clearInput();
-      return;
     }
-    if (rejectsOversizedPrompt(msg, attachedImagesRef.current)) return;
-    if (mode === "steer" && onSteer) {
-      onSteer(msg, attachedImagesRef.current.length ? attachedImagesRef.current : undefined);
-    } else if (mode === "followup" && onFollowUp) {
-      onFollowUp(msg, attachedImagesRef.current.length ? attachedImagesRef.current : undefined);
-    }
-    clearInput();
-  }, [value, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearInput, onAudioUnlock, t, advisorEnabled, rejectsOversizedPrompt]);
-  // A typed, text-only message during a run is a queued follow-up — and so is
-  // a dictation in progress: the primary button must take the same state it
+    const composedMessage = composeMessageWithTextAttachments(msg, files);
+    if (rejectsOversizedPrompt(composedMessage, attachedImagesRef.current)) return;
+    hold(composedMessage);
+  }, [value, handleSend, onSteer, onFollowUp, clearOnceStored, onAudioUnlock, t, advisorEnabled, rejectsOversizedPrompt, rejectsPendingUploads, sendSideQuestion]);
+  // A typed message or attachment during a run is a queued follow-up — and so
+  // is a dictation in progress: the primary button must take the same state it
   // would have if the composer already held text. Keep Stop as the action
   // while the composer is empty and nothing is being recorded.
-  const dictationCapturing = isRecording || isPaused;
+  const dictationCapturing = isRecording || isPaused || isReviewing;
+  const hasAttachments = attachedImages.length > 0 || attachedTextFiles.length > 0 || attachedUploads.length > 0;
+  const uploadingCount = attachedUploads.filter((upload) => upload.status === "uploading").length;
+  const failedUploadCount = attachedUploads.filter((upload) => upload.status === "error").length;
+  const uploadsBlockSend = uploadingCount + failedUploadCount > 0;
+  const imageUploads = attachedUploads.filter((upload) => upload.previewUrl !== null);
+  const fileUploads = attachedUploads.filter((upload) => upload.previewUrl === null);
   const primaryActionQueuesMessage =
-    isStreaming
-    && (Boolean(value.trim()) || dictationCapturing)
-    && attachedImages.length === 0
-    && attachedTextFiles.length === 0
+    isStreaming && !btwMode
+    && (Boolean(value.trim()) || hasAttachments || dictationCapturing)
     && Boolean(onFollowUp);
+  // The button follows the same Settings choice as Enter: soft keyboards have no
+  // Enter to submit with, so this button is how touch devices steer.
+  const primaryActionMode = primaryActionQueuesMessage && onSteer && getSubmitDuringRunBehavior() === "steer" ? "steer" : "followup";
+  // `!cmd` runs at once even during a run (sendQueued hands it to handleSend), so the button must not offer to queue it.
+  const primaryActionRunsShell = primaryActionQueuesMessage && bashMode;
 
   // ── Queued follow-up bar ────────────────────────────────────────────────
-  // omp reports only a queued count over RPC; the texts are tracked in a
-  // client-side mirror, so Edit/Delete/Steer act on that mirror through the
-  // session hook's helpers.
+  // Texts are mirrored locally; mutations wait for native acknowledgement.
   const queuedEntries = [
-    ...(queuedMessages?.followUp ?? []).map((text) => ({ kind: "follow-up" as const, text })),
-    ...(queuedMessages?.steering ?? []).map((text) => ({ kind: "steer" as const, text })),
+    ...(queuedMessages?.followUp ?? []).map((text, index) => ({
+      kind: "follow-up" as const,
+      text,
+      origin: queuedMessages?.messageOrigins?.followUp[index] ?? null,
+    })),
+    ...(queuedMessages?.steering ?? []).map((text, index) => ({
+      kind: "steer" as const,
+      text,
+      origin: queuedMessages?.messageOrigins?.steering[index] ?? null,
+    })),
   ];
   const firstQueued = queuedEntries[0] ?? null;
   const queuedCount = queuedEntries.length;
 
   const [queueExpanded, setQueueExpanded] = useState(false);
+  const [queueActionPending, setQueueActionPending] = useState(false);
+  const queueActionPendingRef = useRef(false);
   // Invalidate confirmation if delivery or navigation changes the queue.
   const activeDeleteTarget = queuedDeleteTarget?.draftKey === draftKey
     && queuedDeleteTarget?.queue === queuedMessages ? queuedDeleteTarget : null;
 
-  const handleItemEdit = useCallback((text: string) => {
-    onRemoveQueuedMessage?.(text);
-    setValue(text);
-    setAtQuery(null);
-    setHistoryMenuOpen(false);
-    requestAnimationFrame(() => {
-      const ta = textareaRef.current;
-      if (!ta) return;
-      ta.focus();
-      ta.setSelectionRange(text.length, text.length);
-      ta.style.height = "auto";
-      ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
-    });
-  }, [onRemoveQueuedMessage]);
-
-  const handleItemDelete = useCallback((text: string) => {
-    setQueuedDeleteTarget({ text, draftKey, queue: queuedMessages });
-  }, [draftKey, queuedMessages]);
-
-  const handleItemSteer = useCallback((entry: { kind: "follow-up" | "steer"; text: string }) => {
-    if (entry.kind === "follow-up") {
-      onPromoteQueuedToSteer?.(entry.text);
+  const handleQueueAction = useCallback(async (
+    entry: { kind: "follow-up" | "steer"; text: string },
+    action: "edit" | "delete" | "steer",
+  ) => {
+    if (queueActionPendingRef.current || (action === "steer" && submissionBlockedRef.current)) return;
+    queueActionPendingRef.current = true;
+    setQueueActionPending(true);
+    const recoveryIdentity = draftRecoveryIdentityRef.current;
+    try {
+      if (action === "steer") {
+        if (entry.kind === "follow-up") await onPromoteQueuedToSteer?.(entry.text);
+        return;
+      }
+      const removed = await onRemoveQueuedMessage?.(
+        entry.text, entry.kind === "steer" ? "steering" : "followUp",
+      );
+      setQueuedDeleteTarget(null);
+      if (!removed || action !== "edit") return;
+      // Recover to this conversation's last confirmed owner, not a later navigation.
+      // omp labels an image-only message "[Image]": not text when it has images.
+      recoverDraft(recoveryIdentity.key, { text: entry.text === "[Image]" && removed.length > 0 ? "" : entry.text, images: removed, promptOnly: true });
+    } catch (error) {
+      setQueuedDeleteTarget(null);
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      queueActionPendingRef.current = false;
+      setQueueActionPending(false);
     }
-  }, [onPromoteQueuedToSteer]);
+  }, [onRemoveQueuedMessage, onPromoteQueuedToSteer]);
+
+  const handleItemDelete = useCallback((entry: { kind: "follow-up" | "steer"; text: string }) => {
+    setQueuedDeleteTarget({ ...entry, draftKey, queue: queuedMessages });
+  }, [draftKey, queuedMessages]);
 
   const handleQueuedEdit = useCallback(() => {
     if (!firstQueued) return;
-    handleItemEdit(firstQueued.text);
-  }, [firstQueued, handleItemEdit]);
+    void handleQueueAction(firstQueued, "edit");
+  }, [firstQueued, handleQueueAction]);
 
   const handleQueuedDelete = useCallback(() => {
     if (!firstQueued) return;
-    handleItemDelete(firstQueued.text);
+    handleItemDelete(firstQueued);
   }, [firstQueued, handleItemDelete]);
 
   const handleQueuedSteer = useCallback(() => {
     if (!firstQueued) return;
-    handleItemSteer(firstQueued);
-  }, [firstQueued, handleItemSteer]);
+    void handleQueueAction(firstQueued, "steer");
+  }, [firstQueued, handleQueueAction]);
 
   const getNextSlashIndex = useCallback((direction: "up" | "down" | "left" | "right") => {
     const lastIndex = filteredSlashCommands.length - 1;
@@ -1262,7 +2007,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       }
       if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "m") {
         e.preventDefault();
-        startFreshDictation();
+        toggleDictation();
         return;
       }
 
@@ -1348,6 +2093,29 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         }
       }
 
+      // Tab (or → at the end of the line) accepts the ghost word, like omp's editor.
+      const ghost = wordPrediction.peek();
+      if (
+        ghost && ghost.text === value && !isComposing && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey &&
+        (e.key === "Tab" || e.key === "ArrowRight") &&
+        e.currentTarget.selectionStart === ghost.cursor && e.currentTarget.selectionEnd === ghost.cursor
+      ) {
+        e.preventDefault();
+        const taken = wordPrediction.take();
+        if (taken) {
+          const next = acceptGhost(taken);
+          setValue(next.text);
+          requestAnimationFrame(() => {
+            const el = textareaRef.current;
+            if (!el) return;
+            el.setSelectionRange(next.cursor, next.cursor);
+            el.style.height = "auto";
+            el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+          });
+        }
+        return;
+      }
+
       if (e.key === "ArrowUp" && !isComposing && !isStreaming && inputHistory.length > 0 && value.trim().length === 0) {
         e.preventDefault();
         setSlashMenuOpen(false);
@@ -1375,9 +2143,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       // inserts a newline and the Send button submits.
       if (e.key === "Enter" && !e.shiftKey && !isMobile) {
         e.preventDefault();
+        if (submissionBlockedRef.current) return;
         if (isStreaming && (onSteer || onFollowUp)) {
-          // Submit-during-run behavior comes from Settings (Steer current run
-          // by default, or Queue follow-up); no in-composer selector.
+          // Submit-during-run behavior comes from Settings (Queue follow-up by
+          // default, or Steer current run); no in-composer selector.
           const behavior = getSubmitDuringRunBehavior();
           if (behavior === "steer" && onSteer) sendQueued("steer");
           else sendQueued("followup");
@@ -1386,7 +2155,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         }
       }
     },
-    [isMobile, isStreaming, onSteer, onFollowUp, onAbort, onMinimize, slashMenuOpen, slashQuery, filteredSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value, startFreshDictation]
+    [isMobile, isStreaming, onSteer, onFollowUp, onAbort, onMinimize, slashMenuOpen, slashQuery, filteredSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value, toggleDictation, wordPrediction, setValue]
   );
 
 
@@ -1449,7 +2218,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
   const modelOptions: ModelOption[] = React.useMemo(() => {
     if (modelList && modelList.length > 0) {
-      return modelList.map((m) => ({ provider: m.provider, modelId: m.id, name: m.name }))
+      return modelList.map((m) => ({ provider: m.provider, modelId: m.id, name: m.name, identity: m.identity, costOutput: m.costOutput }))
         .filter((m) => visibleModelKeys === null || visibleModelKeys.has(`${m.provider}:${m.modelId}`))
         .sort((a, b) => compareModelOptions(modelCollator, a, b));
     }
@@ -1495,7 +2264,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         saved: formatTokenCount(compactSavedTokens, locale),
       })
     : null;
-  // Composer context ring: live totals, falling back to the session snapshot.
+  // Session information ring: live totals, falling back to the session snapshot.
   const ringCtx = contextUsage ?? sessionStats?.contextUsage ?? null;
   const ringPct = ringCtx?.percent ?? null;
   const ringTone = ringPct !== null && ringPct > 90
@@ -1551,6 +2320,47 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     if (!thinkingDropdownOpen) return;
     requestAnimationFrame(() => thinkingDropdownRef.current?.querySelector<HTMLButtonElement>('[role="menuitemradio"]:not([disabled])')?.focus());
   }, [thinkingDropdownOpen]);
+  useLayoutEffect(() => {
+    const wrap = contextWrapRef.current;
+    if (!contextOpen || isMobile || !wrap) return;
+    // --ui-scale zooms <html>: rects are in painted pixels, styles are not.
+    const scale = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--ui-scale")) || 1;
+    const room = wrap.getBoundingClientRect().top - getMenuBoundary(wrap).top;
+    setContextMaxHeight(Math.max(160, room / scale - 16));
+  }, [contextOpen, isMobile]);
+  useLayoutEffect(() => {
+    const panel = contextWrapRef.current?.querySelector<HTMLElement>('[role="dialog"]');
+    if (contextOpen && panel) {
+      const active = document.activeElement;
+      contextReturnFocusRef.current ??= active instanceof HTMLElement ? active : null;
+      panel.focus();
+    } else if (!contextOpen) {
+      const previous = contextReturnFocusRef.current;
+      contextReturnFocusRef.current = null;
+      const active = document.activeElement;
+      if (previous?.isConnected && (active === document.body || contextWrapRef.current?.contains(active))) {
+        previous.focus();
+      }
+    }
+  }, [contextOpen, contextContainer]);
+  useEffect(() => {
+    if (!contextOpen) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape" || event.isComposing || event.defaultPrevented) return;
+      const panel = contextWrapRef.current?.querySelector<HTMLElement>('[role="dialog"]');
+      if (!panel?.getClientRects().length) return;
+      const popup = event.target instanceof Element
+        ? event.target.closest('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')
+        : null;
+      if (popup && !contextWrapRef.current?.contains(popup)) return;
+      // Capture Escape before the composer or global shortcut can stop a run.
+      event.preventDefault();
+      event.stopPropagation();
+      setContextOpen(false);
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [contextOpen]);
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -1578,6 +2388,13 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
+  const attachmentMenuItemStyle: React.CSSProperties = {
+    display: "flex", alignItems: "center", gap: 8, width: "100%",
+    padding: "7px 10px", border: 0, borderRadius: 5,
+    background: "transparent", color: "var(--text-muted)",
+    cursor: "pointer", fontSize: 12, textAlign: "left",
+  };
+
   return (
     <div
       role="group"
@@ -1603,10 +2420,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         confirmLabel={t("chatInput.queuedDelete")}
         cancelLabel={t("chatInput.cancel")}
         danger
+        busy={queueActionPending}
         onConfirm={() => {
           if (!activeDeleteTarget) return;
-          setQueuedDeleteTarget(null);
-          onRemoveQueuedMessage?.(activeDeleteTarget.text);
+          void handleQueueAction(activeDeleteTarget, "delete");
         }}
       />
       {/* Hidden file input */}
@@ -1618,7 +2435,6 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         // only hide files the app can attach (code, config, logs, ...).
         accept="*/*"
         multiple
-        disabled={isStreaming}
         style={{ display: "none" }}
         onChange={(e) => {
           const files = Array.from(e.target.files ?? []);
@@ -1630,43 +2446,60 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         <ModelErrorBanner error={modelError} />
         <ComposerModeStatus goal={activeGoal} plan={activePlan} />
         {/* Retry banner */}
-        {retryInfo && (
-          <div style={{
-            marginBottom: 8, padding: "5px 10px",
-            background: "color-mix(in srgb, var(--status-warning) 8%, transparent)", border: "1px solid color-mix(in srgb, var(--status-warning) 25%, transparent)",
-            borderRadius: 6, fontSize: 12, color: "var(--status-warning)",
-            display: "flex", alignItems: "center", gap: 6,
-          }}>
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-              <path d="M3 3v5h5" />
-            </svg>
-            {t("chatInput.retrying", { attempt: retryInfo.attempt, maxAttempts: retryInfo.maxAttempts })}{retryInfo.errorMessage && <span style={{ opacity: 0.7, marginLeft: 4 }}>— {retryInfo.errorMessage}</span>}
-            {onAbortRetry && (
-              <button
-                type="button"
-                onClick={onAbortRetry}
-                title={t("chatInput.abortRetryTitle")}
-                style={{
-                  marginLeft: "auto",
-                  padding: "3px 9px",
-                  fontSize: 11,
-                  color: "var(--status-warning)",
-                  background: "transparent",
-                  border: "1px solid color-mix(in srgb, var(--status-warning) 45%, transparent)",
-                  borderRadius: 6,
-                  cursor: "pointer",
-                  whiteSpace: "nowrap",
-                  transition: "background var(--dur-fast) var(--ease-out-warm)",
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--status-warning) 12%, transparent)"; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
-              >
-                {t("chatInput.abortRetry")}
-              </button>
-            )}
-          </div>
-        )}
+        {retryInfo && (() => {
+          const remainingSec = (retryInfo.delayMs !== undefined && retryInfo.startedAt !== undefined)
+            ? (() => {
+                const effectiveNow = Math.max(retryNow, retryInfo.startedAt);
+                const maxSec = Math.ceil(retryInfo.delayMs / 1000);
+                return Math.max(0, Math.min(maxSec, Math.ceil((retryInfo.startedAt + retryInfo.delayMs - effectiveNow) / 1000)));
+              })()
+            : undefined;
+          return (
+            <div style={{
+              marginBottom: 8, padding: "5px 10px",
+              background: "color-mix(in srgb, var(--status-warning) 8%, transparent)", border: "1px solid color-mix(in srgb, var(--status-warning) 25%, transparent)",
+              borderRadius: 6, fontSize: 12, color: "var(--status-warning)",
+              display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6,
+            }}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                <path d="M3 3v5h5" />
+              </svg>
+              <span tabIndex={0} style={{ flex: "1 1 160px", minWidth: 0, maxHeight: 120, overflowY: "auto", overflowWrap: "anywhere" }}>
+                {remainingSec !== undefined
+                  ? t("chatInput.retryingWithCountdown", { attempt: retryInfo.attempt, maxAttempts: retryInfo.maxAttempts, seconds: remainingSec })
+                  : t("chatInput.retrying", { attempt: retryInfo.attempt, maxAttempts: retryInfo.maxAttempts })}
+                {retryInfo.errorMessage && <span style={{ opacity: 0.7, marginLeft: 4 }}>— {retryInfo.errorMessage}</span>}
+              </span>
+              {onAbortRetry && (
+                <button
+                  type="button"
+                  onClick={onAbortRetry}
+                  title={t("chatInput.abortRetryTitle")}
+                  style={{
+                    marginLeft: "auto",
+                    flexShrink: 0,
+                    padding: "3px 9px",
+                    fontSize: 11,
+                    color: "var(--status-warning)",
+                    background: "transparent",
+                    border: "1px solid color-mix(in srgb, var(--status-warning) 45%, transparent)",
+                    borderRadius: 6,
+                    cursor: "pointer",
+                    maxWidth: "100%",
+                    whiteSpace: "normal",
+                    overflowWrap: "anywhere",
+                    transition: "background var(--dur-fast) var(--ease-out-warm)",
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--status-warning) 12%, transparent)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                >
+                  {t("chatInput.abortRetry")}
+                </button>
+              )}
+            </div>
+          );
+        })()}
         {compactResultText && (
           <div style={{
             marginBottom: 8, padding: "5px 10px",
@@ -1680,7 +2513,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             {compactResultText}
           </div>
         )}
-        {/* Image previews */}
+        {/* Attachment notices and previews */}
         {attachError && (
           <div role="alert" style={{
             marginBottom: 8, padding: "5px 10px",
@@ -1690,41 +2523,41 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             {attachError}
           </div>
         )}
-        {attachedImages.length > 0 && (
+        {attachNotice && !attachError && (
+          <div role="status" style={{
+            marginBottom: 8, padding: "5px 10px",
+            background: "var(--bg-subtle)", border: "1px solid var(--border)",
+            borderRadius: 6, fontSize: 12, color: "var(--text-muted)",
+          }}>
+            {attachNotice}
+          </div>
+        )}
+        {(attachedImages.length > 0 || imageUploads.length > 0) && (
           <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
             {attachedImages.map((img, i) => (
-              <div key={i} style={{ position: "relative", flexShrink: 0 }}>
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={img.previewUrl}
-                  alt=""
-                  style={{ width: 56, height: 56, objectFit: "cover", borderRadius: 6, border: "1px solid var(--border)", display: "block" }}
-                />
-                <button
-                  className="attachment-remove-button"
-                  onClick={() => removeImage(i)}
-                  title={t("chatInput.removeImage")}
-                  aria-label={t("chatInput.removeImage")}
-                  style={{
-                    position: "absolute", top: -5, right: -5,
-                    width: 24, height: 24, borderRadius: "50%",
-                    background: "var(--bg-panel)", border: "1px solid var(--border)",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    cursor: "pointer", padding: 0, color: "var(--text-muted)",
-                    transition: "color var(--dur-fast) var(--ease-out-warm), background var(--dur-fast) var(--ease-out-warm)",
-                  }}
-                  onMouseEnter={(e) => { e.currentTarget.style.color = "var(--text)"; e.currentTarget.style.background = "var(--bg-hover)"; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-muted)"; e.currentTarget.style.background = "var(--bg-panel)"; }}
-                >
-                  <svg width="9" height="9" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                    <line x1="1" y1="1" x2="7" y2="7" /><line x1="7" y1="1" x2="1" y2="7" />
-                  </svg>
-                </button>
-              </div>
+              <ImageChip
+                key={i}
+                previewUrl={img.previewUrl}
+                upload={null}
+                canSwitch
+                onSwitch={() => switchImageToFile(img)}
+                onRemove={() => removeImage(i)}
+              />
+            ))}
+            {imageUploads.map((upload) => (
+              <ImageChip
+                key={upload.id}
+                previewUrl={upload.previewUrl}
+                upload={upload}
+                canSwitch={upload.file !== null && fitsInline(upload.size)}
+                onSwitch={() => void switchUploadToInline(upload)}
+                onRemove={() => removeUpload(upload.id)}
+                onRetry={() => retryUpload(upload.id)}
+              />
             ))}
           </div>
         )}
-        {attachedTextFiles.length > 0 && (
+        {(attachedTextFiles.length > 0 || fileUploads.length > 0) && (
           <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
             {attachedTextFiles.map((file, i) => (
               <div
@@ -1779,6 +2612,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   </svg>
                 </button>
               </div>
+            ))}
+            {fileUploads.map((upload) => (
+              <UploadChip key={upload.id} upload={upload} onRemove={() => removeUpload(upload.id)} onRetry={() => retryUpload(upload.id)} />
             ))}
           </div>
         )}
@@ -2036,11 +2872,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             </div>
           )}
           {atMenuVisible && (() => {
-            const indexLoading = fileIndexLoading && (!fileIndex || fileIndex.cwd !== cwd);
+            const indexLoading = fileIndexLoading && (!fileIndex || fileIndex.workspaceKey !== fileIndexOwner);
             const matchCountLabel = tn("chatInput.matchCount", atMatches.length);
             // With a truncated index, local results are provisional — the
             // debounced server search over the full listing replaces them.
-            const truncatedHint = fileIndex?.truncated && !serverResultInUse
+            const truncatedHint = fileIndex?.workspaceKey === fileIndexOwner && fileIndex.truncated && !serverResultInUse
               ? ` · ${atQuery.query ? t("chatInput.searchingAllFiles") : t("chatInput.indexTruncated")}`
               : "";
             return (
@@ -2190,16 +3026,21 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     color: "var(--text-muted)",
                   }}
                 >
+                  {firstQueued?.origin?.kind === "session" && firstQueued.origin.session
+                    ? `[From ${firstQueued.origin.session.name?.trim() || "Untitled session"}] `
+                    : firstQueued?.origin?.kind === "github" && firstQueued.origin.github
+                      ? `[${firstQueued.origin.github.repo}#${firstQueued.origin.github.number}] `
+                      : ""}
                   {firstQueued?.text}
                 </span>
-                <QueuedActionButton onClick={handleQueuedEdit} title={t("chatInput.queuedEditTitle")}>
+                <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={handleQueuedEdit} title={t("chatInput.queuedEditTitle")}>
                   {t("chatInput.queuedEdit")}
                 </QueuedActionButton>
-                <QueuedActionButton onClick={handleQueuedDelete} title={t("chatInput.queuedDeleteTitle")}>
+                <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={handleQueuedDelete} title={t("chatInput.queuedDeleteTitle")}>
                   {t("chatInput.queuedDelete")}
                 </QueuedActionButton>
                 {firstQueued?.kind === "follow-up" && (
-                  <QueuedActionButton onClick={handleQueuedSteer} title={t("chatInput.queuedSteerTitle")} accent>
+                  <QueuedActionButton disabled={submissionBlocked || queueActionPending || !onPromoteQueuedToSteer} onClick={handleQueuedSteer} title={t("chatInput.queuedSteerTitle")} accent>
                     {t("chatInput.queuedSteerAction")}
                   </QueuedActionButton>
                 )}
@@ -2262,6 +3103,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                           textTransform: "none",
                         }}
                       >
+                        {firstQueued.origin?.kind === "session" && firstQueued.origin.session
+                          ? `[From ${firstQueued.origin.session.name?.trim() || "Untitled session"}] `
+                          : firstQueued.origin?.kind === "github" && firstQueued.origin.github
+                            ? `[${firstQueued.origin.github.repo}#${firstQueued.origin.github.number}] `
+                            : ""}
                         {firstQueued.kind === "steer" ? `[${t("chatInput.queuedSteer")}] ` : ""}{firstQueued.text}
                       </span>
                     )}
@@ -2319,6 +3165,15 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                         }}>
                           {entry.kind === "steer" ? t("chatInput.queuedSteer") : t("chatInput.queuedFollowUp")}
                         </span>
+                        {entry.origin?.kind === "session" && entry.origin.session ? (
+                          <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>
+                            From {entry.origin.session.name?.trim() || "Untitled session"}
+                          </span>
+                        ) : entry.origin?.kind === "github" && entry.origin.github ? (
+                          <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>
+                            {entry.origin.github.repo}#{entry.origin.github.number}
+                          </span>
+                        ) : null}
                         <span
                           title={entry.text}
                           style={{
@@ -2334,14 +3189,14 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                         >
                           {entry.text}
                         </span>
-                        <QueuedActionButton onClick={() => handleItemEdit(entry.text)} title={t("chatInput.queuedEditTitle")}>
+                        <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={() => void handleQueueAction(entry, "edit")} title={t("chatInput.queuedEditTitle")}>
                           {t("chatInput.queuedEdit")}
                         </QueuedActionButton>
-                        <QueuedActionButton onClick={() => handleItemDelete(entry.text)} title={t("chatInput.queuedDeleteTitle")}>
+                        <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={() => handleItemDelete(entry)} title={t("chatInput.queuedDeleteTitle")}>
                           {t("chatInput.queuedDelete")}
                         </QueuedActionButton>
                         {entry.kind === "follow-up" && (
-                          <QueuedActionButton onClick={() => handleItemSteer(entry)} title={t("chatInput.queuedSteerTitle")} accent>
+                          <QueuedActionButton disabled={submissionBlocked || queueActionPending || !onPromoteQueuedToSteer} onClick={() => void handleQueueAction(entry, "steer")} title={t("chatInput.queuedSteerTitle")} accent>
                             {t("chatInput.queuedSteerAction")}
                           </QueuedActionButton>
                         )}
@@ -2358,8 +3213,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
           <div
             role="status"
             aria-live="polite"
+            data-shell={shellMode}
             style={{
-              border: `1px solid ${bashMode ? "var(--tool-bg)" : "color-mix(in srgb, var(--border) 70%, transparent)"}`,
+              border: btwMode ? "1px solid var(--accent)" : "1px solid var(--shell-border, color-mix(in srgb, var(--border) 70%, transparent))",
               borderBottom: "none",
               borderRadius: queuedCount > 0 ? 0 : "var(--radius-card) var(--radius-card) 0 0",
               background: "var(--bg-panel)",
@@ -2380,11 +3236,12 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         )}
           <div
             className="chat-input-shell"
+            data-shell={shellMode}
             style={{
               display: "flex",
               flexDirection: "column",
-              background: "var(--bg)",
-              border: `1px solid ${bashMode ? "var(--tool-bg)" : "color-mix(in srgb, var(--border) 70%, transparent)"}`,
+              background: btwMode ? "color-mix(in srgb, var(--accent) 8%, var(--bg))" : "var(--shell-bg, var(--bg))",
+              border: btwMode ? "1px solid var(--accent)" : "1px solid var(--shell-border, color-mix(in srgb, var(--border) 70%, transparent))",
               borderRadius: (queuedCount > 0 || Boolean(statusText)) ? "0 0 var(--radius-card) var(--radius-card)" : "var(--radius-card)",
               padding: "12px 12px 10px",
               boxShadow: "var(--shadow-card)",
@@ -2401,25 +3258,38 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               previewDuration={previewDuration}
               transcribeError={transcribeError}
               onPauseResume={togglePauseDictation}
-              onConvert={stopAndInsertDictation}
+              onConvert={stopDictation}
               onRetry={retryDictation}
               onPlayPreview={isPlayingPreview ? pausePreviewDictation : playPreviewDictation}
               onSeekPreview={seekPreviewDictation}
               onConfirmTranscribe={confirmTranscribeDictation}
-              onDiscard={cancelDictationAndReset}
+              onDiscard={cancelDictation}
             />
           ) : (
+          <div style={{ position: "relative" }}>
+          <GhostMirror ref={ghostMirrorRef} textareaRef={textareaRef} prediction={wordPrediction} value={value} />
           <textarea
             ref={textareaRef}
             value={value}
             onChange={(e) => {
               setValue(e.target.value);
+              if (!e.target.value) setPromptOnly(false);
               setHistoryMenuOpen(false);
               updateAtQuery(e.target.value, e.target.selectionStart);
+              updateSlashQuery(e.target.value, e.target.selectionStart);
+              // Half-composed IME text is not a word yet; compositionend reports the result.
+              if (!isComposingRef.current) {
+                wordPrediction.update(e.target.value, e.target.selectionStart, e.target.selectionEnd);
+              }
             }}
             onSelect={(e) => {
               const el = e.currentTarget;
               updateAtQuery(el.value, el.selectionStart);
+              updateSlashQuery(el.value, el.selectionStart);
+              if (!isComposingRef.current) wordPrediction.update(el.value, el.selectionStart, el.selectionEnd);
+            }}
+            onScroll={(e) => {
+              if (ghostMirrorRef.current) ghostMirrorRef.current.scrollTop = e.currentTarget.scrollTop;
             }}
             onKeyDown={handleKeyDown}
             onCompositionStart={() => {
@@ -2430,6 +3300,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               lastCompositionEndAtRef.current = Date.now();
               const el = e.currentTarget;
               updateAtQuery(el.value, el.selectionStart);
+              updateSlashQuery(el.value, el.selectionStart);
+              wordPrediction.update(el.value, el.selectionStart, el.selectionEnd);
             }}
             onPaste={handlePaste}
             placeholder={t("chatInput.placeholder")}
@@ -2450,12 +3322,14 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               color: "var(--text)",
               fontSize: "var(--chat-user-font-size)",
               lineHeight: "var(--chat-line-height)",
-              fontFamily: "inherit",
+              fontFamily: bashMode ? "var(--font-mono)" : "inherit",
               minHeight: 24,
               maxHeight: 200,
               overflow: "auto",
+              position: "relative",
             }}
           />
+          </div>
           )}
 
           {/* Toolbar: plus menu · model · reasoning · fast · compact · send/queue/stop */}
@@ -2524,19 +3398,24 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     role="menuitem"
                     type="button"
                     onClick={() => { setPlusMenuOpen(false); fileInputRef.current?.click(); }}
-                    disabled={isStreaming}
                     title={t("chatInput.attachFile")}
-                    style={{
-                      display: "flex", alignItems: "center", gap: 8, width: "100%",
-                      padding: "7px 10px", border: 0, borderRadius: 5,
-                      background: "transparent", color: isStreaming ? "var(--text-dim)" : "var(--text-muted)",
-                      cursor: isStreaming ? "not-allowed" : "pointer", fontSize: 12, textAlign: "left",
-                      opacity: isStreaming ? 0.5 : 1,
-                    }}
+                    style={attachmentMenuItemStyle}
                   >
                     <Paperclip size={12} strokeWidth={1.8} style={{ flexShrink: 0 }} aria-hidden="true" />
                     <span style={{ flex: 1 }}>{t("chatInput.attachFile")}</span>
                   </button>
+                  {canReadClipboardImages && (
+                    <button
+                      role="menuitem"
+                      type="button"
+                      onClick={() => void pasteClipboardImage()}
+                      title={t("chatInput.pasteImage")}
+                      style={attachmentMenuItemStyle}
+                    >
+                      <ClipboardPaste size={12} strokeWidth={1.8} style={{ flexShrink: 0 }} aria-hidden="true" />
+                      <span style={{ flex: 1 }}>{t("chatInput.pasteImage")}</span>
+                    </button>
+                  )}
                   {onToolPresetChange && (
                     <>
                       <button
@@ -2730,6 +3609,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               </div>
             )}
 
+            <div className="composer-toolbar-spacer" style={{ marginLeft: "auto" }} />
+
             {/* Thinking selector — compact, expressive, and consistent with models */}
             {onThinkingLevelChange && (
               <div ref={thinkingDropdownRef} className="composer-thinking-control" style={{ position: "relative", minWidth: 0 }}>
@@ -2751,11 +3632,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   onMouseEnter={(e) => { if (!isStreaming) { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; } }}
                   onMouseLeave={(e) => { e.currentTarget.style.background = thinkingDropdownOpen ? "var(--bg-hover)" : "none"; e.currentTarget.style.color = "var(--text-muted)"; }}
                 >
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }} aria-hidden="true">
-                    <path d="M9.5 2A5.5 5.5 0 0 0 4 7.5c0 1.7.78 3.21 2 4.21V14a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1v-2.29c1.22-1 2-2.51 2-4.21A5.5 5.5 0 0 0 9.5 2z" />
-                    <line x1="7" y1="18" x2="12" y2="18" /><line x1="8" y1="21" x2="11" y2="21" />
-                  </svg>
-                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textTransform: "capitalize" }}>{thinkingDisplayLabel}</span>
+                  {/* TUI-style level glyph; wide toolbars also show the level
+                      name (label hidden by CSS on narrow toolbars) and the
+                      label always stays in title/aria. */}
+                  <ThinkingGlyph level={thinkingLevel ?? "auto"} />
+                  <span className="composer-thinking-label" style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textTransform: "capitalize" }}>{thinkingDisplayLabel}</span>
                   <ChevronDown size={12} strokeWidth={1.8} style={{ flexShrink: 0, opacity: 0.7, transform: thinkingDropdownOpen ? "rotate(180deg)" : "none", transition: "transform var(--dur-fast) var(--ease-out-warm)" }} aria-hidden="true" />
                 </button>
                 {thinkingDropdownOpen && (
@@ -2793,7 +3674,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                         const displayLabel = (mappedVal != null && mappedVal !== lvl) ? mappedVal : lvl;
                         return (
                           <button
-                            className="picker-thinking-card"
+                            className="picker-row picker-thinking-card"
                             data-active={isActive}
                             role="menuitemradio"
                             aria-checked={isActive}
@@ -2803,6 +3684,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                             <span className="picker-check">
                               {isActive && <svg width="11" height="11" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1.5 5 4 7.5 8.5 2.5" /></svg>}
                             </span>
+                            <ThinkingGlyph level={lvl} />
                             <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textTransform: "capitalize" }}>{displayLabel}</span>
                           </button>
                         );
@@ -2852,7 +3734,48 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               </button>
             )}
 
-            <div className="composer-toolbar-spacer" style={{ marginLeft: "auto" }} />
+            {/* Slow toggle — only when omp reports /slow applies to the
+                active model. A `global` scope is a persisted omp setting
+                shared by every session; `session` is this session's flex
+                tier — the tooltip says which. */}
+            {slowModeSupported && onSlowModeChange && (
+              <button
+                type="button"
+                className="composer-slow-control"
+                onClick={() => { if (isStreaming) return; onSlowModeChange(!slowModeEnabled); }}
+                disabled={isStreaming}
+                title={t(slowModeScope === "global" ? "chatInput.slowTitleGlobal" : "chatInput.slowTitleSession")}
+                aria-label={t("chatInput.slowLabel")}
+                aria-pressed={slowModeEnabled}
+                style={{
+                  display: "flex", alignItems: "center", gap: 5,
+                  height: "var(--control-height-sm)",
+                  padding: "0 8px",
+                  background: slowModeEnabled ? "var(--bg-selected)" : "none",
+                  border: "none",
+                  borderRadius: 7,
+                  color: slowModeEnabled ? "var(--accent)" : "var(--text-muted)",
+                  cursor: isStreaming ? "not-allowed" : "pointer",
+                  opacity: isStreaming ? 0.5 : 1,
+                  fontSize: "var(--text-sm)",
+                  fontWeight: 600,
+                  transition: "background var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm)",
+                }}
+              >
+                <Snail size={11} aria-hidden="true" />
+                <span>{t("chatInput.slowLabel")}</span>
+              </button>
+            )}
+
+            {/* Provider usage-limit stage (wrap-up allowance or /slow low
+                priority), warning-colored like the TUI status line so
+                past-the-limit service is never mistaken for normal.
+                Layout lives in globals.css (own row on mobile). */}
+            {usageLimitLabel && (
+              <div className="composer-usage-limit-badge" role="status" aria-live="polite" title={usageLimitLabel}>
+                {usageLimitLabel}
+              </div>
+            )}
 
             {/* Advisor activity — thunder while the advisor model reviews this run */}
             {advisorActive && (
@@ -2871,9 +3794,15 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               </span>
             )}
 
-            {/* Context ring: usage gauge opening the session context popover */}
+            {/* Desktop keeps the control in the composer; mobile uses the header mount. */}
             {onCompact && (
-              <div ref={contextWrapRef} style={{ position: "relative", flexShrink: 0 }}>
+              <div ref={setComposerContextContainer} style={{ display: isMobile ? "none" : undefined, flexShrink: 0 }} />
+            )}
+            {onCompact && contextContainer && createPortal(
+              <div
+                ref={contextWrapRef}
+                style={{ position: "relative", flexShrink: 0 }}
+              >
                 <button
                   type="button"
                   onClick={() => setContextOpen((open) => !open)}
@@ -2881,9 +3810,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   aria-label={t("composerContext.title")}
                   aria-expanded={contextOpen}
                   aria-haspopup="dialog"
+                  className="composer-context-control ui-focus-ring"
                   style={{
                     display: "flex", alignItems: "center", justifyContent: "center",
-                    width: 28, height: 28, padding: 0,
+                    width: isMobile ? 44 : 28, height: isMobile ? 44 : 28, padding: 0,
                     background: contextOpen ? "var(--bg-hover)" : "none", border: "none",
                     borderRadius: 7,
                     color: isCompacting ? "var(--accent)" : "var(--text-muted)",
@@ -2926,21 +3856,21 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 {contextOpen && (
                   <div
                     role="dialog"
+                    tabIndex={-1}
                     aria-label={t("composerContext.title")}
                     className="picker-panel"
                     style={{
                       position: isMobile ? "fixed" : "absolute",
-                      bottom: isMobile ? 8 : "calc(100% + 8px)",
                       ...(isMobile
-                        ? { left: 8, right: 8 }
-                        : { right: 0, width: 360, maxWidth: "min(360px, calc(100vw - 32px))" }),
+                        ? { top: "calc(52px + env(safe-area-inset-top))", left: 8, right: 8 }
+                        : { bottom: "calc(100% + 8px)", right: 0, width: 360, maxWidth: "min(360px, calc(100vw - 32px))" }),
                       background: "var(--bg-panel)",
                       border: "1px solid var(--border)",
                       borderRadius: "var(--radius-card)",
                       boxShadow: "var(--shadow-pop)",
                       zIndex: 60,
                       padding: 12,
-                      maxHeight: isMobile ? "calc(100dvh - 32px)" : "min(50vh, 380px)",
+                      maxHeight: isMobile ? "calc(100dvh - 68px - env(safe-area-inset-top))" : contextMaxHeight,
                       overflowY: "auto",
                     }}
                   >
@@ -2989,14 +3919,15 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     </button>
                   </div>
                 )}
-              </div>
+              </div>,
+              contextContainer,
             )}
 
             {/* Dictation */}
             {isRecording || isPaused || isReviewing || isTranscribing || transcribeError ? (
               <button
                 type="button"
-                onClick={cancelDictationAndReset}
+                onClick={cancelDictation}
                 title={transcribeError ? t("chatInput.discardDictation") : t("chatInput.cancelDictation")}
                 aria-label={transcribeError ? t("chatInput.discardDictation") : t("chatInput.cancelDictation")}
                 style={{
@@ -3015,7 +3946,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             ) : (
               <button
                 type="button"
-                onClick={startFreshDictation}
+                onClick={toggleDictation}
                 title={t("chatInput.startDictation")}
                 aria-label={t("chatInput.startDictation")}
                 style={{
@@ -3034,21 +3965,17 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 <Mic size={14} strokeWidth={1.8} aria-hidden="true" />
               </button>
             )}
-            {/* Primary action: Send (idle) / Queue (typed while running) / Stop (running) */}
+            {/* Primary action: Send (idle) / Steer or Queue (typed while running, per Settings) / Stop (running) */}
             {primaryActionQueuesMessage ? (
               <button
                 type="button"
                 className="composer-primary-action"
                 onClick={() => {
-                  if (dictationCapturing) {
-                    const behavior = getSubmitDuringRunBehavior();
-                    stopAndQueueDictation(behavior === "steer" && onSteer ? "steer" : "followup");
-                  } else {
-                    sendQueued("followup");
-                  }
+                  if (dictationCapturing) stopAndFinishDictation(primaryActionMode);
+                  else sendQueued(primaryActionMode);
                 }}
-                disabled={isTranscribing}
-                title={t("chatInput.queueMessage")}
+                disabled={submissionBlocked || isTranscribing}
+                title={primaryActionRunsShell ? t("chatInput.runShell") : t(primaryActionMode === "steer" ? "chatInput.steerNowTitle" : "chatInput.queueMessage")}
                 style={{
                   display: "flex", alignItems: "center", gap: 6,
                   background: "var(--accent-strong)",
@@ -3061,10 +3988,14 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   transition: "background var(--dur-fast) var(--ease-out-warm)",
                 }}
               >
-                <ListChecks size={13} strokeWidth={2} aria-hidden="true" />
-                {t("chatInput.queue")}
+                {primaryActionRunsShell
+                  ? <Terminal size={13} strokeWidth={2} aria-hidden="true" />
+                  : primaryActionMode === "steer"
+                  ? <CornerDownRight size={13} strokeWidth={2} aria-hidden="true" />
+                  : <ListChecks size={13} strokeWidth={2} aria-hidden="true" />}
+                {t(primaryActionRunsShell ? "chatInput.runShell" : primaryActionMode === "steer" ? "chatInput.steer" : "chatInput.queue")}
               </button>
-            ) : isStreaming ? (
+            ) : isStreaming && !btwMode ? (
               <button
                 type="button"
                 className="composer-primary-action"
@@ -3091,23 +4022,25 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               <button
                 type="button"
                 className="composer-primary-action"
-                onClick={isRecording || isPaused || isReviewing ? stopAndSendDictation : () => void handleSend()}
-                disabled={isTranscribing || !(isRecording || isPaused || isReviewing || value.trim() || attachedImages.length || attachedTextFiles.length)}
-                title={isRecording || isPaused || isReviewing ? t("chatInput.sendDictation") : t("chatInput.send")}
+                onClick={isRecording || isPaused || isReviewing ? () => stopAndFinishDictation("send") : () => void handleSend()}
+                disabled={submissionBlocked || isTranscribing || (!btwMode && uploadsBlockSend) || !(isRecording || isPaused || isReviewing || value.trim() || hasAttachments)}
+                title={!btwMode && uploadsBlockSend
+                  ? (failedUploadCount > 0 ? t("chatInput.uploadsFailedBlock", { count: failedUploadCount }) : t("chatInput.uploadsWaiting", { count: uploadingCount }))
+                  : isRecording || isPaused || isReviewing ? t("chatInput.sendDictation") : t("chatInput.send")}
                 style={{
                   display: "flex", alignItems: "center", gap: 6,
-                  background: (isRecording || isPaused || isReviewing || isTranscribing || value.trim() || attachedImages.length || attachedTextFiles.length) ? "var(--accent-strong)" : "var(--bg-panel)",
+                  background: (isRecording || isPaused || isReviewing || isTranscribing || value.trim() || hasAttachments) ? "var(--accent-strong)" : "var(--bg-panel)",
                   border: "none",
                   borderRadius: 8,
-                  color: (isRecording || isPaused || isReviewing || isTranscribing || value.trim() || attachedImages.length || attachedTextFiles.length) ? "var(--on-accent)" : "var(--text-dim)",
-                  cursor: isTranscribing ? "wait" : (isRecording || isPaused || value.trim() || attachedImages.length || attachedTextFiles.length) ? "pointer" : "not-allowed",
+                  color: (isRecording || isPaused || isReviewing || isTranscribing || value.trim() || hasAttachments) ? "var(--on-accent)" : "var(--text-dim)",
+                  cursor: submissionBlocked || (!btwMode && uploadsBlockSend) ? "not-allowed" : isTranscribing ? "wait" : (isRecording || isPaused || isReviewing || value.trim() || hasAttachments) ? "pointer" : "not-allowed",
                   fontSize: 12,
                   fontWeight: 600,
-                  boxShadow: (isRecording || isPaused || isTranscribing || value.trim() || attachedImages.length || attachedTextFiles.length) ? "var(--shadow-card)" : "none",
+                  boxShadow: (isRecording || isPaused || isReviewing || isTranscribing || value.trim() || hasAttachments) ? "var(--shadow-card)" : "none",
                   transition: "background var(--dur-fast) var(--ease-out-warm), box-shadow var(--dur-fast) var(--ease-out-warm)",
                 }}
               >
-                {isTranscribing ? (
+                {isTranscribing || (!btwMode && uploadingCount > 0) ? (
                   <Loader2 size={12} strokeWidth={2} className="animate-spin" aria-hidden="true" />
                 ) : (
                   <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -3115,7 +4048,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     <polyline points="7.5 3 12 7 7.5 11" />
                   </svg>
                 )}
-                {t("chatInput.send")}
+                {!btwMode && uploadingCount > 0 ? t("chatInput.uploadsPending", { count: uploadingCount }) : t("chatInput.send")}
               </button>
             )}
           </div>
@@ -3124,7 +4057,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
         {/* Bash mode status label */}
         {bashMode && (
-          <div className="text-xs px-2 py-1" style={{ color: bashExcluded ? "var(--text-muted)" : "var(--accent)", marginTop: 4 }}>
+          <div className="shell-mode-label text-xs px-2 py-1" data-shell={shellMode} style={{ marginTop: 4 }}>
             {bashExcluded ? t("chatInput.shellLocal") : t("chatInput.shellToModel")}
           </div>
         )}

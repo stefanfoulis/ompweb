@@ -3,9 +3,11 @@ import { dirname } from "path";
 import { isMap, parseDocument, stringify } from "yaml";
 import { getSettingsPath } from "./paths";
 import { isRecord } from "../type-guards";
+import { effectiveCompactionMethodOrder, isCompactionMethodOrder, type CompactionMethod } from "../compaction-methods";
 
 export type NativeSettings = {
   defaultThinkingLevel?: "auto" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  providers?: { autoThinkingSource?: "classifier" | "vendor" };
   hideThinkingBlock?: boolean;
   externalThinking?: boolean;
   textVerbosity?: "low" | "medium" | "high";
@@ -23,7 +25,7 @@ export type NativeSettings = {
     fallbackRevertPolicy?: "cooldown-expiry" | "never";
     fallbackChains?: Record<string, string[]>;
   };
-  compaction?: { enabled?: boolean; midTurnEnabled?: boolean; strategy?: "snapcompact" | "handoff" | "context-full" | "shake" | "off"; autoContinue?: boolean; remoteEnabled?: boolean; keepRecentTokens?: number };
+  compaction?: { enabled?: boolean; midTurnEnabled?: boolean; methodOrder?: CompactionMethod[]; autoContinue?: boolean; keepRecentTokens?: number };
   memory?: { backend?: "off" | "local" | "mnemopi" | "hindsight" };
   autolearn?: { enabled?: boolean; autoContinue?: boolean; minToolCalls?: number };
   mnemopi?: { scoping?: "global" | "per-project" | "per-project-tagged"; autoRecall?: boolean; autoRetain?: boolean; noEmbeddings?: boolean };
@@ -37,7 +39,6 @@ const BACKLOGS = new Set(["off", "1", "3", "5"]);
 const APPROVAL_MODES = new Set(["always-ask", "write", "yolo"]);
 const APPROVAL_POLICIES = new Set(["allow", "prompt", "deny"]);
 const FALLBACK_REVERT_POLICIES = new Set(["cooldown-expiry", "never"]);
-const COMPACTION_STRATEGIES = new Set(["snapcompact", "handoff", "context-full", "shake", "off"]);
 const MEMORY_BACKENDS = new Set(["off", "local", "mnemopi", "hindsight"]);
 const MEMORY_SCOPES = new Set(["global", "per-project", "per-project-tagged"]);
 
@@ -64,12 +65,29 @@ function readDocument() {
   return { path, doc };
 }
 
+/** omp's `/slow` for Claude: `providers.anthropic.slowMode: auto` (default off).
+ *  An unreadable config counts as off, like omp's default. */
+export function readAnthropicSlowMode(): boolean {
+  try {
+    const data = readDocument().doc.toJS();
+    if (!isRecord(data)) return false;
+    const providers = isRecord(data.providers) ? data.providers : {};
+    const anthropic = isRecord(providers.anthropic) ? providers.anthropic : {};
+    // omp's migration also accepts top-level dotted keys, nested values winning.
+    return (anthropic.slowMode ?? data["providers.anthropic.slowMode"]) === "auto";
+  } catch {
+    return false;
+  }
+}
+
 /** Returns the persisted native OMP values only; omitted keys keep OMP defaults. */
 export function readNativeSettings(): { path: string; settings: NativeSettings } {
   const { path, doc } = readDocument();
   const data = doc.toJS();
   if (!isRecord(data)) return { path, settings: {} };
   const advisor = isRecord(data.advisor) ? data.advisor : {};
+  const providers = isRecord(data.providers) ? data.providers : {};
+  const autoThinkingSource = providers.autoThinkingSource;
   const tools = isRecord(data.tools) ? data.tools : {};
   const approval = isRecord(tools.approval) ? tools.approval : {};
   const retry = isRecord(data.retry) ? data.retry : {};
@@ -77,6 +95,13 @@ export function readNativeSettings(): { path: string; settings: NativeSettings }
     ? Object.fromEntries(Object.entries(retry.fallbackChains).filter((entry): entry is [string, string[]] => typeof entry[0] === "string" && stringArray(entry[1]) !== undefined))
     : {};
   const compaction = isRecord(data.compaction) ? data.compaction : {};
+  // omp's migration also accepts top-level dotted keys, nested values winning.
+  const methodOrder = effectiveCompactionMethodOrder({
+    methodOrder: data["compaction.methodOrder"],
+    strategy: data["compaction.strategy"],
+    remoteEnabled: data["compaction.remoteEnabled"],
+    ...Object.fromEntries(Object.entries(compaction).filter(([, value]) => value != null)),
+  });
   const memory = isRecord(data.memory) ? data.memory : {};
   const autolearn = isRecord(data.autolearn) ? data.autolearn : {};
   const mnemopi = isRecord(data.mnemopi) ? data.mnemopi : {};
@@ -87,6 +112,9 @@ export function readNativeSettings(): { path: string; settings: NativeSettings }
     path,
     settings: {
       ...(THINKING_LEVELS.has(data.defaultThinkingLevel as string) ? { defaultThinkingLevel: data.defaultThinkingLevel as NativeSettings["defaultThinkingLevel"] } : {}),
+      ...(autoThinkingSource === "classifier" || autoThinkingSource === "vendor"
+        ? { providers: { autoThinkingSource } }
+        : {}),
       ...(typeof data.hideThinkingBlock === "boolean" ? { hideThinkingBlock: data.hideThinkingBlock } : {}),
       ...(typeof data.externalThinking === "boolean" ? { externalThinking: data.externalThinking } : {}),
       ...(TEXT_VERBOSITIES.has(data.textVerbosity as string) ? { textVerbosity: data.textVerbosity as NativeSettings["textVerbosity"] } : {}),
@@ -117,12 +145,11 @@ export function readNativeSettings(): { path: string; settings: NativeSettings }
         ...(FALLBACK_REVERT_POLICIES.has(retry.fallbackRevertPolicy as string) ? { fallbackRevertPolicy: retry.fallbackRevertPolicy as "cooldown-expiry" | "never" } : {}),
         ...(Object.keys(fallbackChains).length ? { fallbackChains } : {}),
       } } : {}),
-      ...(Object.keys(compaction).length ? { compaction: {
+      ...(Object.keys(compaction).length || methodOrder ? { compaction: {
         ...(typeof compaction.enabled === "boolean" ? { enabled: compaction.enabled } : {}),
         ...(typeof compaction.midTurnEnabled === "boolean" ? { midTurnEnabled: compaction.midTurnEnabled } : {}),
-        ...(COMPACTION_STRATEGIES.has(compaction.strategy as string) ? { strategy: compaction.strategy as "snapcompact" | "handoff" | "context-full" | "shake" | "off" } : {}),
+        ...(methodOrder ? { methodOrder } : {}),
         ...(typeof compaction.autoContinue === "boolean" ? { autoContinue: compaction.autoContinue } : {}),
-        ...(typeof compaction.remoteEnabled === "boolean" ? { remoteEnabled: compaction.remoteEnabled } : {}),
         ...(typeof compaction.keepRecentTokens === "number" && Number.isInteger(compaction.keepRecentTokens) ? { keepRecentTokens: compaction.keepRecentTokens } : {}),
       } } : {}),
       ...(Object.keys(memory).length ? { memory: { ...(MEMORY_BACKENDS.has(memory.backend as string) ? { backend: memory.backend as "off" | "local" | "mnemopi" | "hindsight" } : {}) } } : {}),
@@ -150,6 +177,11 @@ export function readNativeSettings(): { path: string; settings: NativeSettings }
 /** Validates and applies a reviewed subset of OMP's global config schema. */
 export function writeNativeSettings(settings: NativeSettings): void {
   if (!isRecord(settings)) throw new Error("Settings must be an object");
+  assertOptionalRecord(settings.providers, "providers");
+  const autoThinkingSource = settings.providers?.autoThinkingSource;
+  if (autoThinkingSource !== undefined && autoThinkingSource !== "classifier" && autoThinkingSource !== "vendor") {
+    throw new Error("Invalid Auto thinking source");
+  }
   assertOptionalRecord(settings.advisor, "advisor");
   assertOptionalRecord(settings.tools, "tools");
   assertOptionalRecord(settings.tools?.approval, "tools.approval");
@@ -169,7 +201,6 @@ export function writeNativeSettings(settings: NativeSettings): void {
     "compaction.enabled": settings.compaction?.enabled,
     "compaction.midTurnEnabled": settings.compaction?.midTurnEnabled,
     "compaction.autoContinue": settings.compaction?.autoContinue,
-    "compaction.remoteEnabled": settings.compaction?.remoteEnabled,
     "autolearn.enabled": settings.autolearn?.enabled,
     "autolearn.autoContinue": settings.autolearn?.autoContinue,
     "mnemopi.autoRecall": settings.mnemopi?.autoRecall,
@@ -194,7 +225,7 @@ export function writeNativeSettings(settings: NativeSettings): void {
       if (!role.trim() || !Array.isArray(chain) || chain.some((selector) => typeof selector !== "string" || !selector.trim())) throw new Error("Fallback chains require non-empty role and model selectors");
     }
   }
-  if (settings.compaction?.strategy !== undefined && !COMPACTION_STRATEGIES.has(settings.compaction.strategy)) throw new Error("Invalid compaction strategy");
+  if (settings.compaction?.methodOrder !== undefined && !isCompactionMethodOrder(settings.compaction.methodOrder)) throw new Error("Invalid compaction method order");
   if (settings.compaction?.keepRecentTokens !== undefined && (!Number.isInteger(settings.compaction.keepRecentTokens) || settings.compaction.keepRecentTokens < 1_000 || settings.compaction.keepRecentTokens > 1_000_000)) throw new Error("Compaction retained tokens must be an integer between 1,000 and 1,000,000");
   if (settings.memory?.backend !== undefined && !MEMORY_BACKENDS.has(settings.memory.backend)) throw new Error("Invalid memory backend");
   if (settings.autolearn?.minToolCalls !== undefined && (!Number.isInteger(settings.autolearn.minToolCalls) || settings.autolearn.minToolCalls < 0 || settings.autolearn.minToolCalls > 100)) throw new Error("Auto-learn minimum tool calls must be an integer between 0 and 100");
@@ -214,6 +245,7 @@ export function writeNativeSettings(settings: NativeSettings): void {
   }
   if (!isMap(doc.contents)) throw new Error(`${path} must contain a YAML mapping`);
   if (settings.defaultThinkingLevel !== undefined) doc.set("defaultThinkingLevel", settings.defaultThinkingLevel);
+  if (autoThinkingSource !== undefined) doc.setIn(["providers", "autoThinkingSource"], autoThinkingSource);
   if (settings.hideThinkingBlock !== undefined) doc.set("hideThinkingBlock", settings.hideThinkingBlock);
   if (settings.externalThinking !== undefined) doc.set("externalThinking", settings.externalThinking);
   if (settings.textVerbosity !== undefined) doc.set("textVerbosity", settings.textVerbosity);

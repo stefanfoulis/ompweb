@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChevronRight, Gauge } from "lucide-react";
+import { Check, ChevronRight, Gauge, RefreshCw } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
-import { formatUsageReset, usageTone, useProviderUsage } from "./AppShell-provider-usage";
+import { formatUsageReset, usageBucketLabel, usageTone, useProviderUsage } from "./AppShell-provider-usage";
 import type { ProviderUsageReport, ProviderUsageWindow } from "@/lib/provider-usage-types";
+import { SidebarIconButton } from "./SessionSidebar-chrome";
+import { Tooltip } from "./ui/primitives";
 
 interface WindowDef {
   short: string;
@@ -18,6 +20,7 @@ const WINDOWS: WindowDef[] = [
 ];
 
 const COLLAPSED_STORAGE_KEY = "omp-web:provider-usage-collapsed";
+const DISPLAY_WINDOW_STORAGE_KEY = "omp-web:provider-usage-window";
 
 function worstWindow(report: ProviderUsageReport): { short: string; window: ProviderUsageWindow } | null {
   let best: { short: string; window: ProviderUsageWindow } | null = null;
@@ -25,6 +28,60 @@ function worstWindow(report: ProviderUsageReport): { short: string; window: Prov
     const window = def.pick(report);
     if (window && (best === null || window.percent > best.window.percent)) {
       best = { short: def.short, window };
+    }
+  }
+  return best;
+}
+
+// Display window for the compact widget rows and header summary (#285).
+// "auto" preserves the previous behavior (worst window per report); pinning
+// to "5H" or "7D" shows that window instead, falling back to the worst
+// window for a report that has no data for the pinned window.
+export type UsageDisplayWindow = "auto" | "5H" | "7D";
+
+export const USAGE_DISPLAY_WINDOWS: UsageDisplayWindow[] = ["auto", "5H", "7D"];
+
+export function nextUsageDisplayWindow(current: UsageDisplayWindow): UsageDisplayWindow {
+  const index = USAGE_DISPLAY_WINDOWS.indexOf(current);
+  return USAGE_DISPLAY_WINDOWS[(index + 1) % USAGE_DISPLAY_WINDOWS.length];
+}
+
+export function displayWindowForReport(
+  report: ProviderUsageReport,
+  display: UsageDisplayWindow,
+): { short: string; window: ProviderUsageWindow } | null {
+  if (display === "auto") return worstWindow(report);
+  const def = WINDOWS.find((d) => d.short === display);
+  const window = def?.pick(report);
+  return window && def ? { short: def.short, window } : worstWindow(report);
+}
+
+export function displaySummary(
+  reports: ProviderUsageReport[],
+  display: UsageDisplayWindow,
+): { percent: number; window: string } | null {
+  let best: { percent: number; window: string } | null = null;
+  for (const report of reports) {
+    let picked: { short: string; window: ProviderUsageWindow } | null = null;
+    if (display === "auto") {
+      picked = worstWindow(report);
+    } else {
+      const def = WINDOWS.find((d) => d.short === display);
+      const window = def?.pick(report);
+      picked = window && def ? { short: def.short, window } : null;
+    }
+    if (picked && (best === null || picked.window.percent > best.percent)) {
+      best = { percent: Math.round(picked.window.percent), window: picked.short };
+    }
+  }
+  if (best === null && display !== "auto") {
+    // No report has the pinned window: fall back to the worst window, as
+    // before, rather than showing "no data" for data that does exist.
+    for (const report of reports) {
+      const picked = worstWindow(report);
+      if (picked && (best === null || picked.window.percent > best.percent)) {
+        best = { percent: Math.round(picked.window.percent), window: picked.short };
+      }
     }
   }
   return best;
@@ -63,28 +120,46 @@ function DetailMeter({ short, window, t }: {
 // slim row per account (worst window only), click to expand the full detail.
 export function ProviderUsageBar() {
   const { t } = useI18n();
-  const { snapshot, loading, error } = useProviderUsage("", 5 * 60_000);
+  const { snapshot, loading, error, refresh } = useProviderUsage("", 5 * 60_000);
+  const [refreshDone, setRefreshDone] = useState(false);
+  useEffect(() => {
+    if (!refreshDone) return;
+    const timer = window.setTimeout(() => setRefreshDone(false), 2000);
+    return () => window.clearTimeout(timer);
+  }, [refreshDone]);
   const reports = snapshot?.reports ?? [];
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   // The first render must match the server, where localStorage is unavailable,
   // so start collapsed and apply the stored preference after mounting.
   const [collapsed, setCollapsed] = useState(true);
+  // Same pattern for the display window: start on "auto" (worst window, the
+  // previous behavior) and apply the stored pinned window after mounting.
+  const [displayWindow, setDisplayWindow] = useState<UsageDisplayWindow>("auto");
   useEffect(() => {
     try {
       // No stored choice yet → stay hidden; an explicit expand persists.
       if (window.localStorage.getItem(COLLAPSED_STORAGE_KEY) === "false") setCollapsed(false);
+      const stored = window.localStorage.getItem(DISPLAY_WINDOW_STORAGE_KEY);
+      if (stored === "5H" || stored === "7D") setDisplayWindow(stored);
     } catch {
       // Storage unavailable: keep the collapsed default.
     }
   }, []);
 
-  let worst: { percent: number; window: string } | null = null;
-  for (const report of reports) {
-    const best = worstWindow(report);
-    if (best && (worst === null || best.window.percent > worst.percent)) {
-      worst = { percent: Math.round(best.window.percent), window: best.short };
-    }
-  }
+  const worst = displaySummary(reports, displayWindow);
+
+  const cycleDisplayWindow = () => {
+    setDisplayWindow((prev) => {
+      const next = nextUsageDisplayWindow(prev);
+      try {
+        window.localStorage.setItem(DISPLAY_WINDOW_STORAGE_KEY, next);
+      } catch {
+        // The preference still applies for this page load.
+      }
+      return next;
+    });
+  };
+  const displayLabel = displayWindow === "auto" ? "Auto" : displayWindow;
 
   return (
     <section
@@ -99,9 +174,9 @@ export function ProviderUsageBar() {
         flexShrink: 0,
         minHeight: 0,
         maxHeight: "32vh",
-        overflowY: "auto",
       }}
     >
+      <div style={{ display: "flex", alignItems: "center", gap: 2, flexShrink: 0 }}>
       <button
         type="button"
         onClick={() => setCollapsed((v) => {
@@ -119,7 +194,7 @@ export function ProviderUsageBar() {
           display: "flex",
           alignItems: "center",
           gap: 7,
-          width: "100%",
+          flex: 1,
           boxSizing: "border-box",
           padding: "0 4px",
           minWidth: 0,
@@ -156,10 +231,53 @@ export function ProviderUsageBar() {
                 : t("appShell.providerUsageNoData")}
         </span>
       </button>
-      {!collapsed && reports.map((report, index) => {
+        <button
+          type="button"
+          onClick={cycleDisplayWindow}
+          aria-label={t("providerUsage.toggleWindow", { window: displayLabel })}
+          title={t("providerUsage.toggleWindow", { window: displayLabel })}
+          style={{
+            fontFamily: "var(--font-mono)",
+            fontWeight: 700,
+            fontSize: 10,
+            color: displayWindow === "auto" ? "var(--text-dim)" : "var(--text)",
+            background: "var(--bg)",
+            border: "1px solid var(--border)",
+            padding: "0 5px",
+            borderRadius: 4,
+            whiteSpace: "nowrap",
+            flexShrink: 0,
+            lineHeight: 1.7,
+            cursor: "pointer",
+          }}
+        >
+          {displayLabel}
+        </button>
+        <Tooltip content={t("sessionSidebar.refresh")} side="top">
+          <SidebarIconButton
+            label={t("sessionSidebar.refresh")}
+            active={refreshDone}
+            disabled={loading}
+            onClick={() => {
+              setRefreshDone(false);
+              void refresh().then(setRefreshDone);
+            }}
+          >
+            {refreshDone ? (
+              <Check size={14} strokeWidth={2.2} aria-hidden="true" />
+            ) : (
+              <RefreshCw size={14} strokeWidth={1.9} aria-hidden="true" />
+            )}
+          </SidebarIconButton>
+        </Tooltip>
+      </div>
+      {!collapsed && reports.length > 0 && (
+      <div style={{ display: "flex", flexDirection: "column", gap: 2, minHeight: 0, overflowY: "auto" }}>
+      {reports.map((report, index) => {
         const account = report.accountLabel ?? t("appShell.account", { number: report.accountIndex ?? index + 1 });
-        const key = `${report.provider}:${account}:${report.modelId ?? "all"}:${index}`;
-        const best = worstWindow(report);
+        const bucketLabel = usageBucketLabel(report);
+        const key = `${report.provider}:${account}:${report.modelId ?? "all"}:${report.tier ?? ""}:${report.bucket ?? ""}:${index}`;
+        const best = displayWindowForReport(report, displayWindow);
         const expanded = expandedKey === key;
         const pct = best ? Math.round(best.window.percent) : 0;
         const tone = usageTone(pct);
@@ -167,9 +285,10 @@ export function ProviderUsageBar() {
           <div key={key} style={{ borderRadius: "var(--radius-control)", background: expanded ? "var(--bg-subtle)" : "transparent" }}>
             <button
               type="button"
+              className="provider-usage-row"
               onClick={() => setExpandedKey((prev) => (prev === key ? null : key))}
               aria-expanded={report.noLimits ? undefined : expanded}
-              title={account}
+              title={bucketLabel ? `${account} (${bucketLabel})` : account}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -200,11 +319,16 @@ export function ProviderUsageBar() {
               <span style={{ fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: 10, color: "var(--text)", background: "var(--bg)", border: "1px solid var(--border)", padding: "0 5px", borderRadius: 4, whiteSpace: "nowrap", flexShrink: 0, lineHeight: 1.7 }}>
                 {report.provider}
               </span>
+              {bucketLabel && (
+                <span style={{ fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: 10, color: "var(--text-muted)", background: "var(--bg-subtle)", border: "1px solid var(--border)", padding: "0 5px", borderRadius: 4, whiteSpace: "nowrap", flexShrink: 0, lineHeight: 1.7 }}>
+                  {bucketLabel}
+                </span>
+              )}
               <span style={{ fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
                 {account}
               </span>
               {report.noLimits ? (
-                <span style={{ fontSize: 10, color: "var(--text-dim)", flexShrink: 0 }}>∞</span>
+                <span title={t("appShell.providerUsageNoData")} aria-label={t("appShell.providerUsageNoData")} style={{ fontSize: 10, color: "var(--text-dim)", flexShrink: 0 }}>—</span>
               ) : (
                 <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, fontWeight: 700, color: tone, fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
                   {pct}%
@@ -227,6 +351,8 @@ export function ProviderUsageBar() {
           </div>
         );
       })}
+      </div>
+      )}
     </section>
   );
 }

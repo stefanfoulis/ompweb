@@ -1,0 +1,110 @@
+import "../tests/setup-dom.mjs";
+import assert from "node:assert/strict";
+import test, { afterEach, beforeEach } from "node:test";
+import React, { act } from "react";
+const { cleanup, render, screen, waitFor } = await import("@testing-library/react/pure.js");
+const { default: userEvent } = await import("@testing-library/user-event");
+
+const { ChatInput } = await import("./ChatInput.tsx");
+const { clearDraft, getDraft } = await import("@/lib/draft-store");
+
+beforeEach(() => {
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  // Typing "/" opens the slash menu, which scrolls its active row into view.
+  window.HTMLElement.prototype.scrollIntoView = () => {};
+});
+afterEach(() => {
+  cleanup();
+  clearDraft("btw-draft");
+  localStorage.clear();
+  delete window.matchMedia;
+  delete window.HTMLElement.prototype.scrollIntoView;
+});
+
+/** Every way the composer can hand text to the agent, recorded by name. */
+function renderComposer(props) {
+  const calls = [];
+  const record = (name) => async (...args) => { calls.push([name, args[0]]); return name === "onSend" ? { status: "accepted" } : true; };
+  const ref = React.createRef();
+  render(React.createElement(ChatInput, {
+    ref,
+    draftKey: "btw-draft",
+    onAbort() {},
+    onSend: record("onSend"),
+    onSteer: record("onSteer"),
+    onFollowUp: record("onFollowUp"),
+    onBuiltinCommand: async (text) => { calls.push(["onBuiltinCommand", text]); return { handled: true }; },
+    ...props,
+  }));
+  return { calls, ref };
+}
+
+for (const isStreaming of [false, true]) {
+  test(`/btw goes to the side-question command, never the agent, ${isStreaming ? "while a run streams" : "when idle"}`, async () => {
+    const user = userEvent.setup();
+    const { calls } = renderComposer({ isStreaming });
+    await user.type(screen.getByRole("textbox"), "/btw what is 2+2");
+    await user.keyboard("{Enter}");
+    await waitFor(() => assert.deepEqual(calls, [["onBuiltinCommand", "/btw what is 2+2"]]));
+    await waitFor(() => assert.equal(screen.getByRole("textbox").value, ""));
+  });
+}
+
+for (const behavior of ["queue", "steer"]) {
+  test(`/btw offers Send during a run regardless of the ${behavior} preference`, async () => {
+    localStorage.setItem("omp-web:submit-during-run", behavior);
+    const user = userEvent.setup();
+    const { calls } = renderComposer({ isStreaming: true });
+    await user.type(screen.getByRole("textbox"), "/btw what is 2+2");
+    await user.click(screen.getByRole("button", { name: "Send", exact: true }));
+    await waitFor(() => assert.deepEqual(calls, [["onBuiltinCommand", "/btw what is 2+2"]]));
+    await waitFor(() => assert.equal(screen.getByRole("textbox").value, ""));
+  });
+}
+
+test("without builtin dispatch, /btw during a run keeps the Queue button and queues as ordinary text", async () => {
+  localStorage.setItem("omp-web:submit-during-run", "queue");
+  const user = userEvent.setup();
+  const { calls } = renderComposer({ isStreaming: true, onBuiltinCommand: undefined });
+  await user.type(screen.getByRole("textbox"), "/btw what is 2+2");
+  assert.equal(screen.queryByRole("button", { name: "Send", exact: true }), null);
+  await user.keyboard("{Enter}");
+  await waitFor(() => assert.deepEqual(calls, [["onFollowUp", "/btw what is 2+2"]]));
+});
+
+test("/btw with an attachment is refused and keeps the draft and the attachment", async () => {
+  const user = userEvent.setup();
+  const { calls, ref } = renderComposer({ isStreaming: false });
+  await act(async () => {
+    ref.current.addFiles([new File(["notes"], "notes.txt", { type: "text/plain" })]);
+  });
+  await waitFor(() => assert.equal(getDraft("btw-draft")?.files.length, 1));
+  await user.type(screen.getByRole("textbox"), "/btw what is this");
+  await user.keyboard("{Enter}");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(calls, []);
+  assert.equal(screen.getByRole("textbox").value, "/btw what is this");
+  assert.equal(getDraft("btw-draft")?.files.length, 1);
+});
+
+test("slash palette keeps /btw available during a streaming run", async () => {
+  const user = userEvent.setup();
+  renderComposer({ isStreaming: true });
+  await user.type(screen.getByRole("textbox"), "/bt");
+  await waitFor(() => assert.ok(screen.getByText("/btw")));
+});
+
+test("/btw Send button refuses pending uploads immediately with the attachment error", async () => {
+  const user = userEvent.setup();
+  const { calls, ref } = renderComposer({ isStreaming: true });
+  // Attach an uploading file (20 MB exceeds inline text limit -> staged upload).
+  await act(async () => {
+    ref.current.addFiles([new File([new Uint8Array(6 * 1024 * 1024)], "big.bin", { type: "application/octet-stream" })]);
+  });
+  await user.type(screen.getByRole("textbox"), "/btw what is this");
+  const sendBtn = screen.getByRole("button", { name: "Send", exact: true });
+  assert.equal(sendBtn.disabled, false);
+  await user.click(sendBtn);
+  assert.deepEqual(calls, []);
+  assert.equal(screen.getByRole("textbox").value, "/btw what is this");
+});

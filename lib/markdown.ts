@@ -10,6 +10,11 @@ const markdownSanitizeSchema = {
     ...defaultSchema.attributes,
     code: [["className", /^language-./, "math-inline", "math-display"]],
   },
+  // `agent://` subagent handles are opened in-app by MarkdownBody; so are Windows drive paths (`C:\…`), which read as a one-letter scheme.
+  protocols: {
+    ...defaultSchema.protocols,
+    href: [...(defaultSchema.protocols?.href ?? []), "agent", ..."ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"],
+  },
   strip: [...(defaultSchema.strip || []), "iframe", "object", "style", "form"],
 };
 
@@ -43,18 +48,42 @@ export function containsMathSyntax(markdown: string): boolean {
   return markdown.includes("$") || markdown.includes("\\(") || markdown.includes("\\[");
 }
 
-/** Loads remark-math + rehype-katex + the KaTeX CSS once, caching module-level. */
+const RAW_CODE_CLOSE_PATTERNS: Record<string, RegExp> = {
+  code: /<\/code\s*>/i,
+  pre: /<\/pre\s*>/i,
+  script: /<\/script\s*>/i,
+  style: /<\/style\s*>/i,
+};
+
+function getRawCodeClosePattern(tag: string): RegExp {
+  return RAW_CODE_CLOSE_PATTERNS[tag] ?? new RegExp(`</${tag}\\s*>`, "i");
+}
+
+let katexCssPromise: Promise<void> | undefined;
+
+/** Links the KaTeX CSS (served at /katex/, kept out of the entry chunk) once; settles on load or error so a failed fetch never blocks rendering. */
+function loadKatexCss(): Promise<void> {
+  katexCssPromise ??= new Promise((resolve) => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "/katex/katex.min.css";
+    link.dataset.katex = "";
+    link.addEventListener("load", () => resolve());
+    link.addEventListener("error", () => resolve());
+    document.head.append(link);
+  });
+  return katexCssPromise;
+}
+
+/** Loads remark-math + rehype-katex once (module-level cache) and waits for the KaTeX CSS in the browser. */
 export function loadMathMarkdownPlugins(): Promise<MarkdownPlugins> {
   if (!mathMarkdownPluginsPromise) {
     mathMarkdownPluginsPromise = (async () => {
       const [remarkMath, rehypeKatex] = await Promise.all([
-        import("remark-math").then((m) => m.default),
+        import("./remark-pandoc-math").then((m) => m.default),
         import("rehype-katex").then((m) => m.default),
       ]);
-      if (typeof window !== "undefined") {
-        // KaTeX styles are only needed (and only loadable) in the browser.
-        await import("katex/dist/katex.min.css");
-      }
+      if (typeof document !== "undefined") await loadKatexCss();
       mathMarkdownPlugins = {
         remarkPlugins: [...baseMarkdownPlugins.remarkPlugins, remarkMath],
         rehypePlugins: [
@@ -98,6 +127,7 @@ export function useMarkdownPlugins(markdown: string): MarkdownPlugins {
 }
 
 export function normalizeDisplayMath(markdown: string): string {
+  if (!containsMathSyntax(markdown)) return markdown;
   const lineBreak = markdown.includes("\r\n") ? "\r\n" : "\n";
   const lines = markdown.split(/\r?\n/);
   const normalized: string[] = [];
@@ -111,7 +141,7 @@ export function normalizeDisplayMath(markdown: string): string {
 
     if (rawCodeTag) {
       normalized.push(line);
-      if (new RegExp(`</${rawCodeTag}\\s*>`, "i").test(line)) rawCodeTag = null;
+      if (getRawCodeClosePattern(rawCodeTag).test(line)) rawCodeTag = null;
       continue;
     }
 
@@ -135,7 +165,7 @@ export function normalizeDisplayMath(markdown: string): string {
     if (rawCodeOpen) {
       const tag = rawCodeOpen[1].toLowerCase();
       const remainder = line.slice((rawCodeOpen.index ?? 0) + rawCodeOpen[0].length);
-      if (!new RegExp(`</${tag}\\s*>`, "i").test(remainder)) rawCodeTag = tag;
+      if (!getRawCodeClosePattern(tag).test(remainder)) rawCodeTag = tag;
       inlineCodeMarkerSize = 0;
       normalized.push(line);
       continue;
@@ -353,8 +383,9 @@ function normalizeInlineLatexMath(line: string): string {
     return line;
   }
 
+  // `$$…$$` inline: explicit `\(…\)` is math, so the single-dollar price rule (remark-pandoc-math) must not apply.
   return line.replace(
     /(?<!\\)\\\(([^`\r\n$]+?)(?<!\\)\\\)/g,
-    (match, math: string) => (math.trim() ? `$${math}$` : match),
+    (match, math: string) => (math.trim() ? `$$${math}$$` : match),
   );
 }

@@ -1,6 +1,16 @@
 export interface ModelsData {
   models: Record<string, string>;
-  modelList: { id: string; name: string; provider: string; supportsFastMode?: boolean }[];
+  modelList: {
+    id: string;
+    name: string;
+    provider: string;
+    supportsFastMode?: boolean;
+    supportsSlowMode?: boolean;
+    /** Vendor lineage/family/revision classification, when the catalog provided one. */
+    identity?: { class: string; family?: string; revision?: string };
+    /** `cost.output` (USD per Mtok) from the catalog; absent for unpriced/unknown models. */
+    costOutput?: number;
+  }[];
   defaultModel: { provider: string; modelId: string } | null;
   thinkingLevels: Record<string, string[]>;
   connectedProviders?: { id: string; name: string; disabled: boolean }[];

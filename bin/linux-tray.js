@@ -1,5 +1,8 @@
 "use strict";
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+require("./node-version").exitIfUnsupportedNode();
+
 // Linux system tray for ompweb (KDE Plasma and any StatusNotifierItem host).
 //
 // Registers a StatusNotifierItem on the session bus with a DBusMenu context
@@ -15,8 +18,6 @@
 //   ompweb-tray --open                       open the web UI in the browser
 //   -p, --port / -H, --hostname              override status endpoint
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const dbus = require("dbus-next");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { parseArgs } = require("util");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -34,9 +35,235 @@ const path = require("node:path");
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { readServiceEnv, writeServiceEnv } = require("./service-env");// eslint-disable-next-line @typescript-eslint/no-require-imports
 const { getAccessibleAddresses, isLoopbackHost } = require("./network-addresses");
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { hashPassword } = require("./omp-web-password-hash");
 
-const { Interface } = dbus.interface;
-const { Variant } = dbus;
+// dbus-next is intentionally NOT a dependency of ompweb (see #268): it
+// pulled in usocket/node-gyp@7 and ten deprecated packages on every
+// install, while only the Linux tray uses it. It is loaded on demand
+// below, and the tray installs it (or tells the user how to) at setup
+// time. Pure helpers that build menu Variants keep working without it
+// via FallbackVariant, which only needs the .value the tests and the
+// menu code read; the real D-Bus path always uses the real Variant.
+const DBUS_MISSING_MESSAGE =
+  "The Linux tray requires dbus-next, which is not bundled with ompweb. " +
+  "Install it with: npm install dbus-next@^0.10.2 " +
+  "(in the ompweb install directory, or globally with npm install -g dbus-next@^0.10.2), " +
+  "then run the tray command again.";
+
+class FallbackVariant {
+  constructor(signature, value) {
+    this.signature = signature;
+    this.value = value;
+  }
+}
+
+function loadDbus() {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return require("dbus-next");
+  } catch {
+    const err = new Error(DBUS_MISSING_MESSAGE);
+    err.code = "DBUS_NEXT_MISSING";
+    throw err;
+  }
+}
+
+function getVariant() {
+  try {
+    return loadDbus().Variant;
+  } catch {
+    return FallbackVariant;
+  }
+}
+
+let cachedDbusClasses = null;
+// The D-Bus interface classes extend dbus-next's Interface, so they can
+// only be defined once dbus-next is actually loaded. Defining them here,
+// inside the factory, is what keeps requiring this module (and its pure
+// helpers, which the tests import) from pulling in dbus-next at all.
+function getDbusClasses() {
+  if (cachedDbusClasses) return cachedDbusClasses;
+  const dbus = loadDbus();
+  const { Interface } = dbus.interface;
+  class StatusNotifierItem extends Interface {
+    constructor(state) {
+      super("org.kde.StatusNotifierItem");
+      this.state = state;
+    }
+
+    get Status() {
+      return "Active";
+    }
+
+    // IconName stays empty on purpose: Plasma prefers the theme name when
+    // non-empty and renders an unresolvable name as nothing. Shipping real
+    // ARGB pixels (IconPixmap) renders deterministically on every host.
+    get IconName() {
+      return "";
+    }
+
+    get IconPixmap() {
+      return buildIconPixmap(this.state.running);
+    }
+
+    get ToolTip() {
+      return [
+        "",
+        this.state.running ? buildIconPixmap(true) : buildIconPixmap(false),
+        "ompweb",
+        this.state.running ? `Running — ${this.state.serviceUrl}` : "Service stopped",
+      ];
+    }
+
+    Activate() {
+      openUrl(this.state.serviceUrl);
+    }
+
+    SecondaryActivate() {
+      openUrl(this.state.serviceUrl);
+    }
+
+    Scroll() {}
+
+    // Signal emitters — dbus-next emits the returned value as the signal body.
+    NewTitle(...args) { return args; }
+    NewIcon(...args) { return args; }
+    NewAttentionIcon(...args) { return args; }
+    NewOverlayIcon(...args) { return args; }
+    NewToolTip(...args) { return args; }
+    NewStatus(...args) { return args; }
+  }
+
+  StatusNotifierItem.configureMembers({
+    properties: {
+      Category: { signature: "s", access: "read" },
+      Id: { signature: "s", access: "read" },
+      Title: { signature: "s", access: "read" },
+      Status: { signature: "s", access: "read" },
+      WindowId: { signature: "i", access: "read" },
+      IconName: { signature: "s", access: "read" },
+      // KDE marshals tray pixmaps as (width, height, ARGB32 byte array).
+      IconPixmap: { signature: "a(iiay)", access: "read" },
+      AttentionIconName: { signature: "s", access: "read" },
+      AttentionIconPixmap: { signature: "a(iiay)", access: "read" },
+      OverlayIconName: { signature: "s", access: "read" },
+      OverlayIconPixmap: { signature: "a(iiay)", access: "read" },
+      ToolTip: { signature: "(sa(iiay)ss)", access: "read" },
+      Menu: { signature: "o", access: "read" },
+      ItemIsMenu: { signature: "b", access: "read" },
+    },
+    methods: {
+      Activate: { inSignature: "ii", outSignature: "" },
+      SecondaryActivate: { inSignature: "ii", outSignature: "" },
+      Scroll: { inSignature: "is", outSignature: "" },
+    },
+    signals: {
+      NewTitle: { signature: "" },
+      NewIcon: { signature: "" },
+      NewAttentionIcon: { signature: "" },
+      NewOverlayIcon: { signature: "" },
+      NewToolTip: { signature: "" },
+      NewStatus: { signature: "s" },
+    },
+  });
+
+  StatusNotifierItem.prototype.Category = "ApplicationStatus";
+  StatusNotifierItem.prototype.Id = "ompweb";
+  StatusNotifierItem.prototype.Title = "ompweb";
+  // Status, IconName, IconPixmap, and ToolTip stay as class getters (dynamic).
+  StatusNotifierItem.prototype.WindowId = 0;
+  StatusNotifierItem.prototype.AttentionIconName = "";
+  StatusNotifierItem.prototype.AttentionIconPixmap = [];
+  StatusNotifierItem.prototype.OverlayIconName = "";
+  StatusNotifierItem.prototype.OverlayIconPixmap = [];
+  StatusNotifierItem.prototype.ItemIsMenu = true;
+  StatusNotifierItem.prototype.Menu = MENU_PATH;
+
+  class DbusMenu extends Interface {
+    constructor(state) {
+      super("com.canonical.dbusmenu");
+      this.state = state;
+    }
+
+    GetLayout(parentId) {
+      return buildLayout(this.state.menuItems(), this.state.menuRevision, Number(parentId) || 0);
+    }
+
+    GetGroupProperties(ids) {
+      const items = this.state.menuItems();
+      const found = ids
+        .map((id) => itemById(items, Number(id)))
+        .filter(Boolean)
+        .map((item) => [item.id, itemProperties(item)]);
+      return [found, []];
+    }
+
+    AboutToShow() {
+      return false;
+    }
+
+    async Event(id, event) {
+      await this.state.handleEvent(Number(id), String(event));
+    }
+
+    EventGroup(events) {
+      for (const entry of events ?? []) {
+        const [id, event] = entry;
+        this.state.handleEvent(Number(id), String(event));
+      }
+      return [[]];
+    }
+
+    // Signal emitters — dbus-next emits the returned value as the signal body.
+    LayoutUpdated(...args) { return args; }
+    ItemsPropertiesUpdated(...args) { return args; }
+  }
+
+  DbusMenu.configureMembers({
+    properties: {
+      Version: { signature: "u", access: "read" },
+      TextDirection: { signature: "s", access: "read" },
+      Status: { signature: "s", access: "read" },
+      IconThemePath: { signature: "s", access: "read" },
+    },
+    methods: {
+      GetLayout: { inSignature: "iias", outSignature: "u(ia{sv}av)" },
+      GetGroupProperties: { inSignature: "aias", outSignature: "a(ia{sv})as" },
+      AboutToShow: { inSignature: "i", outSignature: "b" },
+      Event: { inSignature: "isvu", outSignature: "" },
+      EventGroup: { inSignature: "a(isvu)", outSignature: "ab" },
+    },
+    signals: {
+      LayoutUpdated: { signature: "ui" },
+      ItemsPropertiesUpdated: { signature: "a(ia{sv})a(ia{sv})" },
+    },
+  });
+
+  DbusMenu.prototype.Version = 3;
+  DbusMenu.prototype.TextDirection = "ltr";
+  DbusMenu.prototype.Status = "normal";
+  DbusMenu.prototype.IconThemePath = "";
+
+  class TrayControl extends Interface {
+    constructor(state) {
+      super("org.kde.ompweb.Tray");
+      this.state = state;
+    }
+
+    Quit() {
+      this.state.quit();
+    }
+  }
+
+  TrayControl.configureMembers({
+    methods: {
+      Quit: { inSignature: "", outSignature: "" },
+    },
+  });
+  cachedDbusClasses = { Interface, StatusNotifierItem, DbusMenu, TrayControl };
+  return cachedDbusClasses;
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -45,6 +272,7 @@ const ITEM_PATH = "/StatusNotifierItem";
 const MENU_PATH = "/MenuBar";
 const TRAY_PATH = "/ompweb/tray";
 const SERVICE_UNIT = "ompweb.service";
+const DAEMON_UNIT = "ompweb-host.service";
 const AUTOSTART_FILE = path.join(os.homedir(), ".config", "autostart", "ompweb-tray.desktop");
 const ICON_DIR = path.join(os.homedir(), ".local", "share", "icons", "hicolor", "scalable", "apps");
 const POLL_INTERVAL_MS = 5000;
@@ -223,15 +451,17 @@ function readTrayConfig(overrides = {}, env = process.env, home = os.homedir()) 
 
 // Menu item table. `separator` items render as dividers; `checkmark` items
 // carry a toggle state; `disabled` items are inert status rows.
-function buildMenuItems({ running, version, autostart, hasService, exposed, hasDialogTool }) {
+// `daemon` is "running", "stopped" or "not installed" (the ompweb-host unit).
+function buildMenuItems({ running, version, autostart, hasService, exposed, hasDialogTool, daemon = "not installed" }) {
   return [
     { id: 1, label: `ompweb (v${version})`, enabled: false },
     { id: 2, label: running ? "  Status: Running" : "  Status: Stopped", enabled: false },
+    { id: 19, label: `  Daemon: ${daemon[0].toUpperCase()}${daemon.slice(1)}`, enabled: false },
     { id: 3, separator: true },
     { id: 4, label: "Open in Browser", action: "open" },
     { id: 5, label: "Copy Web URL", action: "copy" },
     { id: 6, separator: true },
-    { id: 7, label: running ? "Stop Server" : "Start Server", action: "toggle", enabled: hasService },
+    { id: 7, label: running ? "Stop Server (omp runs keep going)" : "Start Server", action: "toggle", enabled: hasService },
     { id: 8, label: "Restart Server", action: "restart", enabled: hasService },
     { id: 9, separator: true },
     { id: 10, label: "View Logs", action: "logs" },
@@ -257,32 +487,32 @@ function buildMenuItems({ running, version, autostart, hasService, exposed, hasD
 function itemProperties(item) {
   if (item.separator) {
     return {
-      type: new Variant("s", "separator"),
-      visible: new Variant("b", true),
+      type: new (getVariant())("s", "separator"),
+      visible: new (getVariant())("b", true),
     };
   }
   const props = {
-    label: new Variant("s", item.label),
-    enabled: new Variant("b", item.enabled !== false),
-    visible: new Variant("b", true),
+    label: new (getVariant())("s", item.label),
+    enabled: new (getVariant())("b", item.enabled !== false),
+    visible: new (getVariant())("b", true),
   };
   if (item.checkmark) {
-    props["toggle-type"] = new Variant("s", "checkmark");
-    props["toggle-state"] = new Variant("i", item.state ?? 0);
+    props["toggle-type"] = new (getVariant())("s", "checkmark");
+    props["toggle-state"] = new (getVariant())("i", item.state ?? 0);
   }
   return props;
 }
 
 // (ia{sv}av) struct for one menu node; children wrapped in variants.
 function layoutNode(id, props, children = []) {
-  return [id, props, children.map((child) => new Variant("(ia{sv}av)", child))];
+  return [id, props, children.map((child) => new (getVariant())("(ia{sv}av)", child))];
 }
 
 // Full GetLayout response for the flat tray menu.
 function buildLayout(items, revision, parentId = 0) {
   if (parentId === 0) {
     const children = items.map((item) => layoutNode(item.id, itemProperties(item), []));
-    return [revision, layoutNode(0, { "children-display": new Variant("s", "submenu") }, children)];
+    return [revision, layoutNode(0, { "children-display": new (getVariant())("s", "submenu") }, children)];
   }
   const item = items.find((entry) => entry.id === parentId);
   if (!item) return [revision, layoutNode(parentId, {}, [])];
@@ -340,7 +570,8 @@ function terminalPrefix(terminal) {
 
 function isExecutable(candidate) {
   try {
-    return fs.statSync(candidate).isFile() && fs.accessSync(candidate, fs.constants.X_OK) === undefined;
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return fs.statSync(candidate).isFile();
   } catch {
     return false;
   }
@@ -438,9 +669,18 @@ function systemctlUser(args) {
   };
 }
 
-function serviceInstalled() {
+function unitInstalled(unit) {
   const dir = process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config");
-  return fs.existsSync(path.join(dir, "systemd", "user", SERVICE_UNIT));
+  return fs.existsSync(path.join(dir, "systemd", "user", unit));
+}
+
+function serviceInstalled() {
+  return unitInstalled(SERVICE_UNIT);
+}
+
+function daemonState() {
+  if (!unitInstalled(DAEMON_UNIT)) return "not installed";
+  return systemctlUser(["is-active", DAEMON_UNIT]).stdout === "active" ? "running" : "stopped";
 }
 
 function openUrl(url) {
@@ -464,7 +704,7 @@ function viewLogs() {
   const resolved = candidateBinPath(terminal);
   if (!resolved) return false;
   const prefix = terminalPrefix(terminal).slice(1);
-  const child = spawn(resolved, [...prefix, `journalctl --user -u ompweb -f`], {
+  const child = spawn(resolved, [...prefix, `journalctl --user -u ompweb -u ompweb-host -f`], {
     stdio: "ignore",
     detached: true,
     env: process.env,
@@ -479,186 +719,7 @@ function candidateBinPath(terminal) {
   return which(path.basename(terminal)) ?? terminal;
 }
 
-// ---------------------------------------------------------------------------
-// DBus interfaces
-// ---------------------------------------------------------------------------
-
-class StatusNotifierItem extends Interface {
-  constructor(state) {
-    super("org.kde.StatusNotifierItem");
-    this.state = state;
-  }
-
-  get Status() {
-    return "Active";
-  }
-
-  // IconName stays empty on purpose: Plasma prefers the theme name when
-  // non-empty and renders an unresolvable name as nothing. Shipping real
-  // ARGB pixels (IconPixmap) renders deterministically on every host.
-  get IconName() {
-    return "";
-  }
-
-  get IconPixmap() {
-    return buildIconPixmap(this.state.running);
-  }
-
-  get ToolTip() {
-    return [
-      "",
-      this.state.running ? buildIconPixmap(true) : buildIconPixmap(false),
-      "ompweb",
-      this.state.running ? `Running — ${this.state.serviceUrl}` : "Service stopped",
-    ];
-  }
-
-  Activate() {
-    openUrl(this.state.serviceUrl);
-  }
-
-  SecondaryActivate() {
-    openUrl(this.state.serviceUrl);
-  }
-
-  Scroll() {}
-
-  // Signal emitters — dbus-next emits the returned value as the signal body.
-  NewTitle(...args) { return args; }
-  NewIcon(...args) { return args; }
-  NewAttentionIcon(...args) { return args; }
-  NewOverlayIcon(...args) { return args; }
-  NewToolTip(...args) { return args; }
-  NewStatus(...args) { return args; }
-}
-
-StatusNotifierItem.configureMembers({
-  properties: {
-    Category: { signature: "s", access: "read" },
-    Id: { signature: "s", access: "read" },
-    Title: { signature: "s", access: "read" },
-    Status: { signature: "s", access: "read" },
-    WindowId: { signature: "i", access: "read" },
-    IconName: { signature: "s", access: "read" },
-    // KDE marshals tray pixmaps as (width, height, ARGB32 byte array).
-    IconPixmap: { signature: "a(iiay)", access: "read" },
-    AttentionIconName: { signature: "s", access: "read" },
-    AttentionIconPixmap: { signature: "a(iiay)", access: "read" },
-    OverlayIconName: { signature: "s", access: "read" },
-    OverlayIconPixmap: { signature: "a(iiay)", access: "read" },
-    ToolTip: { signature: "(sa(iiay)ss)", access: "read" },
-    Menu: { signature: "o", access: "read" },
-    ItemIsMenu: { signature: "b", access: "read" },
-  },
-  methods: {
-    Activate: { inSignature: "ii", outSignature: "" },
-    SecondaryActivate: { inSignature: "ii", outSignature: "" },
-    Scroll: { inSignature: "is", outSignature: "" },
-  },
-  signals: {
-    NewTitle: { signature: "" },
-    NewIcon: { signature: "" },
-    NewAttentionIcon: { signature: "" },
-    NewOverlayIcon: { signature: "" },
-    NewToolTip: { signature: "" },
-    NewStatus: { signature: "s" },
-  },
-});
-
-StatusNotifierItem.prototype.Category = "ApplicationStatus";
-StatusNotifierItem.prototype.Id = "ompweb";
-StatusNotifierItem.prototype.Title = "ompweb";
-// Status, IconName, IconPixmap, and ToolTip stay as class getters (dynamic).
-StatusNotifierItem.prototype.WindowId = 0;
-StatusNotifierItem.prototype.AttentionIconName = "";
-StatusNotifierItem.prototype.AttentionIconPixmap = [];
-StatusNotifierItem.prototype.OverlayIconName = "";
-StatusNotifierItem.prototype.OverlayIconPixmap = [];
-StatusNotifierItem.prototype.ItemIsMenu = true;
-StatusNotifierItem.prototype.Menu = MENU_PATH;
-
-class DbusMenu extends Interface {
-  constructor(state) {
-    super("com.canonical.dbusmenu");
-    this.state = state;
-  }
-
-  GetLayout(parentId) {
-    return buildLayout(this.state.menuItems(), this.state.menuRevision, Number(parentId) || 0);
-  }
-
-  GetGroupProperties(ids) {
-    const items = this.state.menuItems();
-    const found = ids
-      .map((id) => itemById(items, Number(id)))
-      .filter(Boolean)
-      .map((item) => [item.id, itemProperties(item)]);
-    return [found, []];
-  }
-
-  AboutToShow() {
-    return false;
-  }
-
-  async Event(id, event) {
-    await this.state.handleEvent(Number(id), String(event));
-  }
-
-  EventGroup(events) {
-    for (const entry of events ?? []) {
-      const [id, event] = entry;
-      this.state.handleEvent(Number(id), String(event));
-    }
-    return [[]];
-  }
-
-  // Signal emitters — dbus-next emits the returned value as the signal body.
-  LayoutUpdated(...args) { return args; }
-  ItemsPropertiesUpdated(...args) { return args; }
-}
-
-DbusMenu.configureMembers({
-  properties: {
-    Version: { signature: "u", access: "read" },
-    TextDirection: { signature: "s", access: "read" },
-    Status: { signature: "s", access: "read" },
-    IconThemePath: { signature: "s", access: "read" },
-  },
-  methods: {
-    GetLayout: { inSignature: "iias", outSignature: "u(ia{sv}av)" },
-    GetGroupProperties: { inSignature: "aias", outSignature: "a(ia{sv})as" },
-    AboutToShow: { inSignature: "i", outSignature: "b" },
-    Event: { inSignature: "isvu", outSignature: "" },
-    EventGroup: { inSignature: "a(isvu)", outSignature: "ab" },
-  },
-  signals: {
-    LayoutUpdated: { signature: "ui" },
-    ItemsPropertiesUpdated: { signature: "a(ia{sv})a(ia{sv})" },
-  },
-});
-
-DbusMenu.prototype.Version = 3;
-DbusMenu.prototype.TextDirection = "ltr";
-DbusMenu.prototype.Status = "normal";
-DbusMenu.prototype.IconThemePath = "";
-
-class TrayControl extends Interface {
-  constructor(state) {
-    super("org.kde.ompweb.Tray");
-    this.state = state;
-  }
-
-  Quit() {
-    this.state.quit();
-  }
-}
-
-TrayControl.configureMembers({
-  methods: {
-    Quit: { inSignature: "", outSignature: "" },
-  },
-});
-
+// D-Bus interface classes are defined lazily in getDbusClasses() below.
 // ---------------------------------------------------------------------------
 // Tray state machine
 // ---------------------------------------------------------------------------
@@ -682,6 +743,7 @@ function createTrayState(config, { log = console.log } = {}) {
     port: config.port,
     hostname: config.hostname,
     version: readPackageVersion(),
+    daemon: daemonState(),
   };
 
   state.menuItems = () =>
@@ -692,6 +754,7 @@ function createTrayState(config, { log = console.log } = {}) {
       hasService: state.hasService,
       exposed: state.exposed,
       hasDialogTool: state.dialogTool !== null,
+      daemon: state.daemon,
     });
 
   // Re-read the env file after config changes and refresh icon + menu.
@@ -735,7 +798,7 @@ function createTrayState(config, { log = console.log } = {}) {
 
   state.refreshIcon = () => {
     if (!state.sni) return;
-    Interface.emitPropertiesChanged(state.sni, {
+    getDbusClasses().Interface.emitPropertiesChanged(state.sni, {
       IconName: "",
       IconPixmap: buildIconPixmap(state.running),
       ToolTip: ["", buildIconPixmap(state.running), "ompweb", state.running ? `Running — ${state.serviceUrl}` : "Service stopped"],
@@ -770,7 +833,7 @@ function createTrayState(config, { log = console.log } = {}) {
       case "expose": {
         const exposing = !state.exposed;
         const updates = { OMP_WEB_HOSTNAME: exposing ? "0.0.0.0" : "127.0.0.1" };
-        if (exposing && !readServiceEnv().OMP_WEB_PASSWORD) {
+        if (exposing && !readServiceEnv().OMP_WEB_PASSWORD_HASH) {
           const password = await dialogPrompt({
             tool: state.dialogTool,
             title: "ompweb",
@@ -781,7 +844,7 @@ function createTrayState(config, { log = console.log } = {}) {
             state.notify("ompweb", "Expose cancelled: a password is required to leave loopback");
             break;
           }
-          updates.OMP_WEB_PASSWORD = password;
+          updates.OMP_WEB_PASSWORD_HASH = hashPassword(password);
         }
         if (state.applyServiceEnv(updates)) {
           const urls = getAccessibleAddresses({ hostname: state.hostname, port: state.port }).entries
@@ -824,9 +887,9 @@ function createTrayState(config, { log = console.log } = {}) {
         if (password === null) break;
         const updates = {};
         if (password) {
-          updates.OMP_WEB_PASSWORD = password;
+          updates.OMP_WEB_PASSWORD_HASH = hashPassword(password);
         } else {
-          updates.OMP_WEB_PASSWORD = null;
+          updates.OMP_WEB_PASSWORD_HASH = null;
           if (!isLoopbackHost(state.hostname)) updates.OMP_WEB_HOSTNAME = "127.0.0.1";
         }
         if (state.applyServiceEnv(updates)) {
@@ -878,11 +941,13 @@ function createTrayState(config, { log = console.log } = {}) {
     }
     const hadService = state.hasService;
     state.hasService = serviceInstalled();
+    const hadDaemon = state.daemon;
+    state.daemon = daemonState();
     if (running !== wasRunning) {
       state.running = running;
       state.refreshIcon();
       state.refreshMenu();
-    } else if (state.hasService !== hadService) {
+    } else if (state.hasService !== hadService || state.daemon !== hadDaemon) {
       state.refreshMenu();
     }
   };
@@ -920,12 +985,15 @@ function createTrayState(config, { log = console.log } = {}) {
 }
 
 async function startTray(config, { log = console.log, error = console.error } = {}) {
+  // Fail fast, before writing icons, if dbus-next is not installed: the
+  // error message tells the user exactly how to install it (#268).
+  const { StatusNotifierItem, DbusMenu, TrayControl } = getDbusClasses();
+  const bus = loadDbus().sessionBus();
   const state = createTrayState(config, { log });
 
   installIcons({ log });
   ensureIconThemeCache();
 
-  const bus = dbus.sessionBus();
   state.bus = bus;
 
   let nameReply;
@@ -1002,7 +1070,13 @@ async function getTrayRunning(bus) {
 }
 
 async function quitRunningTray() {
-  const bus = dbus.sessionBus();
+  let bus;
+  try {
+    bus = loadDbus().sessionBus();
+  } catch {
+    // Without D-Bus there is no tray to quit.
+    return false;
+  }
   try {
     const obj = await bus.getProxyObject(BUS_NAME, TRAY_PATH);
     const iface = obj.getInterface("org.kde.ompweb.Tray");
@@ -1019,7 +1093,7 @@ async function readStatus(overrides) {
   const config = readTrayConfig(overrides);
   let trayRunning = false;
   try {
-    const bus = dbus.sessionBus();
+    const bus = loadDbus().sessionBus();
     try {
       trayRunning = await getTrayRunning(bus);
     } finally {
@@ -1037,6 +1111,7 @@ async function readStatus(overrides) {
     trayRunning,
     serviceInstalled: serviceInstalled(),
     serviceRunning,
+    daemon: daemonState(),
     autostart,
     port: config.port,
     hostname: config.hostname,
@@ -1045,6 +1120,43 @@ async function readStatus(overrides) {
     autostartFile: AUTOSTART_FILE,
     version: readPackageVersion(),
   };
+}
+
+// Best-effort on-demand install of dbus-next, used only by --install:
+// the user explicitly opted into tray setup, so installing the tray's
+// own dependency into the ompweb install directory is in scope there.
+// --start/--restart never auto-install (they can run unattended from
+// autostart); they fail with DBUS_MISSING_MESSAGE instead.
+function defaultNpmInstallDbus() {
+  try {
+    const res = spawnSync("npm", ["install", "dbus-next@^0.10.2", "--no-save"], {
+      cwd: path.join(__dirname, ".."),
+      stdio: "inherit",
+    });
+    return res && res.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function ensureDbusInstalled({ runInstall = defaultNpmInstallDbus } = {}) {
+  try {
+    loadDbus();
+    return true;
+  } catch {
+    // Fall through to the install attempt below.
+  }
+  try {
+    if (!runInstall()) return false;
+  } catch {
+    return false;
+  }
+  try {
+    loadDbus();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function spawnDetachedTray() {
@@ -1100,6 +1212,10 @@ async function runCli(argv = process.argv.slice(2)) {
   };
 
   if (has("install")) {
+    if (!ensureDbusInstalled()) {
+      console.error(`error: ${DBUS_MISSING_MESSAGE}`);
+      return { exitCode: 1 };
+    }
     installIcons();
     ensureIconThemeCache();
     if (!cliArgs["no-autostart"]) {
@@ -1122,7 +1238,15 @@ async function runCli(argv = process.argv.slice(2)) {
 
   if (has("start")) {
     const config = readTrayConfig(overrides);
-    await startTray(config);
+    try {
+      await startTray(config);
+    } catch (err) {
+      if (err && err.code === "DBUS_NEXT_MISSING") {
+        console.error(`error: ${err.message}`);
+        return { exitCode: 1 };
+      }
+      throw err;
+    }
     return { exitCode: 0 };
   }
 
@@ -1133,6 +1257,14 @@ async function runCli(argv = process.argv.slice(2)) {
   }
 
   if (has("restart")) {
+    try {
+      loadDbus();
+    } catch (err) {
+      // The detached --start child would swallow this error (stdio:
+      // ignore), so fail here, visibly, instead of spawning it.
+      console.error(`error: ${err.message}`);
+      return { exitCode: 1 };
+    }
     await quitRunningTray();
     installIcons();
     spawnDetachedTray();
@@ -1154,6 +1286,7 @@ async function runCli(argv = process.argv.slice(2)) {
     console.log(`=== ompweb Linux tray status ===`);
     console.log(`  Tray running    : ${status.trayRunning ? "Yes" : "No"}`);
     console.log(`  Service unit    : ${status.serviceInstalled ? "installed" : "not installed"} (${status.serviceRunning ? "active" : "inactive"})`);
+    console.log(`  Host daemon     : ${status.daemon}`);
     console.log(`  Autostart       : ${status.autostart ? `enabled (${status.autostartFile})` : "disabled"}`);
     console.log(`  Live URL        : ${status.serviceUrl}`);
   }
@@ -1183,6 +1316,7 @@ module.exports = {
   buildTrayIconPixels,
   dialogCandidates,
   dialogPrompt,
+  ensureDbusInstalled,
   itemById,
   itemProperties,
   layoutNode,

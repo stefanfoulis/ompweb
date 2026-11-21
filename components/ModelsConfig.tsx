@@ -24,6 +24,7 @@ import { Plus, Trash2, RefreshCw, AlertCircle, Cpu, Settings, Sparkles, Check as
 import { toast } from "@/components/ui/toast";
 import { SettingsTabs, type SettingsTab } from "./SettingsTabs";
 import { ModelCatalogPicker } from "./ModelCatalogPicker";
+import { ProviderAccounts } from "./ProviderAccounts";
 import {
   API_OPTIONS,
   COMPOSER_MODELS_STORAGE_KEY,
@@ -783,6 +784,8 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
   const { t, tn } = useI18n();
   const [loginState, setLoginState] = useState<OAuthLoginState>({ phase: "idle" });
   const [inputValue, setInputValue] = useState("");
+  // Bumped on login so the account list remounts and shows the new account.
+  const [accountsVersion, setAccountsVersion] = useState(0);
   const eventSourceRef = useRef<EventSource | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -846,6 +849,7 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
       } else if (data.type === "success") {
         es.close();
         setLoginState({ phase: "success" });
+        setAccountsVersion((v) => v + 1);
         onRefresh();
       } else if (data.type === "error") {
         es.close();
@@ -860,22 +864,6 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
       setLoginState((prev) => prev.phase === "success" ? prev : { phase: "error", message: t("modelsConfig.connectionLost") });
     };
   }, [provider.id, onRefresh, t]);
-
-  const handleLogout = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/auth/logout/${encodeURIComponent(provider.id)}`, { method: "POST" });
-      const d = await res.json().catch(() => ({})) as { error?: string; code?: string };
-      if (!res.ok || d.error) {
-        // omp has no logout RPC/CLI surface; the route returns 501 with guidance.
-        setLoginState({ phase: "error", message: d.error || d.code ? formatApiError(d) : `HTTP ${res.status}` });
-        return;
-      }
-      setLoginState({ phase: "idle" });
-      onRefresh();
-    } catch (e) {
-      setLoginState({ phase: "error", message: e instanceof Error ? e.message : String(e) });
-    }
-  }, [provider.id, onRefresh]);
 
   const submitCode = useCallback(async (token: string, code: string) => {
     if (!code.trim()) return;
@@ -1019,6 +1007,8 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
         )}
       </div>
 
+      <ProviderAccounts key={`${provider.id}:${accountsVersion}`} providerId={provider.id} enabled={provider.loggedIn} onChanged={onRefresh} />
+
       {/* Actions */}
       <div style={{ display: "flex", gap: 8 }}>
         {isWorking ? (
@@ -1029,22 +1019,12 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
             {t("modelsConfig.cancel")}
           </button>
         ) : (
-          <>
-            <button
-              onClick={handleLogin}
-              style={{ padding: "5px 14px", background: "var(--accent-strong)", border: "none", borderRadius: 5, color: "var(--on-accent)", cursor: "pointer", fontSize: 12, fontWeight: 600 }}
-            >
-              {provider.loggedIn ? t("modelsConfig.relogin") : t("modelsConfig.login")}
-            </button>
-            {provider.loggedIn && (
-              <button
-                onClick={handleLogout}
-                style={{ padding: "5px 12px", background: "none", border: "1px solid color-mix(in srgb, var(--status-error) 30%, transparent)", borderRadius: 5, color: "var(--status-error)", cursor: "pointer", fontSize: 12 }}
-              >
-                {t("modelsConfig.disconnect")}
-              </button>
-            )}
-          </>
+          <button
+            onClick={handleLogin}
+            style={{ padding: "5px 14px", background: "var(--accent-strong)", border: "none", borderRadius: 5, color: "var(--on-accent)", cursor: "pointer", fontSize: 12, fontWeight: 600 }}
+          >
+            {provider.loggedIn ? t("modelsConfig.addAccount") : t("modelsConfig.login")}
+          </button>
         )}
       </div>
     </div>
@@ -1858,6 +1838,9 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
                     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                       {providers.map(([pName, pData]) => {
                         const models = pData.models ?? [];
+                        const configuredIds = new Set(models.map((model) => model.id));
+                        const discoveredModels = (runtimeModelsByProvider[pName] ?? [])
+                          .filter((model) => !configuredIds.has(model.id));
                         return (
                           <div key={pName} className="settings-card" style={{ flexDirection: "column", alignItems: "stretch", gap: 12 }}>
                             <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -1906,7 +1889,7 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
                             </div>
 
                             {/* Models chips */}
-                            {models.length > 0 ? (
+                            {models.length > 0 || discoveredModels.length > 0 ? (
                               <div style={{ display: "flex", flexWrap: "wrap", gap: 6, paddingTop: 6, borderTop: "1px solid var(--border)" }}>
                                 {models.map((m, i) => (
                                   <button
@@ -1923,10 +1906,24 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
                                     {m.reasoning && <span style={{ fontSize: 9, padding: "0 3px", borderRadius: 2, background: "var(--accent-strong)", color: "var(--on-accent)", fontWeight: 700 }}>T</span>}
                                   </button>
                                 ))}
+                                {discoveredModels.map((model) => (
+                                  <span
+                                    key={model.id}
+                                    title="Automatically discovered by OMP"
+                                    style={{
+                                      display: "inline-flex", alignItems: "center", padding: "3px 8px",
+                                      borderRadius: 5, background: "var(--bg)", border: "1px solid var(--border)",
+                                      color: "var(--text)", fontFamily: "var(--font-mono)", fontSize: 11,
+                                      overflowWrap: "anywhere", minWidth: 0,
+                                    }}
+                                  >
+                                    {model.id}
+                                  </span>
+                                ))}
                               </div>
                             ) : (
                               <div style={{ fontSize: 11.5, color: "var(--text-dim)", paddingTop: 4, borderTop: "1px solid var(--border)" }}>
-                                No models defined yet. Click &quot;Add Model&quot; or &quot;Catalog&quot; above to configure models.
+                                {runtimeModelsLoading ? t("modelsConfig.loadingRuntimeModels") : <>No models configured or discovered. Click &quot;Add Model&quot; or &quot;Catalog&quot; above to configure models.</>}
                               </div>
                             )}
                           </div>

@@ -1,4 +1,4 @@
-import { existsSync, realpathSync, statSync } from "fs";
+import { existsSync, mkdirSync, realpathSync, statSync } from "fs";
 import { homedir, tmpdir } from "os";
 import * as path from "path";
 
@@ -32,12 +32,27 @@ export function getAgentDir(): string {
   return path.join(getConfigRoot(), "agent");
 }
 
+/** The agent directory, created owner-only when missing: omp runs there for a request at the user level, which has no
+ * project; a missing directory would otherwise fail the spawn as if omp itself were missing. */
+export function ensureAgentDir(): string {
+  const dir = getAgentDir();
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
 function isDefaultAgentDir(): boolean {
   const override = process.env.PI_CODING_AGENT_DIR;
   if (override) {
     return path.resolve(override) === path.join(getConfigRoot(), "agent");
   }
   return true;
+}
+
+/** omp-web's crash/stall journal directory: ~/.omp/omp-web, or
+ * <agent dir>/omp-web when PI_CODING_AGENT_DIR points elsewhere, so isolated
+ * runs (tests, dev servers) never write the real journal. */
+export function getDiagnosticsDir(): string {
+  return path.join(isDefaultAgentDir() ? getConfigRoot() : getAgentDir(), "omp-web");
 }
 
 /** XDG data root for the default agent dir: only honored on linux/darwin when
@@ -167,4 +182,16 @@ export function getProjectAgentsDir(cwd: string): string {
 /** Cache directory for unpacked bundled agents (temp). */
 export function getAgentsBundledCacheDir(): string {
   return path.join(tmpdir(), "omp-web-bundled-agents");
+}
+
+// omp's own rule (internal-urls/local-protocol.ts): long artifact paths move to the temp dir on Windows.
+const WINDOWS_LOCAL_ROOT_MAX_CHARS = 180;
+
+/** omp's `local://` root for a session (`resolveLocalRoot` in omp's local-protocol.ts). */
+export function sessionLocalRoot(sessionFile: string, sessionId: string, platform: NodeJS.Platform = process.platform): string {
+  const candidate = path.resolve(path.dirname(sessionFile), path.basename(sessionFile, ".jsonl"), "local");
+  if (platform === "win32" && candidate.length >= WINDOWS_LOCAL_ROOT_MAX_CHARS) {
+    return path.join(tmpdir(), "omp-local", sessionId.replace(/[^a-zA-Z0-9_.-]/g, "_"));
+  }
+  return candidate;
 }

@@ -1,23 +1,26 @@
 // Streaming/SSE, message-transform, subagent, and session-protocol helpers
-// extracted from useAgentSession (pure logic only — no hook state).
+// extracted from useAgentSession (no hook state; host tools may touch browser
+// notifications and the notification-center history).
 
 import type {
   AgentMessage,
   CustomMessage,
   ExtensionStatusItem,
-  ExtensionUiRequest,
   ExtensionWidgetItem,
   SessionTreeNode,
 } from "@/lib/types";
+import type { EventStream } from "@/lib/event-stream";
 import type { ThinkingModelMeta } from "@/lib/thinking-levels";
-import type { RpcAvailableSlashCommand, TodoPhase } from "@/lib/pi-types";
+import type { QueuedMessages, RpcAvailableSlashCommand, SlowModeScope, TodoPhase, UsageLimitState } from "@/lib/pi-types";
 import type {
   SubagentHistoryEntry,
   SubagentInfo,
   SubagentProgress,
 } from "@/lib/subagent-types";
 import { translate } from "@/lib/i18n";
+import { isLocalUri } from "@/lib/local-uri";
 import type { SessionStreamCursor } from "@/lib/session-sync";
+import type { ChatDraft } from "@/lib/draft-store";
 
 export interface SessionData {
   sessionId: string;
@@ -41,6 +44,14 @@ export interface StreamingState {
 export type StreamAction =
   | { type: "start" }
   | { type: "update"; message: Partial<AgentMessage> }
+  /** A finished reply stays on screen until the saved transcript shows it:
+   * dropping it first empties that space for a moment, so the chat jumps up
+   * and back down. `release`, a new stream (`start`, `update`) or `reset`
+   * takes it away; `end` and `idle` leave it. */
+  | { type: "hold"; message: Partial<AgentMessage> }
+  | { type: "release"; committed: readonly AgentMessage[] }
+  /** No message is streaming now (a message ended, a live snapshot has none). */
+  | { type: "idle"; streaming: boolean }
   | { type: "end" }
   | { type: "reset" };
 
@@ -50,7 +61,22 @@ export function streamReducer(state: StreamingState, action: StreamAction): Stre
       return { isStreaming: true, streamingMessage: null };
     case "update":
       return { isStreaming: true, streamingMessage: action.message };
-    case "end":
+    case "hold":
+      return { isStreaming: false, streamingMessage: action.message };
+    case "release": {
+      const held = state.isStreaming ? null : state.streamingMessage;
+      if (!held) return state;
+      // No timestamp to match: drop it now, as before holding existed.
+      const saved = held.timestamp === undefined
+        || action.committed.some((message) => message.role === "assistant" && message.timestamp === held.timestamp);
+      return saved ? { isStreaming: false, streamingMessage: null } : state;
+    }
+    case "idle":
+    case "end": {
+      const held = !state.isStreaming && state.streamingMessage;
+      if (held) return state;
+      return { isStreaming: action.type === "idle" && action.streaming, streamingMessage: null };
+    }
     case "reset":
       return { isStreaming: false, streamingMessage: null };
     default:
@@ -157,6 +183,10 @@ export type AgentStateResponse = {
   thinkingLevel?: string;
   fastModeEnabled?: boolean;
   fastModeActive?: boolean;
+  slowModeSupported?: boolean;
+  slowModeEnabled?: boolean;
+  slowModeScope?: SlowModeScope;
+  usageLimit?: UsageLimitState;
   autoRetryEnabled?: boolean;
   interruptMode?: "immediate" | "wait";
   autoCompactionEnabled?: boolean;
@@ -170,8 +200,7 @@ export type AgentStateResponse = {
   tokensPerSecond?: number | null;
   extensionStatuses?: ExtensionStatusItem[];
   extensionWidgets?: ExtensionWidgetItem[];
-  // omp only reports a count; the queued texts are tracked client-side.
-  queuedMessageCount?: number;
+  queuedMessages?: QueuedMessages;
   todoPhases?: TodoPhase[];
 };
 
@@ -186,14 +215,6 @@ export function toThinkingModelMeta(model: { provider?: string; id?: string; nam
   if (!model?.provider || !model.id) return null;
   return { provider: model.provider, modelId: model.id, name: model.name, reasoning: model.reasoning, thinking: model.thinking };
 }
-
-export type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
-export type ExtensionUiCustomRequest = Extract<ExtensionUiRequest, { method: "custom" }>;
-// omp's rpc-ui frames add open_url (OAuth) and cancel on top of lib/types' union.
-export type IncomingExtensionUiRequest =
-  | ExtensionUiRequest
-  | { type: "extension_ui_request"; id: string; method: "open_url"; url: string; launchUrl?: string; instructions?: string }
-  | { type: "extension_ui_request"; id: string; method: "cancel"; targetId: string };
 
 export type AgentPhase =
   | { kind: "waiting_model" }
@@ -232,16 +253,27 @@ export const PROMPT_SETTLE_INITIAL_DELAY_MS = 800;
 export const PROMPT_SETTLE_POLL_MS = 600;
 export const PROMPT_SETTLE_MAX_MS = 20_000;
 export const AGENT_STATE_RECONCILE_MS = 15_000;
+// Stop waits at most this long to take queued messages back before aborting.
+export const WITHDRAW_BEFORE_ABORT_MS = 1_500;
 export const BASH_STATE_RECONCILE_MS = 1_000;
-// A cold `omp --mode rpc-ui` spawn (extension + skill + LSP discovery) can take
+// Cadence for re-reading a session that some OTHER `omp` process is running.
+// omp-web owns no wrapper for those, so /api/agent/<id>/events 409s and nothing
+// streams in; the only way their transcript advances is an explicit sync poll.
+// Fast enough to look live, far slower than the SSE path it stands in for.
+export const EXTERNAL_RUN_POLL_MS = 2_000;
+// A tail that stopped growing is not a live foreign run any more (its omp died,
+// or the run was interrupted between a tool call and its result). Stop polling;
+// the cheap heuristic below re-arms the poll if the transcript grows again.
+export const EXTERNAL_RUN_STALE_MS = 60_000;
+// A cold ompweb-omp start (extension + skill + LSP discovery) can take
 // far longer than a few seconds, and the SSE route may only answer once the
 // child is ready. Give up only after the child would have timed out anyway
-// (rpc-process waitReady is 120s server-side) rather than dropping the prompt.
+// (rpc-process waitReady, server-side) rather than dropping the prompt.
 export const EVENT_STREAM_CONNECT_TIMEOUT_MS = 60_000;
 // Tell the user something is happening if the stream is still connecting.
 export const EVENT_STREAM_SLOW_CONNECT_MS = 4_000;
-// Manual reconnect backoff for a CLOSED event stream (fatal per EventSource,
-// so the browser will not retry on its own). Doubles per consecutive failure,
+// Manual reconnect backoff for a CLOSED event stream (fatal, so the stream
+// will not retry on its own). Doubles per consecutive failure,
 // caps at the max; reset on any successful open. Without this, an idle
 // session whose stream died (server hiccup, wrapper respawn) stays dead
 // silently until a full page reload.
@@ -256,7 +288,7 @@ export type EventStreamConnectionStatus = "connected" | "timeout" | "closed";
 
 export type EventStreamConnectionResult = {
   status: EventStreamConnectionStatus;
-  source: EventSource;
+  source: EventStream;
 };
 
 export class EventStreamConnectionError extends Error {
@@ -284,6 +316,114 @@ export function isSafeOpenUrl(raw: unknown): boolean {
   if (!match) return false;
   const scheme = match[1].toLowerCase();
   return scheme === "http" || scheme === "https" || scheme === "mailto";
+}
+
+export interface HostToolHandlers {
+  /** Open a validated URL; returns the result text reported to the agent. */
+  openUrl: (url: string) => string;
+  /** Open a file tab; may return the result text reported to the agent. `ownerSessionId` is set when the server
+   * resolved a `local://` file for a session under another id (an alias): the tab belongs to that owner. */
+  openFile?: (path: string, name: string, ownerSessionId?: string) => string | void;
+}
+
+/** How long a `local://` lookup may take before the agent is told the server did not answer: the host ops behind it give
+ * up after 30 s themselves. */
+export const LOCAL_FILE_LOOKUP_TIMEOUT_MS = 30_000;
+
+/** A session's `local://` file as the absolute path the file viewer opens, found by the server that holds the session. */
+async function resolveLocalFile(sessionId: string | undefined, uri: string, signal?: AbortSignal): Promise<{ ok: true; path: string; sessionId?: string } | { ok: false; error: string }> {
+  if (!sessionId) return { ok: false, error: "A local:// file belongs to a session, and no session asked for it" };
+  const unanswered = { ok: false as const, error: `Could not open ${uri}: the server did not answer` };
+  // An AbortController and a timer, not AbortSignal.timeout (older browsers lack it): a stalled request must not leave
+  // the agent's tool call pending until the tab goes away.
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) controller.abort();
+  const timer = setTimeout(() => controller.abort(), LOCAL_FILE_LOOKUP_TIMEOUT_MS);
+  try {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/local-file?uri=${encodeURIComponent(uri)}`, { signal: controller.signal });
+    const body = (await response.json().catch(() => ({}))) as { path?: unknown; sessionId?: unknown; error?: unknown };
+    if (controller.signal.aborted) return unanswered;
+    if (response.ok && typeof body.path === "string") return { ok: true, path: body.path, ...(typeof body.sessionId === "string" ? { sessionId: body.sessionId } : {}) };
+    return { ok: false, error: typeof body.error === "string" ? body.error : `Could not open ${uri} (HTTP ${response.status})` };
+  } catch {
+    return unanswered;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+/**
+ * Execute an omp-web host tool (open_url / notify / open_file) and return the
+ * toolResult text. Shared by the session's own stream and by tabs answering
+ * calls for a session they are not viewing. `sessionId` is the session the
+ * call came from, which owns a `local://` file; required (undefined only when
+ * there is none), so a caller that forgets it fails the typecheck.
+ */
+export async function runHostTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  handlers: HostToolHandlers,
+  sessionId: string | undefined,
+  signal?: AbortSignal,
+): Promise<{ text: string; isError: boolean }> {
+  const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+  const canceled = { text: "Host tool request canceled", isError: true };
+  if (signal?.aborted) return canceled;
+  switch (toolName) {
+    case "open_url": {
+      const raw = str(args.url) ?? "";
+      if (!isSafeOpenUrl(raw)) return { text: "Unsafe or invalid URL not opened", isError: !!raw };
+      return { text: handlers.openUrl(raw), isError: false };
+    }
+    case "notify": {
+      const title = str(args.title) ?? "OMP";
+      const message = str(args.message) ?? "";
+      if (typeof Notification !== "undefined") {
+        try {
+          const permission = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
+          if (signal?.aborted) return canceled;
+          if (permission === "granted") {
+            const options = { body: message, icon: "/icon-192.png", badge: "/badge-96.png" };
+            // Chrome on Android only allows notifications through a service worker.
+            const registration = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration() : undefined;
+            if (signal?.aborted) return canceled;
+            if (registration) await registration.showNotification(title, options);
+            else new Notification(title, options);
+          }
+        } catch {
+          // Notification API blocked — the result still succeeds.
+        }
+      }
+      return { text: "Notification shown", isError: false };
+    }
+    case "open_file": {
+      const requested = str(args.path) ?? "";
+      if (!requested) return { text: "No path provided", isError: true };
+      let path = requested;
+      let owner: string | undefined;
+      if (isLocalUri(requested)) {
+        const resolved = await resolveLocalFile(sessionId, requested, signal);
+        if (signal?.aborted) return canceled;
+        if (!resolved.ok) return { text: resolved.error, isError: true };
+        path = resolved.path;
+        owner = resolved.sessionId;
+      }
+      let text: string | void = undefined;
+      if (handlers.openFile) {
+        try {
+          text = handlers.openFile(path, path.split(/[\\/]/).pop() || path, owner);
+        } catch (error) {
+          return { text: error instanceof Error ? error.message : `Could not open ${requested}`, isError: true };
+        }
+      }
+      return { text: text || `Opened ${requested}`, isError: false };
+    }
+    default:
+      return { text: `Host tool "${toolName}" is not available in omp-web`, isError: true };
+  }
 }
 
 export function delay(ms: number): Promise<void> {
@@ -344,7 +484,7 @@ export function buildOutgoingPrompt(
 
 export interface ChatInputHandle {
   insertText: (text: string) => void;
-  insertIfEmpty: (content: string) => void;
+  insertIfEmpty: (content: string, options?: Pick<ChatDraft, "promptOnly">) => void;
   prependText: (text: string) => void;
   addFiles: (files: File[]) => void;
 }
@@ -356,7 +496,7 @@ export interface AttachedImage {
 }
 
 export type SelectedModel = { provider: string; modelId: string };
-export type ModelEntry = { id: string; name: string; provider: string; supportsFastMode?: boolean; contextWindow?: number; maxTokens?: number };
+export type ModelEntry = { id: string; name: string; provider: string; supportsFastMode?: boolean; supportsSlowMode?: boolean; contextWindow?: number; maxTokens?: number; identity?: { class: string; family?: string; revision?: string }; costOutput?: number };
 export type ModelsResponse = {
   models: Record<string, string>;
   modelList?: ModelEntry[];
@@ -364,6 +504,8 @@ export type ModelsResponse = {
   thinkingLevels?: Record<string, string[]>;
   thinkingLevelMaps?: Record<string, Record<string, string | null>>;
   modelError?: string;
+  /** omp's `providers.anthropic.slowMode` is `auto` (read fresh per request). */
+  anthropicSlowMode?: boolean;
 };
 
 export type SlashCommandsResponse = {
@@ -381,4 +523,26 @@ export function toSlashCommandInfo(command: RpcAvailableSlashCommand): SlashComm
       ? "skill"
       : "prompt";
   return { name: command.name, description: command.description, source };
+}
+
+// omp exposes only the commands its RPC prompt path can actually run. TUI-only
+// ones (`/guided-goal`, `/vibe`, `/budget`, …) never appear in `get_commands`,
+// so the client has no way to run them and sending one lands in the transcript
+// as literal prompt text with no hint that nothing happened (#167).
+//
+// Callers pass the FULL command list — including the builtins that
+// `toSlashCommandInfo` hides from the palette, which are still executed by omp
+// when typed and therefore must not warn. An empty list means the roster has
+// not arrived yet (or failed), in which case saying "unknown" would be a guess.
+export function isUnknownSlashCommand(text: string, knownNames: readonly string[]): boolean {
+  if (knownNames.length === 0) return false;
+  const match = /^\/([A-Za-z][A-Za-z0-9_-]*)/.exec(text.trim());
+  if (!match) return false;
+  const name = match[1].toLowerCase();
+  return !knownNames.some((known) => known.toLowerCase() === name);
+}
+
+/** The bare command word of a prompt that tries to invoke a slash command. */
+export function slashCommandName(text: string): string | null {
+  return /^\/([A-Za-z][A-Za-z0-9_-]*)/.exec(text.trim())?.[1] ?? null;
 }

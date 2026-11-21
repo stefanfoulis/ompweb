@@ -1,32 +1,71 @@
-import { NextResponse, type NextRequest } from "next/server";
 import { isApiRequestOriginAllowed, shouldCheckApiRequestOrigin } from "@/lib/request-security";
-import { isValidWebSession, isWebPasswordEnabled, OMP_WEB_SESSION_COOKIE } from "@/lib/web-auth";
+import {
+  isTrustedProxyRequest,
+  isValidWebSession,
+  isWebPasswordEnabled,
+  webPasswordConfigurationProblem,
+  OMP_WEB_SESSION_COOKIE,
+  OMP_WEB_TRUSTED_HEADER,
+} from "@/lib/web-auth";
 
-export function proxy(request: NextRequest) {
-  if (request.nextUrl.pathname.startsWith("/api/") && shouldCheckApiRequestOrigin(request) && !isApiRequestOriginAllowed(request)) {
-    return NextResponse.json({ error: "Cross-origin API requests are not allowed" }, { status: 403 });
+// The sign-in screen still needs its JavaScript, CSS and fonts (/assets/, and
+// in dev only Bun's bundles under /_bun/) before a session exists; these and the
+// ordinary browser icons are public assets, not workspace data. /api/manifest
+// stays authenticated: its link includes credentials and its embedded
+// installation icons need no separate request. The service worker script holds
+// no data either, and the browser re-fetches it for update checks even after
+// the sign-in cookie expired. /assets/ is a prefix on purpose: it holds only the
+// hashed build output. The icon and sw.js names are exact (anchored), so no path
+// below or beside them skips the gate. /api/hosts/link (exactly, no subpath)
+// authenticates the host's bearer token itself before it upgrades or reads any
+// body (lib/hosts/hub.ts); /api/hosts/broker/v1/ (a prefix, so /api/hosts/broker,
+// /api/hosts/broker/updates and any other version stay gated) does the same before
+// it forwards to the auth broker (app/api/hosts/broker/[...path]/route.ts);
+// /api/hosts/cluster-config/manifest and /api/hosts/cluster-config/file/<64 hex digits> (exactly: hosts/[id]/cluster and
+// hosts/[id]/updates answer to id "cluster-config" and stay gated) check it before serving the master's configuration
+// to a cluster member (app/api/hosts/cluster-config/).
+// /api/hosts/maintenance is the independent maintenance API; its bearer gate also covers discovery.
+export const UNGATED = /^\/(?:assets\/|(?:favicon\.ico|icon\.svg|icon\.png|icon-192\.png|badge-96\.png|sw\.js)$|api\/hosts\/(?:link|maintenance)$|api\/hosts\/broker\/v1\/|api\/hosts\/cluster-config\/(?:manifest|file\/[0-9a-f]{64})$)/;
+
+// Relative: request.url is always http:// under Bun, so an absolute Location would leave https behind a TLS proxy.
+const redirect = (location: string) => new Response(null, { status: 307, headers: { location } });
+
+/**
+ * The password gate and API origin check. A Response answers the request; otherwise it continues, "authenticated"
+ * when it carries a session or the trusted header (or no password is set), "public" when it needs neither.
+ */
+export function proxy(request: Request): Response | "public" | "authenticated" {
+  const url = new URL(request.url);
+  const { pathname } = url;
+  if (UNGATED.test(pathname) || (process.env.NODE_ENV === "development" && pathname.startsWith("/_bun/"))) return "public";
+  if (pathname.startsWith("/api/") && shouldCheckApiRequestOrigin(request) && !isApiRequestOriginAllowed(request)) {
+    return Response.json({ error: "Cross-origin API requests are not allowed" }, { status: 403 });
+  }
+  // A configured-but-unusable password (plaintext, or a truncated hash) must
+  // never degrade into an open server: refuse every request with the fix. The
+  // problem is also reported once at startup (instrumentation.node.ts), so this
+  // deliberately logs nothing — a doomed request loop must not flood the log.
+  const passwordProblem = webPasswordConfigurationProblem();
+  if (passwordProblem) {
+    return new Response(`omp-web password configuration error\n\n${passwordProblem}\n`, {
+      status: 503,
+      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+    });
   }
   if (!isWebPasswordEnabled()) {
-    return request.nextUrl.pathname === "/login"
-      ? NextResponse.redirect(new URL("/", request.url))
-      : NextResponse.next();
+    return pathname === "/login" ? redirect("/") : "authenticated";
   }
 
-  const { pathname } = request.nextUrl;
-  const hasSession = isValidWebSession(request.cookies.get(OMP_WEB_SESSION_COOKIE)?.value);
+  const hasSession = isTrustedProxyRequest(request.headers.get(OMP_WEB_TRUSTED_HEADER))
+    || isValidWebSession(new Bun.CookieMap(request.headers.get("cookie") ?? "").get(OMP_WEB_SESSION_COOKIE) ?? undefined);
   if (pathname === "/login") {
-    return hasSession ? NextResponse.redirect(new URL("/", request.url)) : NextResponse.next();
+    return hasSession ? redirect("/") : "public";
   }
-  if (pathname === "/api/web-auth/session") return NextResponse.next();
-  if (hasSession) return NextResponse.next();
+  if (pathname === "/api/web-auth/session") return "public";
+  if (hasSession) return "authenticated";
   if (pathname.startsWith("/api/")) {
-    return NextResponse.json({ error: "Password required", code: "password_required" }, { status: 401 });
+    return Response.json({ error: "Password required", code: "password_required" }, { status: 401 });
   }
-  return NextResponse.redirect(new URL("/login", request.url));
+  // Keep a deep link to a session (e.g. a notification click) across sign-in.
+  return redirect(pathname === "/" && url.search ? `/login?${new URLSearchParams({ next: `/${url.search}` })}` : "/login");
 }
-
-// The sign-in screen still needs its Next.js JavaScript and CSS before a
-// session exists; these are public build assets, not workspace data. The
-// same goes for the web app manifest and its icons: browsers fetch them
-// without cookies, and a login redirect there breaks PWA installation.
-export const config = { matcher: "/((?!_next/static|_next/image|favicon\\.ico|manifest\\.webmanifest|icon\\.svg|icon\\.png|icon-192\\.png).*)" };

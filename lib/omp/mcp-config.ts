@@ -5,6 +5,7 @@ import { basename, dirname, join, relative, resolve, sep } from "path";
 import { stripAnsi } from "../ansi";
 import { getAgentDir } from "./paths";
 import { isRecord } from "../type-guards";
+import { createGitEnvironment } from "../project-command-env";
 
 const MAX_MCP_CONFIG_BYTES = 512 * 1024;
 const MAX_DISCOVERED_MCP_CONFIG_BYTES = 5 * 1024 * 1024;
@@ -21,7 +22,7 @@ export type McpUserConfig = {
 };
 
 export type McpLiveStatus = "connected" | "connecting" | "not_connected" | "inactive" | "disabled" | "configured";
-export type McpLiveServer = { name: string; source: string; status: McpLiveStatus; type?: string };
+export type McpLiveServer = { name: string; source: string; status: McpLiveStatus; type?: string; sourcePath?: string };
 
 /** Browser-facing project config must never expose environment variables or HTTP headers. */
 export function redactMcpServer(server: McpServer): McpServer {
@@ -97,7 +98,7 @@ function readTomlMcpServers(path: string, source: string, disabledNames: Set<str
       const name = section[1] ?? section[2];
       if (!name || disabledNames.has(name)) return [];
       const body = text.slice((section.index ?? 0) + section[0].length, sections[index + 1]?.index);
-      return [{ name, source, status: /^\s*enabled\s*=\s*false\s*$/m.test(body) ? "disabled" as const : "configured" as const, type: /^\s*url\s*=/m.test(body) ? "http" : "stdio" }];
+      return [{ name, source, sourcePath: path, status: /^\s*enabled\s*=\s*false\s*$/m.test(body) ? "disabled" as const : "configured" as const, type: /^\s*url\s*=/m.test(body) ? "http" : "stdio" }];
     });
   } catch {
     return [];
@@ -127,7 +128,7 @@ export function readDiscoveredMcpServers(cwd?: string, disabled = [] as string[]
       if (seen.has(key)) continue;
       seen.add(key);
       const type = typeof server.config.type === "string" ? server.config.type : typeof server.config.url === "string" ? "http" : "stdio";
-      servers.push({ name: server.name, source, status: server.config.enabled === false ? "disabled" : "configured", type });
+      servers.push({ name: server.name, source, sourcePath: path, status: server.config.enabled === false ? "disabled" : "configured", type });
     }
   }
   return servers;
@@ -183,7 +184,7 @@ function projectRoot(cwd: string): string {
   if (cached && cached.expiresAt > Date.now()) return cached.root;
   let root: string;
   try {
-    root = resolve(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }).trim());
+    root = resolve(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, env: createGitEnvironment() }).trim());
   } catch {
     // Transient git failure (hang, timeout, sick mount): fall back to the cwd
     // but do NOT cache it — a cached fallback would aim MCP reads/writes at

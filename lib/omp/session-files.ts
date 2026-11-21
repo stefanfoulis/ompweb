@@ -2,6 +2,8 @@ import { randomUUID } from "crypto";
 import type { Dirent } from "fs";
 import {
   closeSync,
+  constants as fsConstants,
+  fstatSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -41,8 +43,8 @@ import { sessionPathKey } from "../paths";
  * Pure-Node reader/writer for oh-my-pi's session JSONL files (format v3).
  * Ported from oh-my-pi packages/coding-agent/src/session/ (session-entries,
  * session-title-slot, session-listing, session-loader, session-migrations,
- * blob-store) because the @oh-my-pi packages are Bun-only and cannot run
- * inside the Node-hosted Next.js server.
+ * blob-store) because the @oh-my-pi packages are Bun-only and the server ran
+ * on Node (Next.js) when this was written.
  *
  * File layout: optional fixed-width 256-byte title-slot line, then the
  * {"type":"session"} header line, then entries forming a tree via
@@ -344,8 +346,8 @@ export function containsBlobRef(value: unknown): boolean {
 }
 
 export interface ResolveBlobOptions {
-  /** Leave blob refs inside toolResult messages unresolved (the caller is about
-   * to omit those images from the payload anyway). */
+  /** Leave blob refs inside toolResult messages unresolved (the caller turns
+   * those images into /api/media URLs instead of inlining them). */
   skipToolResultImages?: boolean;
 }
 
@@ -392,7 +394,7 @@ const SESSION_READ_CHUNK_BYTES = 1024 * 1024;
  * Ceiling on the on-disk size omp-web will materialize into memory. omp streams
  * sessions, so this is not an omp limit — it is the point past which parsing a
  * session into JS objects (and serializing it into one HTTP response) would OOM
- * the whole Next.js server. Refusing loudly beats taking the process down.
+ * the whole server. Refusing loudly beats taking the process down.
  */
 export const MAX_SESSION_LOAD_BYTES = 1024 * 1024 * 1024;
 
@@ -400,11 +402,12 @@ export const MAX_SESSION_LOAD_BYTES = 1024 * 1024 * 1024;
  * Read a file line by line over a byte buffer. Unlike readFileSync(path,"utf8")
  * this never materializes the whole file as a single JS string, so sessions
  * past Node's ~512 MiB string cap still open. Lines exclude the newline; the
- * decoder carries multi-byte characters across chunk boundaries.
+ * decoder carries multi-byte characters across chunk boundaries. Returning
+ * false from onLine stops the read.
  */
 export function forEachFileLineSync(
   filePath: string,
-  onLine: (line: string, offset: number, length: number) => void,
+  onLine: (line: string, offset: number, length: number) => boolean | void,
 ): void {
   const fd = openSync(filePath, "r");
   try {
@@ -425,7 +428,7 @@ export function forEachFileLineSync(
         length += end - start;
         if (end < bytesRead) {
           fragments.push(decoder.end());
-          onLine(fragments.join(""), offset, length);
+          if (onLine(fragments.join(""), offset, length) === false) return;
           fragments.length = 0;
           offset += length + 1;
           length = 0;
@@ -521,16 +524,29 @@ export function loadSessionFile(filePath: string, options: LoadSessionOptions = 
  * the second when line 1 is a title slot), capped at 64 KiB. The slot title is
  * folded into the returned header.
  */
-export function readSessionHeaderSync(filePath: string): SessionHeader | null {
+export function readSessionHeaderSync(filePath: string, strict = false): SessionHeader | null {
   const maxHeaderBytes = 64 * 1024 + SESSION_TITLE_SLOT_BYTES;
+  if (strict && !lstatSync(path.dirname(filePath)).isDirectory()) throw new Error(`Cannot inventory symlinked session project at ${filePath}`);
+  const expected = strict ? lstatSync(filePath, { bigint: true }) : null;
+  if (expected && !expected.isFile()) throw new Error(`Cannot inventory non-regular session path ${filePath}`);
   let fd: number;
   try {
-    fd = openSync(filePath, "r");
-  } catch {
+    fd = openSync(filePath, strict ? fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) : "r");
+  } catch (error) {
+    if (strict) throw error;
     return null;
   }
   let head: string;
   try {
+    if (expected) {
+      const opened = fstatSync(fd, { bigint: true });
+      const current = lstatSync(filePath, { bigint: true });
+      if (!lstatSync(path.dirname(filePath)).isDirectory()) throw new Error(`Session project changed during strict discovery: ${filePath}`);
+      if (!current.isFile() || expected.dev !== opened.dev || expected.ino !== opened.ino
+        || current.dev !== opened.dev || current.ino !== opened.ino) {
+        throw new Error(`Session path changed during strict discovery: ${filePath}`);
+      }
+    }
     const buffer = Buffer.allocUnsafe(maxHeaderBytes);
     const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
     head = buffer.subarray(0, bytesRead).toString("utf8");
@@ -642,6 +658,8 @@ export interface OmpSessionInfo {
   size: number;
   firstMessage: string;
   status?: SessionStatus;
+  /** Timestamp of the last message entry in the tail window (when scanned with status). */
+  lastMessageAt?: Date;
 }
 
 const SESSION_LIST_PREFIX_BYTES = 4096;
@@ -724,6 +742,47 @@ function extractFirstDisplayMessageFromPrefix(content: string): string | undefin
   return fallback;
 }
 
+// Injected context (rules, skills, memory recall) can push the first user
+// message past the 4 KiB prefix; stream lines until one turns up.
+function scanFirstUserMessage(filePath: string): string {
+  let text = "";
+  try {
+    forEachFileLineSync(filePath, (line) => {
+      if (!line.includes('"user"') && !line.includes('"skill-prompt"')) return;
+      try {
+        const entry = JSON.parse(line) as {
+          type?: string;
+          customType?: string;
+          content?: unknown;
+          message?: { role?: string; content?: unknown };
+        };
+        if (entry.type === "message" && entry.message?.role === "user") {
+          text = extractTextFromContent(entry.message.content);
+          return !text;
+        }
+        if (entry.type === "custom_message" && entry.customType === "skill-prompt") {
+          const content = typeof entry.content === "string" ? entry.content : "";
+          const parts = content.split(/\nUser:\s*/);
+          if (parts.length > 1 && parts[parts.length - 1].trim()) {
+            text = parts[parts.length - 1].trim();
+            return !text;
+          }
+          const skillMatch = /User invoked the "([^"]+)" skill/.exec(content);
+          if (skillMatch && skillMatch[1]) {
+            text = `Skill: ${skillMatch[1]}`;
+            return !text;
+          }
+        }
+      } catch {
+        // Torn or hand-edited line: skip it, as parseJsonlLenient does.
+      }
+    });
+  } catch {
+    // A line past the JS string cap: keep listing the session without a first message.
+  }
+  return text;
+}
+
 function extractTextFromContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -766,26 +825,27 @@ function statusFromTailMessage(message: TailMessage): SessionStatus {
   }
 }
 
-/** Derive the lifecycle status from the tail window's last message entry. */
-function deriveSessionStatus(suffix: string): SessionStatus {
-  if (!suffix) return "unknown";
+/** The tail window's last message entry: lifecycle status plus its timestamp. */
+function scanTailMessage(suffix: string): { status: SessionStatus; lastMessageAt?: Date } {
+  if (!suffix) return { status: "unknown" };
   const lines = suffix.split("\n");
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
     // Every persisted entry starts with "{" — cheaply skips blank lines and
     // the leading partial fragment of the tail window.
     if (line.charCodeAt(0) !== 123) continue;
-    let entry: { type?: string; message?: TailMessage };
+    let entry: { type?: string; timestamp?: unknown; message?: TailMessage };
     try {
       entry = JSON.parse(line);
     } catch {
       continue;
     }
     if (entry.type === "message" && entry.message) {
-      return statusFromTailMessage(entry.message);
+      const at = typeof entry.timestamp === "string" ? new Date(entry.timestamp) : undefined;
+      return { status: statusFromTailMessage(entry.message), lastMessageAt: at && !Number.isNaN(at.getTime()) ? at : undefined };
     }
   }
-  return "unknown";
+  return { status: "unknown" };
 }
 
 interface SessionListHeader {
@@ -859,8 +919,13 @@ function parseSessionListHeader(
   return undefined;
 }
 
-function readTextSlices(filePath: string, prefixBytes: number, suffixBytes: number): [string, string, number, Date] {
-  const stat = statSync(filePath);
+function readTextSlices(
+  filePath: string,
+  prefixBytes: number,
+  suffixBytes: number,
+  knownStat?: { size: number; mtime: Date },
+): [string, string, number, Date] {
+  const stat = knownStat ?? statSync(filePath);
   const fd = openSync(filePath, "r");
   try {
     const prefixLength = Math.min(prefixBytes, stat.size);
@@ -886,12 +951,17 @@ function readTextSlices(filePath: string, prefixBytes: number, suffixBytes: numb
  * window (plus a 32 KiB tail window when `withStatus` is set). Faithful port
  * of omp's scanSessionFile — messageCount is a prefix-derived lower bound.
  */
-export function scanSessionInfo(filePath: string, withStatus = true): OmpSessionInfo | undefined {
+export function scanSessionInfo(
+  filePath: string,
+  withStatus = true,
+  knownStat?: { size: number; mtime: Date },
+): OmpSessionInfo | undefined {
   try {
     const [content, suffix, size, mtime] = readTextSlices(
       filePath,
       SESSION_LIST_PREFIX_BYTES,
       withStatus ? SESSION_LIST_SUFFIX_BYTES : 0,
+      knownStat,
     );
     const entries = parseJsonlLenient<Record<string, unknown>>(content);
     const header = parseSessionListHeader(content, entries);
@@ -913,8 +983,14 @@ export function scanSessionInfo(filePath: string, withStatus = true): OmpSession
       }
     }
 
+    // Cap at the prefix size: the list ships firstMessage for every session.
+    // Files past the load ceiling cannot be opened anyway, so skip reading them.
+    if (!firstMessage && size > SESSION_LIST_PREFIX_BYTES && size <= MAX_SESSION_LOAD_BYTES) {
+      firstMessage = scanFirstUserMessage(filePath).slice(0, SESSION_LIST_PREFIX_BYTES);
+    }
     firstMessage ||= extractFirstDisplayMessageFromPrefix(content) ?? "";
     const messageCount = Math.max(parsedMessageCount, countMessageMarkers(content));
+    const tail = withStatus ? scanTailMessage(suffix) : undefined;
     return {
       path: filePath,
       id: header.id,
@@ -926,7 +1002,8 @@ export function scanSessionInfo(filePath: string, withStatus = true): OmpSession
       messageCount,
       size,
       firstMessage: firstMessage || "(no messages)",
-      status: withStatus ? deriveSessionStatus(suffix) : undefined,
+      status: tail?.status,
+      lastMessageAt: tail?.lastMessageAt,
     };
   } catch {
     return undefined;
@@ -984,7 +1061,7 @@ export function invalidateAllSessionScanCaches(): void {
 /** scanSessionInfo memoized on (path, size, mtimeMs). Callers must treat the
  * returned info as immutable — cache hits share one object. */
 function scanSessionInfoCached(filePath: string): OmpSessionInfo | undefined {
-  let stat: { size: number; mtimeMs: number };
+  let stat: { size: number; mtime: Date; mtimeMs: number };
   try {
     stat = statSync(filePath);
   } catch {
@@ -999,7 +1076,7 @@ function scanSessionInfoCached(filePath: string): OmpSessionInfo | undefined {
     return cached.info;
   }
   if (cached) cache.delete(key);
-  const info = scanSessionInfo(filePath, true);
+  const info = scanSessionInfo(filePath, true, stat);
   // Failed scans are not negatively cached: a transient read error must not
   // hide a session until its next mtime bump.
   if (info) {
@@ -1098,26 +1175,53 @@ export async function listSessionFiles(sessionsRoot: string): Promise<string[]> 
   return files;
 }
 
-function collectSessionFiles(sessionsRoot: string): string[] {
+/** Restore conflict preflight only: an uncached, complete ID inventory. Never populate or trust the best-effort sidebar
+ * caches: skipped directories or unreadable/unidentifiable headers cannot prove a session absent on this machine. */
+export function listSessionIdsForRestore(sessionsRoot = getSessionsDir()): string[] {
+  const ids: string[] = [];
+  for (const file of collectSessionFiles(sessionsRoot, true)) {
+    const header = readSessionHeaderSync(file, true);
+    if (!header || typeof header.id !== "string" || !header.id) throw new Error(`Cannot identify active session at ${file}`);
+    ids.push(header.id);
+  }
+  return ids;
+}
+
+function collectSessionFiles(sessionsRoot: string, strict = false): string[] {
   const files: string[] = [];
+  let projects: Dirent[];
+  let observedRoot = false;
   try {
-    for (const dirent of readDirectorySyncRuntime(sessionsRoot, { withFileTypes: true })) {
-      if (!dirent.isDirectory()) continue;
-      const dirPath = path.join(sessionsRoot, dirent.name);
-      let inner: Dirent[];
-      try {
-        inner = readDirectorySyncRuntime(dirPath, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const file of inner) {
-        if (file.isFile() && file.name.endsWith(".jsonl")) {
-          files.push(path.join(dirPath, file.name));
-        }
-      }
+    if (strict) {
+      const root = lstatSync(sessionsRoot);
+      observedRoot = true;
+      if (!root.isDirectory()) throw new Error(`Cannot inventory non-directory sessions root ${sessionsRoot}`);
     }
-  } catch {
+    projects = readDirectorySyncRuntime(sessionsRoot, { withFileTypes: true });
+  } catch (error) {
+    // Only a root absent from the outset is an empty inventory. Once observed, disappearance is uncertainty.
+    if (strict && (observedRoot || !(error && typeof error === "object" && "code" in error && error.code === "ENOENT"))) throw error;
     return [];
+  }
+  for (const dirent of projects) {
+    const dirPath = path.join(sessionsRoot, dirent.name);
+    if (strict && dirent.isSymbolicLink()) throw new Error(`Cannot inventory symlinked session project ${dirPath}`);
+    if (!dirent.isDirectory()) continue;
+    let inner: Dirent[];
+    try {
+      if (strict && !lstatSync(dirPath).isDirectory()) throw new Error(`Session project changed during strict discovery: ${dirPath}`);
+      inner = readDirectorySyncRuntime(dirPath, { withFileTypes: true });
+    } catch (error) {
+      // This project was enumerated: even ENOENT may mean it was renamed with active sessions inside. Never skip it in preflight.
+      if (strict) throw error;
+      continue;
+    }
+    for (const file of inner) {
+      if (strict && file.isSymbolicLink() && file.name.endsWith(".jsonl")) {
+        throw new Error(`Cannot inventory symlinked session file ${path.join(dirPath, file.name)}`);
+      }
+      if (file.isFile() && file.name.endsWith(".jsonl")) files.push(path.join(dirPath, file.name));
+    }
   }
   return files;
 }
@@ -1322,4 +1426,37 @@ export function deleteSessionFileWithArtifacts(filePath: string): void {
   } catch {
     // The session file itself is already gone; artifact cleanup is best-effort.
   }
+}
+
+/**
+ * Every transcript (`*.jsonl`, any depth) in a session's artifacts directory:
+ * task subagents and their nested subagents, advisors (`__advisor*.jsonl`),
+ * `/tan` clones and extension sub-sessions. Each records its own model usage.
+ * The top-level `local/` folder is skipped: it is the agent's `local://`
+ * scratch space, which omp never writes transcripts to and which can hold
+ * arbitrary trees (cloned repos, dependencies). Returns [] without an
+ * artifacts directory.
+ */
+export function listSessionArtifactTranscripts(sessionFile: string): string[] {
+  if (!sessionFile.endsWith(".jsonl")) return [];
+  const root = sessionFile.slice(0, -".jsonl".length);
+  const transcripts: string[] = [];
+  const pending = [root];
+  for (let dir = pending.pop(); dir !== undefined; dir = pending.pop()) {
+    let entries: Dirent[];
+    try {
+      entries = readDirectorySyncRuntime(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (dir !== root || entry.name !== "local") pending.push(entryPath);
+      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        transcripts.push(entryPath);
+      }
+    }
+  }
+  return transcripts;
 }

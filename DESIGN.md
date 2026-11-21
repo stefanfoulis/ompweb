@@ -16,14 +16,15 @@ do not assume that Pi-specific implementation changes can be merged unchanged.
 ## Product principles
 
 1. **OMP remains authoritative.** Sessions, credentials, providers, and agent
-   behavior belong to the installed `omp` CLI. ompweb must not invent a
-   parallel data format or credential store.
+   behavior belong to omp (run as ompweb's own build of it, `runner/`). ompweb
+   must not invent a parallel data format or credential store.
 2. **Local-first by default.** The server binds to `127.0.0.1`; remote access
    is an explicit user choice and must be protected by a trusted network
    boundary and HTTPS.
-3. **Node-first installation.** A normal user installs Node.js 22.19+ and OMP,
-   then runs `npx ompweb@latest` or installs `ompweb` globally. ompweb does not
-   require users to install Bun for its own runtime.
+3. **Node-first installation.** A normal user installs Node.js 24+ and OMP,
+   then runs `npx ompweb@latest` or installs `ompweb` globally. The npm package
+   brings its own Bun for the web server, so users do not install Bun
+   themselves.
 4. **Native compatibility over imitation.** Prefer OMP's CLI and documented
    on-disk formats to copied SDK internals. If a capability cannot be done
    safely through those boundaries, leave it out rather than emulating it
@@ -37,8 +38,9 @@ do not assume that Pi-specific implementation changes can be merged unchanged.
 - npm package and CLI command: `ompweb`.
 - Default server address: `http://127.0.0.1:30177`.
 - Existing `OMP_WEB_*` environment variables remain the configuration prefix
-  for compatibility: `OMP_WEB_HOSTNAME`, `OMP_WEB_NO_OPEN`,
-  `OMP_WEB_PASSWORD`, and `OMP_WEB_OMP_BIN`.
+  for compatibility: `OMP_WEB_HOSTNAME`, `OMP_WEB_NO_OPEN`, and
+  `OMP_WEB_OMP_BIN`. `OMP_WEB_PASSWORD` is accepted only as a migration step
+  (see the security contract).
 - `PI_CODING_AGENT_DIR` and OMP's own directory conventions are
   respected because they identify the user's existing OMP state.
 - The web UI displays its own package version separately from the detected
@@ -50,27 +52,89 @@ do not assume that Pi-specific implementation changes can be merged unchanged.
 Browser
   │ HTTP / Server-Sent Events
   ▼
-ompweb (Next.js on Node)
+ompweb (Bun server, started by the Node launcher)
   ├─ reads native OMP session files and selected configuration
   ├─ serves allow-listed project files
-  └─ starts one `omp --mode rpc-ui` child per active session
-       │ NDJSON over stdio
+  └─ starts one `ompweb-omp --headless` child per active session
+       │ ompweb channel, NDJSON over stdio
        ▼
-     installed OMP CLI and its existing ~/.omp/agent state
+     ompweb's own omp build (runner/) and the existing ~/.omp/agent state
 ```
 
-### Why the CLI boundary is locked
+### The omp boundary
 
 OMP SDK packages are Bun-only TypeScript and import Bun APIs. Importing
-`@oh-my-pi/*` or `@earendil-works/*` into a Node/Next server would make the
-application unreliable or non-runnable. Therefore, production code must not
-add those runtime dependencies.
+`@oh-my-pi/*` or `@earendil-works/*` into the ompweb server, even though it runs on
+Bun, would tie it to omp's internals and make the application unreliable.
+Therefore, the ompweb server and daemon must not add those runtime dependencies.
 
-Live work goes through the user’s installed `omp --mode rpc-ui` process. This
-keeps the agent version, providers, extensions, and session behavior aligned
-with the CLI the user already trusts. The RPC layer negotiates v2 when the CLI
-advertises it, reassembles bounded chunked frames, and remains compatible with
-v1-capable installations.
+Live work goes through ompweb's own omp build, the runner (`ompweb-omp`). It is
+built and released by the fork, `ompweb-dev/oh-my-pi` (workspace package
+`packages/ompweb-runner`, compiled by the fork's `oml` build against the
+upstream omp release plus the PRs the fork carries, among them `runSessionHost`,
+which the headless mode needs); ompweb holds no runner source. Each fork release
+attaches the runners (`ompweb-omp-<platform>[.exe]`), their `ompweb-omp.sha256`
+and `ompweb-omp.json`, which names the runner protocol (`RUNNER_PROTOCOL`,
+`lib/omp/omp-cli.ts`, printed by `ompweb-omp --runner-info` too): the version of
+the contract below, bumped only by a change an older ompweb cannot speak. The
+runner replaces omp's
+launch command: its session factory connects every session to `ompweb host`
+over ompweb's channel. The host receives the same `AgentSession` events and
+calls the same session methods omp's TUI does, so nothing depends on omp's RPC
+mode. A session started from the runner's TUI connects to the daemon's Unix
+socket and shows up live in the web; dialogs open on both sides and the first
+answer wins. `omp-runner.json` pins the fork release an ompweb build fetches its
+runner from (`lib/omp/runner-fetch.ts`, SHA-256-checked); a release build
+records the newest published fork release whose protocol is `RUNNER_PROTOCOL`.
+Between ompweb releases, "Update omp" installs a newer runner from such a fork
+release (AGENTS.md, "Updates"). The design and the wire are in
+`docs/specs/2026-11-12-omp-runner-design.md`.
+
+### The Host seam
+
+Every machine-local action of a session goes through one interface,
+`Host` (`lib/hosts/host.ts`): spawning `ompweb-omp --headless`, checking that a
+session file exists, invalidating cached session lists, and the
+file-reading operations behind the session and project routes. The web server
+has no direct path to any machine, its own included: it reaches every host
+through the link described below. The implementation on the web server is
+`RemoteHost`; the daemon (`ompweb host`) runs the other side, `LocalHost`, on
+the machine whose omp it owns.
+
+```
+Browser ─▶ ompweb ◀── link (loopback)  ── ompweb host ── spawn ompweb-omp --headless (stdio)
+                 ◀── link (WebSocket) ── ompweb host on another machine
+                                           └─ spawn ompweb-omp --headless
+```
+
+"This machine" is the host with the fixed id `local`, linked to the daemon
+that the service installers set up next to the web service. Because the daemon
+owns the omp processes, restarting or redeploying the web server does not end
+a run: the restarted server adopts the live children from the daemon's hello,
+with their open blocking requests replayed. A direct spawn path would tie
+every run to the web server's lifetime, which is why none exists.
+
+The omp boundary above holds on every machine: a remote machine runs its own
+runner build, its own `~/.omp/agent` and its own credentials, unless sharing is
+turned on for that host (Settings → Hosts): then its sessions use the server's
+provider logins through `omp auth-broker serve`, and the host never gets a
+refresh token. ompweb only routes. `RpcProcess` takes its byte pipe
+(`RpcTransport`) from the host, so the
+session wrapper, event streams, notifications and queue handle frames without
+knowing where omp runs. Session routes address a session by id; the owning
+host resolves the file path, so a remote path never reaches the serving
+machine's filesystem.
+
+The link is one WebSocket that the `ompweb host` daemon opens to the
+server: text frames carry the messages in both directions and binary frames
+carry large op results (daemon → server). The daemon
+forwards omp's NDJSON unchanged and answers a fixed allow-list of host
+operations; there is no generic exec or file-read operation. A host is
+trusted like the serving machine: control of the server or of a host token is
+a shell on that host. Tokens are stored hashed, shown once, and revocable, and
+the daemon requires `https://` except for loopback or an explicit
+`--allow-http`. The full protocol is in
+`docs/specs/2026-10-28-remote-hosts-design.md`.
 
 ## Data and mutation boundaries
 
@@ -79,16 +143,17 @@ v1-capable installations.
 - `~/.omp/agent` is the source of
   truth for sessions, configuration, models, skills, plugins, and blobs.
 - `agent.db` contains authentication data. ompweb never reads or writes it;
-  authentication actions go through the OMP RPC process.
+  authentication actions go through the `ompweb-omp` process.
 - A live OMP process owns writes to its session file. ompweb routes supported
-  live actions through RPC and never races a live file rewrite.
+  live actions through the runner's channel and never races a live file rewrite.
 
 ### Direct file access
 
 Session browsing is implemented in pure Node against OMP JSONL files. The
 reader tolerates the fixed title slot and older session shapes, resolves blob
 references when needed, and builds the active branch context from the entry
-tree.
+tree. The session and project routes run it in the daemon of the session's host
+(`session-ops.ts`), so the same code serves this machine and every linked one.
 
 Direct session mutation is deliberately narrow and explicit: rename/title,
 archive, deletion, and required branch-parent maintenance. These writes are
@@ -162,7 +227,7 @@ version change invalidates offsets rather than trusting an unchecked prefix.
 Failed reads never advance the confirmed cursor.
 
 File-only catch-up also refreshes model and thinking metadata without replacing
-newer or pending RPC choices. Replacement observer connections restore browser
+newer or pending channel choices. Replacement observer connections restore browser
 registrations and the subagent roster only after successfully connecting.
 
 Deploy the frontend and API support together; no native OMP upgrade is required.
@@ -170,13 +235,34 @@ Deploy the frontend and API support together; no native OMP upgrade is required.
 ## Security contract
 
 - Bind loopback-only by default. A non-loopback hostname is an explicit opt-in.
-- `OMP_WEB_PASSWORD` protects every route with a password-only sign-in screen.
+- `OMP_WEB_PASSWORD_HASH` protects every route with a password-only sign-in
+  screen. Only a scrypt hash reaches the server (`ompweb hash-password`),
+  because every `omp` session inherits the server's environment and an agent
+  could print the password into its transcript, session file and
+  model-provider traffic. `--password`, or a plaintext `OMP_WEB_PASSWORD` next
+  to a hash, refuses to start. A lone `OMP_WEB_PASSWORD` is hashed by the
+  launcher, removed from the server's environment, and logged as a warning with
+  the hash to use instead; the server itself still refuses a plaintext.
   Successful sign-in creates an HTTP-only, signed cookie with a 30-day expiry;
-  changing the configured password invalidates existing sessions. Exposed
-  deployments require HTTPS through a trusted reverse proxy or VPN.
+  the signing key is a per-installation random value mixed with the hash, so a
+  copied password hash cannot forge a session and changing the password still
+  invalidates existing sessions. Exposed deployments require HTTPS through a
+  trusted reverse proxy or VPN. With `OMP_WEB_TRUSTED_HEADER_SHA256` set, a
+  request whose `X-Omp-Web-Auth` header hashes to that digest counts as signed
+  in; omp-web never holds the secret itself. Deciding which clients get the
+  header is the reverse proxy's job, because omp-web has no client address it
+  can trust.
+- omp-web's own secrets (`OMP_WEB_PASSWORD`, `OMP_WEB_PASSWORD_HASH`,
+  `OMP_WEB_TRUSTED_HEADER_SHA256` and its legacy name
+  `OMP_WEB_TRUSTED_HEADER_SECRET`) are stripped from every child process
+  environment through `createChildProcessEnvironment`
+  (`lib/project-command-env.ts`). `OMP_WEB_*` values that are configuration
+  rather than secrets (`OMP_WEB_PACKAGE_DIR`, `OMP_WEB_OMP_BIN`, ...) are kept.
 - API requests are origin-checked. Do not add browser-to-host execution paths
   that bypass this boundary.
-- OMP RPC host tools are intentionally not registered. A browser request must
+- Host tools (`host_tool_call`) come from a fixed set: the browser's own tools
+  (open a URL or file, notify) and the server's session tools in `lib/agent-tools.ts`;
+  none runs a host command. A browser request must
   not become arbitrary host command execution through an extension callback.
 - File APIs are not a general filesystem browser. They are restricted to
   selected workspaces, valid Git worktrees, session-referenced directories, and
@@ -189,8 +275,8 @@ Deploy the frontend and API support together; no native OMP upgrade is required.
 
 - The session sidebar is the durable navigation model: projects, sessions,
   branches, worktrees, and files must agree about the selected workspace.
-- Streaming state is explicit. The UI reconciles Server-Sent Events with RPC
-  state so a background tab cannot remain falsely “running”.
+- Streaming state is explicit. The UI reconciles Server-Sent Events with the
+  session's state so a background tab cannot remain falsely “running”.
 - Desktop and mobile share the same core workflow. Mobile controls keep usable
   touch targets and a visible loading state rather than a blank shell.
 - Accessibility and motion preferences are first-class. Components use the
@@ -208,7 +294,7 @@ behavior, not blindly the implementation.
 Releases are independent:
 
 1. Run typecheck, lint, relevant tests, and a production build.
-2. Confirm `npm pack --dry-run` contains the built `.next` output and exposes
+2. Confirm `npm pack --dry-run` contains the built `dist/` output and exposes
    the `ompweb` binary.
 3. Publish `ompweb@<version>` only from an npm account authorized for that
    package.
@@ -217,7 +303,7 @@ Releases are independent:
 ## Non-goals
 
 - Reimplementing OMP, its provider registry, or its credential database.
-- Embedding Bun-only OMP SDK packages in the Node server.
+- Embedding Bun-only OMP SDK packages in the omp-web server.
 - Turning a local agent workspace into an internet-facing multi-user service.
 - Unrestricted filesystem browsing or arbitrary browser-triggered host tools.
 - Automatic bulk synchronization from `agegr/pi-web`.

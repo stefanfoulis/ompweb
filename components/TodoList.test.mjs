@@ -2,13 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { createJiti } from "jiti";
 
-const jiti = createJiti(import.meta.url, {
-  jsx: { runtime: "automatic" },
-  tsconfigPaths: true,
-});
-const { TodoList } = await jiti.import("./TodoList.tsx");
+const { TodoList } = await import("./TodoList.tsx");
 
 test("renders live todo phases, task states, and blockers", () => {
   const html = renderToStaticMarkup(React.createElement(TodoList, {
@@ -134,4 +129,15 @@ test("the scroll area is reachable by keyboard and named", () => {
   // announces "Tasks" for the region and again for the scroll area inside it.
   assert.match(html, /<section[^>]*aria-label="Tasks"/);
   assert.doesNotMatch(html, /role="group"[^>]*aria-label="Tasks"/);
+});
+
+test("merges live status into the tasks header row instead of a separate line (#245)", () => {
+  const html = renderToStaticMarkup(React.createElement(TodoList, {
+    phases: [{ name: "Implementation", tasks: [{ content: "Wire panels", status: "in_progress" }] }],
+    collapsible: true,
+    liveStatus: "Waiting for model...",
+  }));
+  assert.match(html, /Waiting for model\.\.\./);
+  assert.match(html, /0\/1 complete/);
+  assert.match(html, /role="status"/);
 });

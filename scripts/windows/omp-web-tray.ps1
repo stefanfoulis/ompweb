@@ -38,6 +38,16 @@ Add-Type -AssemblyName System.Drawing
 # -----------------------------------------------------------------------------
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
 $PkgJsonPath = Join-Path $RepoRoot "package.json"
+
+# The updater replaces this installation in place, and Windows refuses to rename a
+# directory that is a live process's working directory (ERROR_SHARING_VIOLATION).
+# Every path below is absolute, so the server and the shortcuts start outside it.
+$LaunchWorkingDirectory = $env:USERPROFILE
+# An empty value would make the child inherit the process's own directory, which is the
+# installation; refuse instead of silently reintroducing the lock.
+if ([string]::IsNullOrWhiteSpace($LaunchWorkingDirectory)) {
+    throw "USERPROFILE is empty: refusing to start omp-web from inside its installation directory."
+}
 $PkgVersion = "0.0.0"
 if (Test-Path $PkgJsonPath) {
     try {
@@ -76,9 +86,9 @@ if ($OpenBrowser) {
     $ShouldOpenBrowser = $true
 }
 
-# Fallback: if in start mode but .next directory does not exist, fall back to dev mode
-$NextDir = Join-Path $RepoRoot ".next"
-if ($EffectiveMode -eq "start" -and !(Test-Path $NextDir)) {
+# Fallback: if in start mode but the client build (dist\index.html) does not exist, fall back to dev mode
+$BuildIndex = Join-Path $RepoRoot "dist\index.html"
+if ($EffectiveMode -eq "start" -and !(Test-Path $BuildIndex)) {
     $EffectiveMode = "dev"
     if ($EffectivePort -eq 30177) {
         $EffectivePort = 30178
@@ -203,6 +213,17 @@ function Find-NodeExecutable {
 
 $NodeExe = Find-NodeExecutable
 
+# Copy an omp-web credential from the user (then system) environment into the
+# child, or remove it there. This launcher's own environment was captured at
+# logon, so a value changed or removed with `setx` since then must not survive
+# a server restart: the old password would keep working after rotation.
+function Set-ChildCredential($psi, [string]$name) {
+    $value = [Environment]::GetEnvironmentVariable($name, "User")
+    if ([string]::IsNullOrEmpty($value)) { $value = [Environment]::GetEnvironmentVariable($name, "Machine") }
+    if ([string]::IsNullOrEmpty($value)) { $psi.EnvironmentVariables.Remove($name) } else { $psi.EnvironmentVariables[$name] = $value }
+    return $value
+}
+
 function Start-WebServer {
     if ($script:ChildProcess -and !$script:ChildProcess.HasExited) {
         return
@@ -225,7 +246,7 @@ function Start-WebServer {
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $NodeExe
-    $psi.WorkingDirectory = $RepoRoot
+    $psi.WorkingDirectory = $LaunchWorkingDirectory
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $false
@@ -235,29 +256,29 @@ function Start-WebServer {
         $launcherJs = Join-Path $RepoRoot "bin\omp-web.js"
         $inner = "`"$NodeExe`" `"$launcherJs`" -p $EffectivePort -H $EffectiveHostname --no-open"
     } else {
-        $nextBin = Join-Path $RepoRoot "node_modules\next\dist\bin\next"
-        $inner = "`"$NodeExe`" `"$nextBin`" dev -H $EffectiveHostname -p $EffectivePort"
+        # The working directory is outside the installation, so both the dev entry and the config
+        # (Bun reads bunfig.toml from the working directory) are passed as absolute paths.
+        $inner = "`"$NodeExe`" `"$(Join-Path $RepoRoot 'bin\bun-runtime.js')`" `"--config=$(Join-Path $RepoRoot 'bunfig.toml')`" --hot `"$(Join-Path $RepoRoot 'server\dev.ts')`" -H $EffectiveHostname -p $EffectivePort"
     }
     $psi.FileName = $env:ComSpec
     $psi.Arguments = "/d /s /c `"$inner >> `"$childOutLog`" 2>&1`""
 
     # Environment variables
     $psi.EnvironmentVariables["OMP_WEB_PORT"] = [string]$EffectivePort
+    # The child runs outside the installation, so name it explicitly (dev mode derives its root from this).
+    $psi.EnvironmentVariables["OMP_WEB_PACKAGE_DIR"] = $RepoRoot
     $psi.EnvironmentVariables["OMP_WEB_HOSTNAME"] = [string]$EffectiveHostname
     $psi.EnvironmentVariables["OMP_WEB_SERVICE"] = "1"
     $psi.EnvironmentVariables["PORT"] = [string]$EffectivePort
 
-    # bin/omp-web.js refuses a non-loopback bind without OMP_WEB_PASSWORD, so do not
-    # rely on inheritance alone: a logon-time environment block can be stale (e.g.
-    # after `setx OMP_WEB_PASSWORD`), and the child would then crash-loop on start.
-    $childPassword = [Environment]::GetEnvironmentVariable("OMP_WEB_PASSWORD", "Process")
-    if ([string]::IsNullOrEmpty($childPassword)) {
-        $childPassword = [Environment]::GetEnvironmentVariable("OMP_WEB_PASSWORD", "User")
-    }
-    if (![string]::IsNullOrEmpty($childPassword)) {
-        $psi.EnvironmentVariables["OMP_WEB_PASSWORD"] = $childPassword
-    } else {
-        Write-ServiceLog "WARN: OMP_WEB_PASSWORD not found in the process or user environment; a non-loopback bind will be refused by bin/omp-web.js"
+    # bin/omp-web.js refuses a non-loopback bind without a password hash. A
+    # plaintext OMP_WEB_PASSWORD is passed through only so the server can refuse
+    # it with instructions; generate a hash with `ompweb hash-password`.
+    $childHash = Set-ChildCredential $psi "OMP_WEB_PASSWORD_HASH"
+    $null = Set-ChildCredential $psi "OMP_WEB_PASSWORD"
+    $null = Set-ChildCredential $psi "OMP_WEB_TRUSTED_HEADER_SHA256"
+    if ([string]::IsNullOrEmpty($childHash)) {
+        Write-ServiceLog "WARN: OMP_WEB_PASSWORD_HASH not found in the user or system environment; a non-loopback bind will be refused by bin/omp-web.js (generate one with: ompweb hash-password)"
     }
 
     $proc = New-Object System.Diagnostics.Process
@@ -356,7 +377,7 @@ function Set-AutostartShortcut([bool]$enable) {
             $shortcut = $wsh.CreateShortcut($startupLnk)
             $shortcut.TargetPath = $wscriptExe
             $shortcut.Arguments = "`"$launchVbs`" -Startup"
-            $shortcut.WorkingDirectory = $RepoRoot
+            $shortcut.WorkingDirectory = $LaunchWorkingDirectory
             if (Test-Path $IcoPath) {
                 $shortcut.IconLocation = "$IcoPath,0"
             }
@@ -423,6 +444,12 @@ $script:MenuItemStatus.Text = "  Status: Starting (Port $EffectivePort)"
 $script:MenuItemStatus.Enabled = $false
 $contextMenu.Items.Add($script:MenuItemStatus) | Out-Null
 
+# Item 2b: Host daemon indicator (`ompweb host`, registered as the omp-web-host task)
+$script:MenuItemDaemon = New-Object System.Windows.Forms.ToolStripMenuItem
+$script:MenuItemDaemon.Text = "  Daemon: Checking..."
+$script:MenuItemDaemon.Enabled = $false
+$contextMenu.Items.Add($script:MenuItemDaemon) | Out-Null
+
 $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
 # Item 3: Open in Browser
@@ -455,7 +482,7 @@ $contextMenu.Items.Add($script:MenuItemRestart) | Out-Null
 
 # Item 6: Toggle Start/Stop Server
 $script:MenuItemToggle = New-Object System.Windows.Forms.ToolStripMenuItem
-$script:MenuItemToggle.Text = "Stop Server"
+$script:MenuItemToggle.Text = "Stop Server (omp runs keep going)"
 $script:MenuItemToggle.add_Click({
     if ($script:State -eq "Running" -or $script:State -eq "Starting") {
         Stop-WebServer
@@ -534,6 +561,23 @@ $script:NotifyIcon.add_DoubleClick({
     try { [System.Diagnostics.Process]::Start($ServerUrl) | Out-Null } catch { }
 })
 
+# The supervisor (omp-web-host.ps1) holds a named mutex while it runs: opening it is an in-process
+# check. Only when it is not held do we shell out to schtasks to tell "Stopped" from "Not installed".
+function Get-HostDaemonState {
+    try {
+        $held = $null
+        if ([System.Threading.Mutex]::TryOpenExisting("Local\OmpWebHostDaemon_Instance_Mutex", [ref]$held)) {
+            $held.Dispose()
+            return "Running"
+        }
+        schtasks.exe /query /tn "omp-web-host" 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { return "Not installed" }
+        return "Stopped"
+    } catch { return "Unknown" }
+}
+$script:DaemonTicks = 0
+$script:DaemonState = "Checking..."
+
 function Update-TrayUI {
     $statusText = switch ($script:State) {
         "Running"  { "Running ($EffectivePort)" }
@@ -544,6 +588,7 @@ function Update-TrayUI {
     }
 
     $script:MenuItemStatus.Text = "  Status: $statusText"
+    $script:MenuItemDaemon.Text = "  Daemon: $($script:DaemonState)"
 
     # Limit tooltip text length (Windows NotifyIcon.Text max 63 characters)
     $tipText = "omp-web ($statusText)"
@@ -551,7 +596,7 @@ function Update-TrayUI {
     $script:NotifyIcon.Text = $tipText
 
     if ($script:State -eq "Running" -or $script:State -eq "Starting") {
-        $script:MenuItemToggle.Text = "Stop Server"
+        $script:MenuItemToggle.Text = "Stop Server (omp runs keep going)"
         $script:MenuItemRestart.Enabled = $true
     } else {
         $script:MenuItemToggle.Text = "Start Server"
@@ -568,6 +613,16 @@ $script:Timer.Interval = 3000
 
 $script:Timer.add_Tick({
     if ($script:IsExiting) { return }
+
+    # Every 5th tick (15 s) is enough for the daemon state.
+    if ($script:DaemonTicks % 5 -eq 0) {
+        $newDaemonState = Get-HostDaemonState
+        if ($newDaemonState -ne $script:DaemonState) {
+            $script:DaemonState = $newDaemonState
+            Update-TrayUI
+        }
+    }
+    $script:DaemonTicks++
 
     # Check child process state
     if ($script:ChildProcess -and $script:ChildProcess.HasExited) {

@@ -1,13 +1,21 @@
-# ompweb
+<div align="center">
 
-[![npm version](https://img.shields.io/npm/v/@kahme247/ompweb.svg?logo=npm&color=e05d44)](https://www.npmjs.com/package/@kahme247/ompweb)
-[![node version](https://img.shields.io/node/v/@kahme247/ompweb.svg?logo=node.js&color=44cc11)](https://nodejs.org)
-[![license](https://img.shields.io/github/license/kahme247/ompweb.svg?color=44cc11)](./LICENSE)
-[![npm downloads](https://img.shields.io/npm/dm/@kahme247/ompweb.svg?color=44cc11)](https://www.npmjs.com/package/@kahme247/ompweb)
-[![GitHub stars](https://img.shields.io/github/stars/kahme247/ompweb.svg?logo=github)](https://github.com/kahme247/ompweb/stargazers)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/kahme247/ompweb/pulls)
+<img src="public/icon.svg" alt="ompweb logo" width="150">
 
-[English](./README.md) | [简体中文](./README.zh-CN.md) | [日本語](./README.ja.md)
+<h1>ompweb</h1>
+
+<p>
+  <a href="https://www.npmjs.com/package/@kahme247/ompweb"><img src="https://img.shields.io/npm/v/@kahme247/ompweb.svg?logo=npm&amp;color=e05d44" alt="npm version"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/@kahme247/ompweb.svg?logo=node.js&amp;color=44cc11" alt="node version"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/github/license/ompweb-dev/ompweb.svg?color=44cc11" alt="license"></a>
+  <a href="https://www.npmjs.com/package/@kahme247/ompweb"><img src="https://img.shields.io/npm/dm/@kahme247/ompweb.svg?color=44cc11" alt="npm downloads"></a>
+  <a href="https://github.com/ompweb-dev/ompweb/stargazers"><img src="https://img.shields.io/github/stars/ompweb-dev/ompweb.svg?logo=github" alt="GitHub stars"></a>
+  <a href="https://github.com/ompweb-dev/ompweb/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
+</p>
+
+</div>
+
+[English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md) | [日本語](./README.ja.md)
 
 社区：[加入 OMPWEB Discord](https://discord.gg/evqgGzRfM5)
 
@@ -26,8 +34,12 @@
 
 ## 环境要求
 
-- 已安装 [omp](https://github.com/can1357/oh-my-pi) 且在 `PATH` 中（或通过 `OMP_WEB_OMP_BIN` 指定路径）
-- Node.js `>= 22.19.0`
+- 无需另行安装 omp：ompweb 使用自己的 [omp](https://github.com/can1357/oh-my-pi) 构建 `ompweb-omp`，直接使用 `~/.omp` 中的设置、认证和会话。该构建由 [oh-my-pi 分支](https://github.com/ompweb-dev/oh-my-pi/releases)构建并发布，而不是 ompweb。每种安装方式（npm、npx 或单一可执行文件）都会在首次启动时从其 ompweb 版本固定的分支发布（`omp-runner.json`）下载 `ompweb-omp`，校验 SHA-256 后保存（单一可执行文件放在同一目录，其他方式放在 `~/.omp/agent/omp-web/omp/<version>/<发布标签>/`）；也可用 `ompweb fetch-omp` 手动获取。支持的平台为 linux-x64、linux-arm64、darwin-x64、darwin-arm64 和 windows-x64；在其他平台（musl 的 Linux、Arm 版 Windows、FreeBSD）上无法启动会话。无法访问 GitHub 的机器请将 `OMP_WEB_OMP_BIN` 指向该发布的 `ompweb-omp-<os>-<arch>` 副本
+- Node.js `>= 24`。服务器运行在 [Bun](https://bun.sh) 上，Bun 会作为 npm 包的依赖自动安装（找不到随包安装的 Bun 时使用 `PATH` 中的 Bun）
+
+排队消息的 **Steer**、**Delete** 和 **Edit** 操作是 `ompweb-omp` 通道的命令（`promote_queued_message`、`remove_queued_message`）。只有 omp 确认取消后才会移除消息；编辑时也必须先取消成功，再将文本恢复到输入框。消息已不在队列中时，界面保留队列并显示提示；ompweb 不会重复发送一条引导消息。
+
+队列面板显示 omp 自身的队列（`get_state` 中的 `queuedMessages` 和 `queue_update` 事件），因此查看同一会话的所有设备都会看到相同的排队消息。**Stop** 会将仍在队列中等待的消息文本放回输入框，而不是让智能体运行它们；但模型已通过实时引导接收的引导消息仍会运行。
 
 ## 快速开始
 
@@ -44,6 +56,8 @@ npm install -g @kahme247/ompweb
 ompweb
 ```
 
+每个版本也提供**无需 Node 或 npm 的单一可执行文件**，用法见英文 README 的 [Single binary](README.md#single-binary)。
+
 在浏览器中打开 [http://127.0.0.1:30177](http://127.0.0.1:30177)。
 
 ### CLI 选项
@@ -51,18 +65,55 @@ ompweb
 ```bash
 ompweb --port 8080                         # 自定义端口
 ompweb --hostname 0.0.0.0                  # 监听网络地址
-ompweb --password "your-password"          # 启用密码保护
+ompweb hash-password                      # 输出 OMP_WEB_PASSWORD_HASH 的值
+ompweb fetch-omp                          # 从固定的分支发布下载 ompweb-omp（校验 SHA-256，仅在缺失时）
+ompweb preflight                          # 像新会话一样启动一次 omp 并等待其 hello；失败时说明原因并以 1 退出
 ompweb --no-open                           # 不自动打开浏览器
 ```
+
+### 密码保护
+
+omp-web **绝不把明文密码交给服务器**：每个 `omp` 会话都会继承服务器的环境变量，
+智能体只要运行 `env` 就会把密码写入会话文件并发送给模型提供商。使用
+`--password` 会导致启动被拒绝。`OMP_WEB_PASSWORD` 暂时仍可使用：`ompweb`
+会在启动时将其哈希、使其不进入服务器的环境变量，并在日志中输出警告，附上应设置为
+`OMP_WEB_PASSWORD_HASH` 的哈希值。请尽快切换：智能体仍能从 `ompweb` 启动器进程中
+读取明文，而且每次启动都会生成新的哈希，每次重启都会让所有浏览器退出登录。
+同时设置两个变量会导致启动被拒绝，请删除 `OMP_WEB_PASSWORD`。
+
+请改用哈希：
+
+```bash
+ompweb hash-password                       # 输入两次，内容不回显
+echo "a-long-random-password" | ompweb hash-password   # 也可通过管道输入
+
+OMP_WEB_PASSWORD_HASH='scrypt$15$8$1$…' ompweb
+```
+
+`ompweb hash-password` 从标准输入读取密码（绝不作为命令行参数），因此不会
+留在 shell 历史或 `ps` 输出中。哈希使用 scrypt（N = 2^15、r = 8、p = 1）
+与 16 字节随机盐，输出格式为 `scrypt$<ln>$<r>$<p>$<salt>$<digest>`。
+即使读到哈希也无法用它登录，更无法还原出密码。
+
+会话签名不使用密码哈希。首次启动时会生成随机签名密钥并保存到
+`~/.omp/agent/omp-web/web-auth-secret.json`（权限 `0600`），再与哈希混合得到
+签名密钥：修改密码会让已有会话失效，而仅凭保存的哈希无法伪造会话。
+
+服务安装脚本（`ompweb systemd install`、`ompweb-launchd install`、Linux 托盘、
+Windows 服务）仍在安装时接受 `OMP_WEB_PASSWORD`，但在写入配置前会先做哈希，
+最终只保存哈希。
 
 ## 功能特性
 
 - **实时对话**：与本地 `omp` 智能体进行低延迟流式交互。
-- **队列删除确认**：从队列面板移除后续消息或引导消息前，先预览内容并确认。此操作不会取消 OMP 内部已排队消息的发送。
+- **队列删除确认**：取消 OMP 中排队的后续消息或引导消息前，先预览内容并确认。需要原生支持 `remove_queued_message`；已发送的消息无法撤回。
 - **会话管理**：按项目浏览历史会话，支持会话分叉与分支回溯。
 - **草稿恢复**：未发送的文本按会话或新会话的工作区分别保存；浏览器存储可用时，在同一标签页后退、前进或重新加载后可恢复（最多 50 份草稿）。图片和文件附件仅保留在内存中。
 - **实时任务与子智能体**：可折叠面板实时展示任务清单（todo）与子智能体进度，并支持查看完整转录。
 - **文件管理与预览**：与对话并排浏览文件，支持代码、Markdown、图片、音频及 PDF 预览。
+- **各主机的文件**：文件浏览、搜索、预览、下载和实时更新都通过文件所属主机的守护进程执行。上传每个文件最多 2 GiB，不再限制批次总大小为 100 MiB。预览限制仍为文本 256 KiB、图片及 DOCX 10 MiB。切换对话不会改变文件标签页所属的主机。
+- **各主机的工作区**：Git 差异、工作树操作、目录浏览以及 HTTPS/SSH 仓库克隆均在所属主机执行。取消克隆会等待进程退出和安全清理；连接中断时会明确提示结果未知。
+- 若清理克隆时目标目录被替换，捕获的数据会保存在私有隔离目录中，错误信息会显示其位置。删除或恢复前请先检查内容。
 - **Git Worktree 支持**：直接在侧边栏切换与管理 Git 工作树。
 - **可视化设置**：在 Web 界面中直接配置模型、API 密钥、MCP 服务器、技能、插件及 OMP 原生设置。
 - **快捷指令与命令面板**：内置常用指令（`/plan`、`/review`、`/fix`、`/test` 等）及 `⌘K` / `Ctrl+K` 全局面板。
@@ -74,35 +125,40 @@ ompweb --no-open                           # 不自动打开浏览器
 | --- | --- | --- |
 | `PORT` | 服务端口 | `30177` |
 | `OMP_WEB_HOSTNAME` | 绑定主机名 | `127.0.0.1` |
-| `OMP_WEB_PASSWORD` | 可选的 Web 访问密码 | _无（未启用验证）_ |
+| `OMP_WEB_PASSWORD_HASH` | Web 登录密码的 scrypt 哈希（由 `ompweb hash-password` 生成）。绑定非回环地址时必须设置 | _无（未启用验证）_ |
+| `OMP_WEB_TRUSTED_HEADER_SHA256` | 受信任的反向代理在 `X-Omp-Web-Auth` 请求头中发送的密钥的 SHA-256 摘要（十六进制）；请求头哈希匹配的请求无需密码。omp-web 不保存密钥本身。生成方法和 nginx 配置示例见英文 README 的 “Skipping the password on trusted networks” 一节 | _无（未启用）_ |
 | `OMP_WEB_NO_OPEN` | 设为 `1` 时禁止自动打开浏览器 | `0` |
 | `OMP_WEB_DISABLE_AUTOUPDATE` | 设为 `1` 时禁用更新检查和应用内更新；修改后需重启 | `0` |
-| `OMP_WEB_OMP_BIN` | `omp` 二进制路径（未在 PATH 时使用） | _自动检测_ |
+| `OMP_WEB_NAME` | 浏览器标签页和已安装应用中显示的名称。设为 `url`、`host` 或 `domain`（不区分大小写）时使用浏览器所连接的主机名（不含端口），localhost 和 IP 地址仍显示 `omp web`；其他值按原样使用。修改后需重启 | `omp web` |
+| `OMP_WEB_OMP_BIN` | 用于替代下载版本的 `ompweb-omp` 构建路径（无法访问 GitHub 的机器上为分支发布中 `ompweb-omp-<os>-<arch>` 的副本，或从分支自行构建的 runner）。普通的 `omp` 不支持 ompweb 的通道，无法使用。服务安装程序仅在你设置了它时才写入服务环境 | _下载的 `ompweb-omp`_ |
 | `PI_CODING_AGENT_DIR` | 自定义 omp agent 目录 | `~/.omp/agent` |
-| `OMP_WEB_STT_ENDPOINT` | OpenAI 兼容的语音转文字接口 URL | _无（默认禁用）_ |
+| `OMP_WEB_STT_ENDPOINT` | OpenAI 兼容的语音转文字接口 URL。不设置时使用 `OMP_WEB_STT_MODEL` 通过 omp 自身的凭据转录 | _无_ |
 | `OMP_WEB_STT_KEY` | STT 接口对应的 API Key | _无_ |
-| `OMP_WEB_STT_MODEL` | STT 接口的模型名称 | _无_ |
+| `OMP_WEB_STT_MODEL` | STT 接口的模型名称。未设置接口时：使用 omp 登录凭据运行的 omp 语音转文字模型，例如 `openai-codex/codex-transcribe`（ChatGPT 订阅；需要包含该模型的 omp 版本） | _无（未设置接口时禁用）_ |
+
+**`OMP_WEB_NAME` 与已安装应用。** 已安装应用（PWA）通常以安装时所在页面的名称命名。如果之后修改了 `OMP_WEB_NAME`，或在 `OMP_WEB_NAME` 为 `url`、`host` 或 `domain` 时通过其他地址访问 omp-web，操作系统可能也会重命名已安装的应用。建议将 `OMP_WEB_NAME` 留空，或设置一个无论通过哪个域名或地址访问都能识别这台 omp-web 服务器的名称。
 
 ## 本地开发
 
 ```bash
-git clone https://github.com/kahme247/ompweb.git
+git clone https://github.com/ompweb-dev/ompweb.git
 cd ompweb
 npm install
+npm run fetch-omp   # ompweb 的 omp runner（omp-runner.json 固定的分支发布）
 npm run dev
 ```
 
-本地开发服务器运行在 [http://127.0.0.1:30178](http://127.0.0.1:30178)。
+本地开发服务器运行在 [http://127.0.0.1:30178](http://127.0.0.1:30178)。它使用 `npm run fetch-omp` 下载的 runner（每个固定版本一次）；`npm run smoke` 和 `npm run build:binary` 会自行下载。
+
+`npm run dev` 以 Bun 热重载方式运行服务器。`npm run build` 将浏览器端应用打包到 `dist/`，`npm start` 在 30177 端口提供该产物（可用 `npm run smoke` 检查结果）。`npm run dev:lan` 会将开发服务器绑定到所有网络接口。
 
 ### 代码检查
 
 ```bash
 npm run typecheck   # TypeScript 类型检查
 npm run lint        # ESLint 检查
-npm test            # 运行测试套件
+npm test            # 运行测试套件 (bun test)
 ```
-
-> **注意**：本地开发期间请勿运行 `npm run build`，以免污染 `.next/` 导致开发服务器异常。
 
 ## 致谢与许可证
 

@@ -1,45 +1,11 @@
-import { NextRequest, NextResponse } from "next/server";
-import { apiErrorResponse } from "@/lib/api-utils";
-import { stat } from "fs/promises";
-import {
-  getBrowseStartDirectory,
-  getParentDirectory,
-  listDirectories,
-  listWindowsDrives,
-  resolveDirectory,
-  shouldShowWindowsDrivePicker,
-} from "@/lib/directory-browser";
+import { apiErrorResponse, opErrorResponse, resolveWorkspaceHost } from "@/lib/api-utils";
 
-// GET /api/cwd/browse?path=... — lists readable subdirectories in the filesystem.
-export async function GET(request: NextRequest) {
+export async function GET(request: Request) {
   try {
-    const requested = request.nextUrl.searchParams.get("path")?.trim();
-    if (shouldShowWindowsDrivePicker(requested)) {
-      return NextResponse.json({ path: "", parentPath: null, drives: await listWindowsDrives(), directories: [] });
-    }
-    const candidate = getBrowseStartDirectory(requested);
-
-    let resolved: string;
-    try {
-      resolved = await resolveDirectory(candidate);
-    } catch {
-      return NextResponse.json({ error: "Directory does not exist", code: "directory_not_found" }, { status: 404 });
-    }
-
-
-    const directoryStat = await stat(resolved);
-    if (!directoryStat.isDirectory()) {
-      return NextResponse.json({ error: "Path is not a directory", code: "not_a_directory" }, { status: 400 });
-    }
-
-    const directories = await listDirectories(resolved);
-
-    return NextResponse.json({
-      path: resolved,
-      parentPath: getParentDirectory(resolved),
-      directories,
-    });
-  } catch (error) {
-    return apiErrorResponse(error);
-  }
+    const params = new URL(request.url).searchParams;
+    const resolved = await resolveWorkspaceHost(params.get("hostId") ?? undefined, null);
+    if ("response" in resolved) return resolved.response;
+    const result = await resolved.host.workspaceOps.browseDirectories(params.get("path"));
+    return result.ok ? Response.json(result.value) : opErrorResponse(result);
+  } catch (error) { return apiErrorResponse(error); }
 }

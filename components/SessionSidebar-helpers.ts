@@ -1,4 +1,6 @@
+import { isLinkUp, type HostStatus } from "@/lib/hosts/host";
 import type { SessionInfo } from "@/lib/types";
+import { LOCAL_HOST_ID, type ProjectSortMode } from "@/lib/project-ordering";
 import { comparableProjectPath } from "@/lib/comparable-path";
 interface WorktreeEntry {
   path: string;
@@ -7,6 +9,7 @@ interface WorktreeEntry {
 }
 
 interface WorktreeState {
+  hostId: string;
   /** The cwd this data was fetched for — guards against stale responses */
   forCwd: string;
   projectRoot: string;
@@ -15,6 +18,22 @@ interface WorktreeState {
    *  because subdir sessions keep their own project identity */
   isTopLevel: boolean;
   worktrees: WorktreeEntry[];
+  error?: string;
+}
+/** The active Git workspace's worktrees plus the actions that change them
+ *  (owned by SessionSidebar, rendered by the file panel's Worktrees tab). */
+interface WorktreeContext {
+  hostId: string;
+  projectRoot: string;
+  worktrees: WorktreeEntry[];
+  error?: string;
+  /** Path of the worktree the workspace currently points at. */
+  currentPath: string;
+  select(path: string): void;
+  /** Creates the branch's worktree and selects it; rejects with an Error whose message is user-facing. */
+  create(branch: string): Promise<void>;
+  /** Resolves "dirty" when the worktree has uncommitted changes and force was false; rejects with a user-facing Error otherwise. */
+  remove(path: string, force: boolean): Promise<"removed" | "dirty">;
 }
 /** Normalize a repository/project path for use as a Git-state map key. The
  *  same physical repo may be reached via different path spellings (forward /
@@ -89,6 +108,27 @@ function saveExpandedProjects(paths: Set<string>): void {
     // ignore storage quota / privacy-mode errors
   }
 }
+const PROJECT_SORT_STORAGE_KEY = "omp-web:project-sort";
+
+function loadProjectSortMode(): ProjectSortMode {
+  if (typeof window === "undefined") return "none";
+  try {
+    const raw = window.localStorage.getItem(PROJECT_SORT_STORAGE_KEY);
+    return raw === "alphabetical" || raw === "updated" ? raw : "none";
+  } catch {
+    return "none";
+  }
+}
+
+function saveProjectSortMode(mode: ProjectSortMode): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (mode === "none") window.localStorage.removeItem(PROJECT_SORT_STORAGE_KEY);
+    else window.localStorage.setItem(PROJECT_SORT_STORAGE_KEY, mode);
+  } catch {
+    // ignore storage quota / privacy-mode errors
+  }
+}
 /** Substitute the home dir prefix with ~ (no path truncation — see PathLabel) */
 function displayCwd(cwd: string, homeDir?: string): string {
   return (homeDir && cwd.startsWith(homeDir)) ? "~" + cwd.slice(homeDir.length) : cwd;
@@ -123,7 +163,7 @@ interface SessionTreeNode {
   children: SessionTreeNode[];
 }
 
-function buildSessionTree(sessions: SessionInfo[]): SessionTreeNode[] {
+function buildSessionTree(sessions: SessionInfo[], scores?: Map<string, number>): SessionTreeNode[] {
   const byId = new Map<string, SessionTreeNode>();
   for (const s of sessions) {
     byId.set(s.id, { session: s, children: [] });
@@ -158,13 +198,49 @@ function buildSessionTree(sessions: SessionInfo[]): SessionTreeNode[] {
     }
   }
 
-  // Sort each level by modified desc
+  // Sort each level by search score (when searching), then modified desc
   const sort = (nodes: SessionTreeNode[]) => {
-    nodes.sort((a, b) => b.session.modified.localeCompare(a.session.modified));
+    nodes.sort((a, b) => ((scores?.get(b.session.id) ?? 0) - (scores?.get(a.session.id) ?? 0)) || b.session.modified.localeCompare(a.session.modified));
     nodes.forEach((n) => sort(n.children));
   };
   sort(roots);
   return roots;
+}
+/** Where a live session runs: its cwd and, on a remote host, that host's id. */
+interface LivePlace {
+  cwd: string;
+  hostId?: string;
+  poolId?: string;
+  projectId?: string;
+  projectKey?: string;
+  /** Running entries only: a blocking dialog waits for the user. */
+  awaitingInput?: boolean;
+}
+
+/** Where a live session the session list lacks gets its placeholder row: the
+ *  freshest source that knows it, host included, so a remote run is never
+ *  grouped under This machine; else the selected workspace. */
+function livePlace(
+  id: string,
+  optimistic: (LivePlace & { id: string }) | null | undefined,
+  running: Readonly<Record<string, LivePlace>>,
+  exited: ReadonlyMap<string, LivePlace>,
+  known: ReadonlyMap<string, LivePlace>,
+  selected: LivePlace,
+): LivePlace {
+  return (optimistic?.id === id ? optimistic : undefined) ?? running[id] ?? exited.get(id) ?? known.get(id) ?? selected;
+}
+/** True when a host is link-up in `next` but was not in `prev` (a host new to
+ *  the list counts). On the first snapshot (`prev` null) only a linked remote
+ *  host counts: the initial load already has this machine's sessions, but a
+ *  remote host may have linked after that load. */
+function hostsCameOnline(
+  prev: ReadonlyArray<{ id: string; status: HostStatus }> | null,
+  next: ReadonlyArray<{ id: string; status: HostStatus }>,
+): boolean {
+  if (!prev) return next.some((host) => host.id !== LOCAL_HOST_ID && isLinkUp(host.status));
+  const wasUp = new Set(prev.filter((host) => isLinkUp(host.status)).map((host) => host.id));
+  return next.some((host) => isLinkUp(host.status) && !wasUp.has(host.id));
 }
 const MAX_PROJECT_SESSIONS = 5;
 export {
@@ -177,13 +253,19 @@ export {
   buildSessionTree,
   displayCwd,
   formatRelativeTime,
+  hostsCameOnline,
+  livePlace,
   loadExpandedProjects,
+  loadProjectSortMode,
   loadUnreadSessionIds,
   normalizeProjectKey,
   projectLabel,
   saveExpandedProjects,
+  saveProjectSortMode,
   saveUnreadSessionIds,
+  type LivePlace,
   type SessionTreeNode,
+  type WorktreeContext,
   type WorktreeEntry,
   type WorktreeState,
 };

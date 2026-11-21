@@ -3,6 +3,7 @@
 import React, { useMemo, useState } from "react";
 import { Check, ChevronLeft, ChevronRight, Plus, Search } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
+import { groupModelsForPicker, versionOf } from "@/lib/model-families";
 import { providerInitials } from "./ModelsConfig-types";
 import type { ModelOption } from "./ChatInput-model-options";
 
@@ -116,11 +117,18 @@ export function ModelPickerPanel({
       ? currentModel?.provider ?? null
       : groups[0]?.provider ?? null;
 
-  const leftModels = searching
-    ? filteredModelOptions
-    : (groups.find((group) => group.provider === activeProvider)?.options ?? []);
+  const leftModels = useMemo(
+    () => (searching ? filteredModelOptions : (groups.find((group) => group.provider === activeProvider)?.options ?? [])),
+    [searching, filteredModelOptions, groups, activeProvider],
+  );
 
   const leftGroups = searching ? filteredGroups : null;
+  // Sections only apply to the per-provider (non-searching) pane: a search
+  // flattens across providers and families alike, same as before.
+  const { latest: leftLatestModels, all: leftAllModels } = useMemo(
+    () => groupModelsForPicker(leftModels),
+    [leftModels],
+  );
   const showProviderRail = !searching && (!isMobile || selectedProvider === null);
   const showModelPane = searching || !isMobile || selectedProvider !== null;
 
@@ -128,7 +136,7 @@ export function ModelPickerPanel({
     onSelectModel(opt.provider, opt.modelId);
   };
 
-  const renderModelRow = (opt: ModelOption, opts?: { showProvider?: boolean }) => {
+  const renderModelRow = (opt: ModelOption, opts?: { showProvider?: boolean; snapshot?: boolean }) => {
     const isActive = Boolean(currentModel)
       && opt.modelId === currentModel?.modelId
       && opt.provider === currentModel?.provider;
@@ -136,6 +144,7 @@ export function ModelPickerPanel({
       <button
         className="picker-row"
         data-active={isActive}
+        data-snapshot={opts?.snapshot ? "true" : undefined}
         type="button"
         key={`${opt.provider}:${opt.modelId}`}
         role="menuitemradio"
@@ -237,7 +246,12 @@ export function ModelPickerPanel({
                 {showModelsLoading ? t("chatInput.loadingModels") : t("chatInput.noAvailableModels")}
               </div>
             ) : (
-              leftModels.map((opt) => renderModelRow(opt))
+              <>
+                <div className="picker-group-label">{t("chatInput.modelsLatest")}</div>
+                {leftLatestModels.map((opt) => renderModelRow(opt))}
+                <div className="picker-group-label picker-section-divider">{t("chatInput.modelsAllVersions")}</div>
+                {leftAllModels.map((opt) => renderModelRow(opt, { snapshot: versionOf(opt).snapshot }))}
+              </>
             )}
           </div>
         )}

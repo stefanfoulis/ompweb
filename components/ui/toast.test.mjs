@@ -2,13 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { createJiti } from "jiti";
 
-const jiti = createJiti(import.meta.url, {
-  jsx: { runtime: "automatic" },
-  tsconfigPaths: true,
-});
-const { ClampedDescription, clampDescriptionStyle } = await jiti.import("./toast.tsx");
+const { ClampedDescription, clampDescriptionStyle, resolveToastTimeout } = await import("./toast.tsx");
 
 const TOOL_LIST = "xd://: mounted mcp__ida_reverse_engineering_ida_address_context, mcp__ida_decompile";
 
@@ -37,4 +32,13 @@ test("clamp style helper drops the clamp when expanded", () => {
   assert.equal(expanded.WebkitLineClamp, undefined);
   assert.equal(expanded.overflow, undefined);
   assert.equal(expanded.cursor, "default");
+});
+
+test("toasts default to 6s, errors to 10s, and an explicit timeout (including sticky 0) wins", () => {
+  assert.equal(resolveToastTimeout("info"), 6000);
+  assert.equal(resolveToastTimeout("success"), 6000);
+  assert.equal(resolveToastTimeout("error"), 10000);
+  assert.equal(resolveToastTimeout("error", { timeout: 12000 }), 12000);
+  assert.equal(resolveToastTimeout("info", { duration: 2000 }), 2000);
+  assert.equal(resolveToastTimeout("info", { timeout: 0 }), 0);
 });

@@ -2,14 +2,29 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { createJiti } from "jiti";
+import { JSDOM } from "jsdom";
 
-const jiti = createJiti(import.meta.url, {
-  jsx: { runtime: "automatic" },
-  tsconfigPaths: true,
+const { ChatInput, ModelErrorBanner, filterModelOptions } = await import("./ChatInput.tsx");
+const { setDraft, clearDraft } = await import("@/lib/draft-store");
+
+test("provider-defined reasoning levels appear once in the trigger", () => {
+  for (const thinkingLevel of ["ultra", "ultrathink-extended", "constructor"]) {
+    const html = renderToStaticMarkup(React.createElement(ChatInput, {
+      async onSend() { return { status: "accepted" }; },
+      onThinkingLevelChange() {},
+      thinkingLevel,
+      isStreaming: false,
+    }));
+    const dom = new JSDOM(html);
+    try {
+      const trigger = dom.window.document.querySelector(".composer-thinking-control > button");
+      assert.equal(trigger.textContent, thinkingLevel);
+      assert.ok(trigger.getAttribute("aria-label").endsWith(`: ${thinkingLevel}`));
+    } finally {
+      dom.window.close();
+    }
+  }
 });
-const { ChatInput, ModelErrorBanner, filterModelOptions } = await jiti.import("./ChatInput.tsx");
-const { setDraft, clearDraft } = await jiti.import("@/lib/draft-store");
 
 test("shows Queue instead of Stop for typed text during a run", () => {
   const draftKey = "chat-input-queue-action-test";
@@ -17,7 +32,7 @@ test("shows Queue instead of Stop for typed text during a run", () => {
   try {
     const html = renderToStaticMarkup(
       React.createElement(ChatInput, {
-        onSend() {},
+        async onSend() { return { status: "accepted" }; },
         onAbort() {},
         onFollowUp() {},
         isStreaming: true,
@@ -50,10 +65,111 @@ test("does not render an empty model error", () => {
   assert.equal(renderToStaticMarkup(React.createElement(ModelErrorBanner, { error: null })), "");
 });
 
+test("formats structured Claude low-priority state in the browser locale", () => {
+  const resetsAtSec = Math.floor(Date.now() / 1000) + 3_600;
+  const time = new Date(resetsAtSec * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const html = renderToStaticMarkup(
+    React.createElement(ChatInput, {
+      async onSend() { return { status: "accepted" }; },
+      isStreaming: false,
+      usageLimit: { stage: "low_priority", resetsAtSec, allowanceLeftPercent: 62 },
+    }),
+  );
+  assert.match(html, new RegExp(`low priority until ${time.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")} · 62% left`));
+});
+
+test("formats every Claude usage-limit stage", () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const shortReset = nowSec + 3_600;
+  const longReset = nowSec + 86_400;
+  const shortTime = new Date(shortReset * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const longTime = new Date(longReset * 1000).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  const rows = [
+    [{ stage: "low_priority", resetsAtSec: shortReset }, `low priority until ${shortTime}`],
+    [{ stage: "wrap_up", extraUsage: false }, "limit reached · wrapping up"],
+    [{ stage: "wrap_up", resetsAtSec: shortReset, extraUsage: false }, `limit reached · wrapping up · resets ${shortTime}`],
+    [{ stage: "wrap_up", extraUsage: true }, "limit reached · wrap-up, then extra usage"],
+    [{ stage: "low_priority", resetsAtSec: longReset }, `low priority until ${longTime}`],
+  ];
+  for (const [usageLimit, label] of rows) {
+    const html = renderToStaticMarkup(
+      React.createElement(ChatInput, { async onSend() { return { status: "accepted" }; }, isStreaming: false, usageLimit }),
+    );
+    assert.ok(html.includes(label), `${JSON.stringify(usageLimit)} should render ${label}`);
+  }
+});
+
+test("never renders a null percentage, an invalid date, or a past reset clock", () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const pastSec = nowSec - 3_600;
+  const rows = [
+    { stage: "low_priority", resetsAtSec: nowSec + 3_600, allowanceLeftPercent: null },
+    { stage: "low_priority", resetsAtSec: nowSec + 3_600, allowanceLeftPercent: Number.NaN },
+    { stage: "low_priority", resetsAtSec: null, allowanceLeftPercent: 62 },
+    { stage: "low_priority", resetsAtSec: undefined, allowanceLeftPercent: 62 },
+    { stage: "low_priority", resetsAtSec: null },
+    { stage: "low_priority", resetsAtSec: pastSec, allowanceLeftPercent: 62 },
+    { stage: "wrap_up", resetsAtSec: null, extraUsage: false },
+    { stage: "wrap_up", resetsAtSec: pastSec, extraUsage: false },
+  ];
+  for (const usageLimit of rows) {
+    const html = renderToStaticMarkup(
+      React.createElement(ChatInput, { async onSend() { return { status: "accepted" }; }, isStreaming: false, usageLimit }),
+    );
+    const label = `${JSON.stringify(usageLimit)} -> ${html}`;
+    // "null" / "NaN" / "Invalid Date" reaching the label is the bug this pins:
+    // every one of them is a value the user would plan their session around.
+    assert.ok(!html.includes("Invalid Date"), `invalid date rendered: ${label}`);
+    assert.ok(!html.includes("null%"), `null percentage rendered: ${label}`);
+    assert.ok(!html.includes("NaN%"), `NaN percentage rendered: ${label}`);
+    // A reset already in the past must not render a plausible wrong clock.
+    if (usageLimit.resetsAtSec === pastSec) {
+      assert.ok(!html.includes(new Date(pastSec * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })),
+        `past reset clock rendered: ${label}`);
+    }
+  }
+  // The allowance is still worth showing when the reset time is unusable.
+  assert.match(
+    renderToStaticMarkup(
+      React.createElement(ChatInput, {
+        async onSend() { return { status: "accepted" }; },
+        isStreaming: false,
+        usageLimit: { stage: "low_priority", resetsAtSec: null, allowanceLeftPercent: 62 },
+      }),
+    ),
+    /low priority · 62% left/,
+  );
+  // ...and something is still shown when neither is usable.
+  assert.match(
+    renderToStaticMarkup(
+      React.createElement(ChatInput, {
+        async onSend() { return { status: "accepted" }; },
+        isStreaming: false,
+        usageLimit: { stage: "low_priority", resetsAtSec: null },
+      }),
+    ),
+    /class="composer-usage-limit-badge"[^>]*>low priority</,
+  );
+});
+
+test("shows the Slow toggle only when omp reports /slow applies, pressed when enabled", () => {
+  const render = (props) => renderToStaticMarkup(
+    React.createElement(ChatInput, { async onSend() { return { status: "accepted" }; }, isStreaming: false, onSlowModeChange() {}, ...props }),
+  );
+  // Older omp omits the field; an unsupported model reports false.
+  for (const props of [{}, { slowModeSupported: false, slowModeEnabled: true }]) {
+    assert.doesNotMatch(render(props), /composer-slow-control/);
+  }
+  assert.match(
+    render({ slowModeSupported: true, slowModeEnabled: true }),
+    /<button[^>]*class="composer-slow-control"[^>]*aria-pressed="true"/,
+  );
+});
+
 test("keeps the model selector visible when a model error leaves no options", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       onModelChange() {},
       isStreaming: false,
@@ -71,7 +187,7 @@ test("keeps the model selector visible when a model error leaves no options", ()
 test("renders goal, planning, and advisor indicators at the composer", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       onModelChange() {},
       isStreaming: false,
@@ -93,23 +209,10 @@ test("renders goal, planning, and advisor indicators at the composer", () => {
   assert.match(html, /aria-label="(More actions|chatInput\.plusMenu)"/);
 });
 
-test("renders the compact toolbar action", () => {
-  const html = renderToStaticMarkup(
-    React.createElement(ChatInput, {
-      onSend() {},
-      onAbort() {},
-      onCompact() {},
-      isStreaming: false,
-    }),
-  );
-
-  assert.match(html, /title="(Compact context|chatInput\.compactContext)"/);
-});
-
 test("shows the advisor thunder indicator with the reviewing model and reasoning", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       isStreaming: true,
       advisorActive: true,
@@ -135,17 +238,28 @@ test("filters model options by display name, identifier, and provider", () => {
 test("renders single queued prompt in compact bar", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       isStreaming: true,
       queuedMessages: {
         followUp: ["First follow-up task"],
         steering: [],
+        messageOrigins: {
+          followUp: [{
+            v: 1, kind: "session", sentAt: "2026-11-15T12:41:00.000Z",
+            session: {
+              id: "source", name: "Build session", hostId: "local", hostLabel: "This machine",
+              tool: "send_to_session", delivery: "followUp",
+            },
+          }],
+          steering: [],
+        },
       },
     }),
   );
 
   assert.match(html, /First follow-up task/);
+  assert.match(html, /\[From Build session\]/);
   assert.match(html, />(Edit|chatInput\.queuedEdit)</);
   assert.match(html, />(Delete|chatInput\.queuedDelete)</);
   assert.match(html, />(Steer|chatInput\.queuedSteerAction)</);
@@ -154,7 +268,7 @@ test("renders single queued prompt in compact bar", () => {
 test("keeps editing and deletion but hides Steer for a single queued steer", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       onPromoteQueuedToSteer() {},
       isStreaming: true,
@@ -174,7 +288,7 @@ test("keeps editing and deletion but hides Steer for a single queued steer", () 
 test("renders multiple queued prompts with count and expand action", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       isStreaming: true,
       queuedMessages: {
@@ -191,7 +305,7 @@ test("renders multiple queued prompts with count and expand action", () => {
 
 
 test("nested model picker groups by provider and pins the current provider first", async () => {
-  const { groupModelOptionsByProvider, orderProviderGroups } = await jiti.import("./ChatInput-model-picker.tsx");
+  const { groupModelOptionsByProvider, orderProviderGroups } = await import("./ChatInput-model-picker.tsx");
   const options = [
     { provider: "anthropic", modelId: "claude", name: "Claude" },
     { provider: "openai", modelId: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
@@ -207,7 +321,7 @@ test("nested model picker groups by provider and pins the current provider first
 });
 
 test("model picker panel renders providers rail, models pane, and Add Providers", async () => {
-  const { ModelPickerPanel } = await jiti.import("./ChatInput-model-picker.tsx");
+  const { ModelPickerPanel } = await import("./ChatInput-model-picker.tsx");
   const html = renderToStaticMarkup(
     React.createElement(ModelPickerPanel, {
       modelOptions: [
@@ -238,11 +352,55 @@ test("model picker panel renders providers rail, models pane, and Add Providers"
   assert.match(html, />(Add Providers|chatInput\.addProviders)</);
 });
 
+test("model picker shows Latest/All versions sections without a search query, flat list with one", async () => {
+  const { ModelPickerPanel } = await import("./ChatInput-model-picker.tsx");
+  const options = [
+    { provider: "codex", modelId: "gpt-6-sol", name: "GPT-6 Sol", identity: { class: "openai", family: "gpt", revision: "6.0.0" }, costOutput: 10 },
+    { provider: "codex", modelId: "gpt-6.1-sol", name: "GPT-6.1 Sol", identity: { class: "openai", family: "gpt", revision: "6.1.0" }, costOutput: 10 },
+    { provider: "codex", modelId: "gpt-6-luna", name: "GPT-6 Luna", identity: { class: "openai", family: "gpt", revision: "6.0.0" }, costOutput: 0.5 },
+  ];
+  const baseProps = {
+    modelOptions: options,
+    currentModel: { provider: "codex", modelId: "gpt-6.1-sol" },
+    isMobile: false,
+    onSelectModel() {},
+    onOpenProviders() {},
+    onSearchQueryChange() {},
+  };
+
+  const noQueryHtml = renderToStaticMarkup(
+    React.createElement(ModelPickerPanel, {
+      ...baseProps,
+      filteredModelOptions: options,
+      modelSearchQuery: "",
+    }),
+  );
+  assert.match(noQueryHtml, /picker-section-divider/);
+  assert.match(noQueryHtml, />(Latest|chatInput\.modelsLatest)</);
+  assert.match(noQueryHtml, />(All versions|chatInput\.modelsAllVersions)</);
+  // The newer version of the same family represents it in Latest; both
+  // versions still show up once each under All versions.
+  assert.equal((noQueryHtml.match(/GPT-6\.1 Sol/g) ?? []).length, 2);
+  assert.match(noQueryHtml, /GPT-6 Sol</);
+
+  const filtered = options.filter((o) => o.modelId.includes("sol"));
+  const queryHtml = renderToStaticMarkup(
+    React.createElement(ModelPickerPanel, {
+      ...baseProps,
+      filteredModelOptions: filtered,
+      modelSearchQuery: "sol",
+    }),
+  );
+  assert.doesNotMatch(queryHtml, /picker-section-divider/);
+  assert.doesNotMatch(queryHtml, />(Latest|chatInput\.modelsLatest)</);
+  assert.doesNotMatch(queryHtml, />(All versions|chatInput\.modelsAllVersions)</);
+});
+
 
 test("exposes tool presets through the plus menu when a handler is provided", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       isStreaming: false,
       toolPreset: "full",
@@ -259,7 +417,7 @@ test("exposes tool presets through the plus menu when a handler is provided", ()
 test("plus trigger renders without change handlers", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       isStreaming: false,
     }),
@@ -272,7 +430,7 @@ test("plus trigger renders without change handlers", () => {
 test("renders live status bar attached to the composer top edge when statusText is provided", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       isStreaming: true,
       statusText: "Waiting for model...",
@@ -287,7 +445,7 @@ test("renders live status bar attached to the composer top edge when statusText 
 test("omits live status bar when statusText is absent or null", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       isStreaming: false,
       statusText: null,
@@ -301,7 +459,7 @@ test("omits live status bar when statusText is absent or null", () => {
 test("renders both queued prompts and attached status bar together", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
-      onSend() {},
+      async onSend() { return { status: "accepted" }; },
       onAbort() {},
       isStreaming: true,
       statusText: "Waiting for model...",
@@ -315,4 +473,21 @@ test("renders both queued prompts and attached status bar together", () => {
   assert.match(html, /Next prompt to run/);
   assert.match(html, /Waiting for model\.\.\./);
   assert.match(html, /live-status-dot/);
+});
+
+test("renders retry banner with countdown when delayMs and startedAt are provided", () => {
+  const now = Date.now();
+  const html = renderToStaticMarkup(
+    React.createElement(ChatInput, {
+      async onSend() { return { status: "accepted" }; },
+      retryInfo: {
+        attempt: 2,
+        maxAttempts: 5,
+        delayMs: 10000,
+        startedAt: now,
+      },
+    }),
+  );
+
+  assert.match(html, /Retrying \(2\/5\) in 10s…/);
 });

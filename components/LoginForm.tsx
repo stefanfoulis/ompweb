@@ -4,9 +4,10 @@ import { LockKeyhole } from "lucide-react";
 import { FormEvent, useState } from "react";
 import { useI18n } from "@/lib/i18n";
 
-export function LoginForm() {
+/** `initialPassword`: what was typed into app/index.html's static copy of this form before the bundle ran. */
+export function LoginForm({ initialPassword = "" }: { initialPassword?: string }) {
   const { t } = useI18n();
-  const [password, setPassword] = useState("");
+  const [password, setPassword] = useState(initialPassword);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -26,7 +27,9 @@ export function LoginForm() {
       }
       // Full reload so the new auth cookie is picked up by middleware
       // and server components — SPA navigation alone may keep stale state.
-      window.location.replace("/");
+      // `next` (set by proxy.ts) may only point back into the app root.
+      const next = new URLSearchParams(window.location.search).get("next");
+      window.location.replace(next?.startsWith("/?") ? next : "/");
     } catch {
       setError(t("login.connectionFailed"));
     } finally {

@@ -1,6 +1,7 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { resolveOmpBin } from "./omp/omp-cli";
+import { OMP_NOT_FOUND, resolveOmpBin } from "./omp/omp-cli";
+import { createChildProcessEnvironment } from "./project-command-env";
 import { asNumber, isRecord } from "./type-guards";
 import type {
   ProviderUsageReport,
@@ -19,6 +20,7 @@ type CachedUsage = { expiresAt: number; output: string };
 
 let usageCache: CachedUsage | undefined;
 let usageInFlight: Promise<string> | undefined;
+let usageInFlightForced = false;
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -58,18 +60,46 @@ function usageWindow(
   };
 }
 
-function accountLabel(metadata: Record<string, unknown> | undefined): string | undefined {
-  return nonEmptyString(metadata?.email) ?? nonEmptyString(metadata?.accountId);
-}
-
 type UsageLimit = { id: ProviderUsageWindowId; fraction: number; window: Record<string, unknown> };
 
 type UsageGroup = {
   priority: number;
   modelId?: string;
   tier?: string;
+  bucket?: string;
   limits: Map<ProviderUsageWindowId, UsageLimit>;
 };
+
+/**
+ * Bucket name for an Antigravity limit, if omp distinguishes one.
+ *
+ * Antigravity quotas split by backend counter, not by model/tier, and omp
+ * reports that split only in the limit's label/id — never in scope. The
+ * quota-summary path labels a bucket "Gemini" or "Claude & GPT (shared)"
+ * (the latter is one shared third-party quota, duplicated by omp into
+ * anthropic/openai counter ids, so it must stay one bucket, not two);
+ * the model-based path labels it "Usage (Google)" / "Usage (Anthropic)" /
+ * "Usage (OpenAI)". A bare id counter is used only as a fallback, and
+ * never for a shared limit, so the shared bucket is never invented twice.
+ * Other providers return undefined: Anthropic's Fable bucket already
+ * arrives as scope.tier, and no other provider's labels are bucket names.
+ */
+function antigravityBucket(rawLimit: Record<string, unknown>, scope: Record<string, unknown>): string | undefined {
+  const label = nonEmptyString(rawLimit.label);
+  if (label === "Gemini" || label === "Claude & GPT (shared)") return label;
+  const usageMatch = label ? /^Usage \((.+)\)$/.exec(label) : null;
+  // The model-based path names the Google counter "Google"; the quota
+  // summary path names the same counter "Gemini". Unify on "Gemini" so
+  // the two fetch paths never split one counter into two rows.
+  if (usageMatch) return usageMatch[1] === "Google" ? "Gemini" : usageMatch[1];
+  if (scope.shared === true) return undefined;
+  const id = nonEmptyString(rawLimit.id);
+  const counter = id ? id.split(":")[1] : undefined;
+  if (counter === "google") return "Gemini";
+  if (counter === "anthropic") return "Anthropic";
+  if (counter === "openai") return "OpenAI";
+  return undefined;
+}
 
 function normalizeReport(
   rawReport: Record<string, unknown>,
@@ -97,11 +127,17 @@ function normalizeReport(
     const tier = nonEmptyString(scope.tier);
     const normalizedModelId = modelId?.toLowerCase();
     const normalizedTier = tier?.toLowerCase();
-    const groupKey = `${normalizedModelId ?? ""}\0${normalizedTier ?? ""}`;
+    // Antigravity buckets must not merge: without a bucket in the key, a
+    // Gemini weekly limit and a Claude & GPT weekly limit collapse into
+    // one group and only the larger fraction survives (#284).
+    const bucket = provider === "google-antigravity" || provider === "antigravity"
+      ? antigravityBucket(rawLimit, scope)
+      : undefined;
+    const groupKey = `${normalizedModelId ?? ""}\0${normalizedTier ?? ""}\0${bucket ?? ""}`;
     const priority = modelId ? (normalizedTier ? 0 : 1) : normalizedTier ? 2 : 3;
     let group = groups.get(groupKey);
     if (!group) {
-      group = { priority, modelId, tier, limits: new Map() };
+      group = { priority, modelId, tier, bucket, limits: new Map() };
       groups.set(groupKey, group);
     }
     const candidate = { id: windowId, fraction, window };
@@ -111,11 +147,18 @@ function normalizeReport(
 
   const selectedGroups = [...groups.values()];
   if (activeModelId && selectedGroups.length > 0) {
-    const selected = selectedGroups.reduce((best, group) => group.priority < best.priority ? group : best);
-    selectedGroups.splice(0, selectedGroups.length, selected);
+    // Keep every group tied at the best priority, not just the first:
+    // Antigravity's Gemini and shared buckets share priority (no modelId,
+    // no tier) and differ only by bucket, so picking one would drop a
+    // quota bucket from a model-filtered query (#284, CodeRabbit).
+    const bestPriority = Math.min(...selectedGroups.map((group) => group.priority));
+    const kept = selectedGroups.filter((group) => group.priority === bestPriority);
+    selectedGroups.splice(0, selectedGroups.length, ...kept);
   }
   const metadata = isRecord(rawReport.metadata) ? rawReport.metadata : undefined;
-  const label = accountLabel(metadata);
+  // Email only: unredacted account ids are opaque UUIDs, so those accounts
+  // show as "Account N".
+  const label = nonEmptyString(metadata?.email);
   const plan = nonEmptyString(metadata?.planType);
   if (selectedGroups.length === 0) {
     return [{
@@ -134,6 +177,7 @@ function normalizeReport(
       ...(plan ? { plan } : {}),
       ...(group.modelId ? { modelId: group.modelId } : {}),
       ...(group.tier ? { tier: group.tier } : {}),
+      ...(group.bucket ? { bucket: group.bucket } : {}),
     };
     for (const candidate of group.limits.values()) {
       const normalized = usageWindow(candidate.id, candidate.fraction, candidate.window, now);
@@ -155,25 +199,51 @@ export function parseProviderUsageOutput(output: string, query: UsageQuery = {},
   if (!isRecord(payload)) throw new Error("omp usage returned an invalid response");
   const rawReports = Array.isArray(payload.reports) ? payload.reports : [];
   const reports = rawReports.flatMap((report, index) => isRecord(report) ? normalizeReport(report, query, now, index) : []);
+  const accountsWithoutUsage = Array.isArray(payload.accountsWithoutUsage) ? payload.accountsWithoutUsage : [];
+  for (const [index, account] of accountsWithoutUsage.entries()) {
+    if (!isRecord(account)) continue;
+    reports.push(...normalizeReport({
+      provider: account.provider,
+      metadata: { email: account.email },
+    }, query, now, rawReports.length + index));
+  }
   const generatedAt = asNumber(payload.generatedAt) ?? null;
   return { generatedAt, reports };
 }
 
-async function fetchProviderUsage(): Promise<string> {
+async function fetchProviderUsage(refresh = false): Promise<string> {
   const bin = resolveOmpBin();
-  if (!bin) throw new Error("omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN.");
-  const { stdout } = await execFileAsync(bin, ["usage", "--json", "--redact"], {
+  if (!bin) throw new Error(OMP_NOT_FOUND);
+  if (refresh) {
+    await execFileAsync(bin, ["usage", "invalidate"], {
+      timeout: USAGE_TIMEOUT_MS,
+      maxBuffer: USAGE_MAX_BUFFER,
+      windowsHide: true,
+      // No `env` option would inherit the server's full environment,
+      // including omp-web's own secrets, into this child.
+      env: createChildProcessEnvironment(),
+    });
+  }
+  // Unredacted so accounts show their real email; only the parsed label, plan
+  // and windows reach the browser, never the raw metadata.
+  const { stdout } = await execFileAsync(bin, ["usage", "--json"], {
     timeout: USAGE_TIMEOUT_MS,
     maxBuffer: USAGE_MAX_BUFFER,
     windowsHide: true,
+    env: createChildProcessEnvironment(),
   });
   return stdout;
 }
 
-function getUsageOutput(): Promise<string> {
-  if (usageCache && usageCache.expiresAt > Date.now()) return Promise.resolve(usageCache.output);
-  if (usageInFlight) return usageInFlight;
-  usageInFlight = fetchProviderUsage()
+function getUsageOutput(refresh = false): Promise<string> {
+  if (!refresh && usageCache && usageCache.expiresAt > Date.now()) return Promise.resolve(usageCache.output);
+  if (usageInFlight) {
+    return refresh && !usageInFlightForced
+      ? usageInFlight.then(() => getUsageOutput(true), () => getUsageOutput(true))
+      : usageInFlight;
+  }
+  usageInFlightForced = refresh;
+  usageInFlight = fetchProviderUsage(refresh)
     .then((output) => {
       usageCache = { output, expiresAt: Date.now() + USAGE_CACHE_TTL_MS };
       return output;
@@ -182,6 +252,6 @@ function getUsageOutput(): Promise<string> {
   return usageInFlight;
 }
 
-export async function getProviderUsage(query: UsageQuery = {}): Promise<ProviderUsageSnapshot> {
-  return parseProviderUsageOutput(await getUsageOutput(), query);
+export async function getProviderUsage(query: UsageQuery = {}, refresh = false): Promise<ProviderUsageSnapshot> {
+  return parseProviderUsageOutput(await getUsageOutput(refresh), query);
 }

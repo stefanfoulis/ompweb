@@ -1,29 +1,22 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "child_process";
-import { createInterface } from "readline";
+import type { spawn } from "child_process";
 import { sanitizeProjectCommandEnvironment } from "../project-command-env";
-import { resolveOmpBin, wrapWindowsScript } from "./omp-cli";
-import { encodeRpcCommand, RpcFrameDecoder, type RpcFrameRecord, type RpcProtocolVersion } from "./rpc-frame";
+import { isRecord } from "../type-guards";
+import { OMP_NOT_FOUND, resolveOmpBin } from "./omp-cli";
+import { type RpcTransport, spawnLocalRpcTransport } from "./rpc-transport";
+import { LINK_LIMITS } from "../hosts/link-protocol";
+import { passthroughProfile } from "./profile-passthrough";
 
 /**
- * Process + protocol layer for `omp --mode rpc-ui` (NDJSON over stdio).
- * Protocol v1: commands `{id, type, ...}` on stdin; `{type:"response", id, ...}`
- * plus interleaved event frames on stdout. omp announces readiness with a
- * `{type:"ready"}` frame before accepting commands. When readiness advertises
- * protocol v2, callers negotiate it before sending normal commands and omp's
- * oversized outbound frames arrive as bounded `rpc_chunk` sequences, which the
- * decoder below reassembles. Commands written to stdin stay single unchunked
- * JSONL objects — see `encodeRpcCommand` (issue #105).
+ * Process + protocol layer for ompweb's omp (`ompweb-omp --headless`), which speaks the channel of
+ * packages/ompweb-runner/src/channel.ts of the oh-my-pi fork as NDJSON over stdio. Frames pass through as `{type: t, ...rest}`, except:
+ *
+ *   hello                          → readiness (`waitReady` resolves `{type:"ready", ...hello}`)
+ *   event {event}                  → the event object itself
+ *   res {id, ok, data?, error?}    → settles `sendCommand`
+ *
+ * and back: `sendCommand({type, ...args})` → `cmd {id, op: type, args}`, any other `{type, ...rest}`
+ * → `{t: type, ...rest}` (`ui_response`, `ui_input`, `host_tool_result`, …).
  */
-
-export interface RpcResponseFrame {
-  type: "response";
-  id?: string;
-  command: string;
-  success: boolean;
-  data?: unknown;
-  error?: string;
-  code?: string;
-}
 
 export type RpcFrame = { type: string; [key: string]: unknown };
 
@@ -41,12 +34,15 @@ export class RpcCommandError extends Error {
 export class RpcCommandTimeoutError extends Error {
   readonly command: string;
   readonly timeoutMs: number;
+  /** When the command went to the transport (or its wait started); a timer fires timeoutMs later. */
+  readonly dispatchedAt: number;
 
-  constructor(command: string, timeoutMs: number, message?: string) {
+  constructor(command: string, timeoutMs: number, message?: string, dispatchedAt = Date.now() - timeoutMs) {
     super(message ?? `RPC command ${command} timed out after ${timeoutMs}ms`);
     this.name = "RpcCommandTimeoutError";
     this.command = command;
     this.timeoutMs = timeoutMs;
+    this.dispatchedAt = dispatchedAt;
   }
 }
 
@@ -55,12 +51,13 @@ interface PendingCommand {
   resolve: (data: unknown) => void;
   reject: (error: Error) => void;
   timer?: NodeJS.Timeout;
+  onReply?: (success: boolean, id: string) => void;
 }
 
 export interface RpcProcessOptions {
   /** Working directory for the agent (also passed as --cwd). */
   cwd: string;
-  /** Extra CLI args appended after the base `--mode rpc-ui --cwd <cwd>`. */
+  /** Extra CLI args appended after the base `--headless --cwd <cwd>`. */
   extraArgs?: string[];
   /** Environment overrides merged over process.env. */
   env?: Record<string, string>;
@@ -68,6 +65,11 @@ export interface RpcProcessOptions {
   onFrame?: (frame: RpcFrame) => void;
   /** Called once when the child exits, after pending commands are rejected. */
   onExit?: (info: { code: number | null; signal: NodeJS.Signals | null; stderrTail: string }) => void;
+  /** Byte transport to run over. Omitted → spawn ompweb's omp (see spawnLocalRpcTransport). */
+  transport?: RpcTransport;
+  /** The daemon already saw this child's hello, or it outlived its server: ready at once,
+   * and frames are held until `release` (after `replay`). */
+  adopted?: true;
   /** Injectable process boundary for deterministic transport tests. */
   dependencies?: {
     resolveOmpBin?: typeof resolveOmpBin;
@@ -76,134 +78,119 @@ export interface RpcProcessOptions {
 }
 
 const STDERR_TAIL_LIMIT = 8 * 1024;
+/**
+ * Largest line omp-web writes to omp's stdin. Command bodies are already capped at 8 MiB by the
+ * agent routes (`MAX_AGENT_COMMAND_REQUEST_BYTES`); this bound only turns a pathological command
+ * into a clear error instead of an unbounded pipe write.
+ */
+const MAX_INBOUND_LINE_BYTES = 32 * 1024 * 1024;
+/** Frames whose numeric `id` names the cmd they belong to; ompweb correlates them with `onReply`'s string id. */
+const COMMAND_ID_FRAMES = new Set(["prompt_result", "prompt_error", "bash_output"]);
+
+/** A stdout line as JSON; undefined when blank or not JSON (never let a stray line kill the reader). */
+function parseLine(line: string): unknown {
+  const trimmed = line.trim();
+  if (!trimmed) return undefined;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+}
+
+const REQUEST_TYPES = new Set(["host_tool_call", "host_uri_request", "ui_request"]);
+const requestId = (frame: RpcFrame) =>
+  REQUEST_TYPES.has(frame.type) && (typeof frame.id === "string" || typeof frame.id === "number") ? String(frame.id) : null;
+
+/** Spawns ompweb's omp headless with the sanitized child environment. */
+export function spawnOmpTransport(options: RpcProcessOptions): RpcTransport {
+  const resolveBin = options.dependencies?.resolveOmpBin ?? resolveOmpBin;
+  const bin = resolveBin();
+  if (!bin) {
+    throw new Error(OMP_NOT_FOUND);
+  }
+  const args = ["--headless", "--cwd", options.cwd, ...(options.extraArgs ?? [])];
+  // omp-web ignores named profiles (OMP_PROFILE/PI_PROFILE): strip them so the
+  // child resolves the same default agent dir. An explicit options.env entry
+  // still wins (used to force the default profile for isolated test runs).
+  const env = sanitizeProjectCommandEnvironment({ ...process.env, ...options.env });
+  if (options.env?.OMP_PROFILE === undefined) delete env.OMP_PROFILE;
+  if (options.env?.PI_PROFILE === undefined) delete env.PI_PROFILE;
+  // A profile whose agent dir PI_CODING_AGENT_DIR pins resolves the same agent state either
+  // way, so it passes through and the child also gets that profile's plugins and caches.
+  const pinnedProfile = passthroughProfile({ ...process.env, ...options.env });
+  if (pinnedProfile && options.env?.OMP_PROFILE === undefined) env.OMP_PROFILE = pinnedProfile;
+  return spawnLocalRpcTransport({ bin, args, cwd: options.cwd, env, spawn: options.dependencies?.spawn });
+}
 
 export class RpcProcess {
   readonly cwd: string;
-  private child: ChildProcessWithoutNullStreams;
-  private readonly pending = new Map<string, PendingCommand>();
+  /** Read by the session wrapper for host-specific signals (a remote link's resync and lost child). */
+  readonly transport: RpcTransport;
+  private readonly exitedPromise: Promise<void>;
+  private readonly pending = new Map<number, PendingCommand>();
   private readonly frameListeners = new Set<(frame: RpcFrame) => void>();
   private readyPromise: Promise<RpcFrame>;
+  private readonly resolveReady: (frame: RpcFrame) => void;
+  /** An adopted child's frames, held until `release` (see RpcProcessOptions.adopted), and the bytes of its lines since. */
+  private heldFrames: RpcFrame[] | null = null;
+  private heldBytes = 0;
+  /** Set once an adopted child's output outgrew the cap before `release`: the adoption fails. */
+  private heldOverflow: Error | null = null;
+  /** Ids of the requests `replay` delivered (see `release`). */
+  private readonly replayedRequests = new Set<string>();
+  // The daemon maps each link's ids onto its own, so a plain counter cannot meet another server's.
   private nextId = 1;
   private stderrTail = "";
   private exited = false;
   private exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
-  private protocolVersion: RpcProtocolVersion = 1;
-  private readonly spawnProcess: typeof spawn;
-  // Commands are written to stdin one logical frame at a time (never chunked,
-  // however large) so two of them cannot interleave on the pipe.
+  // Lines are written one at a time so two of them cannot interleave on the pipe.
   private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(options: RpcProcessOptions) {
-    const resolveBin = options.dependencies?.resolveOmpBin ?? resolveOmpBin;
-    this.spawnProcess = options.dependencies?.spawn ?? spawn;
-    const bin = resolveBin();
-    if (!bin) {
-      throw new Error("omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN.");
-    }
+    this.transport = options.transport ?? spawnOmpTransport(options);
     this.cwd = options.cwd;
     if (options.onFrame) this.frameListeners.add(options.onFrame);
 
-    const args = ["--mode", "rpc-ui", "--cwd", options.cwd, ...(options.extraArgs ?? [])];
-    // omp-web ignores named profiles (OMP_PROFILE/PI_PROFILE): strip them so the
-    // child resolves the same default agent dir. An explicit options.env entry
-    // still wins (used to force the default profile for isolated test runs).
-    const childEnv = sanitizeProjectCommandEnvironment({ ...process.env, ...options.env });
-    if (options.env?.OMP_PROFILE === undefined) delete childEnv.OMP_PROFILE;
-    if (options.env?.PI_PROFILE === undefined) delete childEnv.PI_PROFILE;
-    const target = wrapWindowsScript(bin, args);
-    this.child = this.spawnProcess(target.file, target.args, {
-      cwd: options.cwd,
-      env: childEnv,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      // On POSIX, omp launches grandchildren (LSP servers, extension subprocesses). Run the
-      // child in its own process group so dispose() can SIGTERM/SIGKILL the whole
-      // tree — otherwise a crashed omp would orphan its LSP children as zombies.
-      // Windows uses taskkill /t instead, so detaching would only create a console.
-      detached: process.platform !== "win32",
-    });
-
-    // A write queued when the child dies fails both the write callback and an
-    // 'error' event on the pipe. Without a listener that event becomes an
-    // uncaughtException (Next merely logs it today; other hosts die).
-    this.child.stdin.on("error", () => {});
-    this.child.stdout.on("error", () => {});
-
-    let resolveReady: (frame: RpcFrame) => void;
-    let rejectReady: (error: Error) => void;
-    this.readyPromise = new Promise<RpcFrame>((resolve, reject) => {
-      resolveReady = resolve;
-      rejectReady = reject;
-    });
+    const ready = Promise.withResolvers<RpcFrame>();
+    this.readyPromise = ready.promise;
+    this.resolveReady = ready.resolve;
     // waitReady() is optional for callers; avoid unhandled-rejection noise when
     // the process dies before anyone awaited readiness.
     this.readyPromise.catch(() => {});
+    const exitDeferred = Promise.withResolvers<void>();
+    this.exitedPromise = exitDeferred.promise;
+    if (options.adopted) {
+      // Its hello went to the daemon or the server that spawned it.
+      this.heldFrames = [];
+      ready.resolve({ type: "ready" });
+    }
 
-    const decoder = new RpcFrameDecoder();
-    const rl = createInterface({ input: this.child.stdout });
-    rl.on("line", (line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(trimmed);
-      } catch {
-        // omp guards stdout in RPC mode, but never let a stray line kill the reader.
-        return;
-      }
-      let frame: RpcFrameRecord;
-      try {
-        if (parsed && typeof parsed === "object" && (parsed as { type?: unknown }).type === "rpc_chunk" && this.protocolVersion !== 2) {
-          throw new Error("RPC chunk received before protocol negotiation");
-        }
-        const decoded = decoder.push(parsed);
-        if (!decoded) return;
-        frame = decoded;
-      } catch (error) {
-        this.stderrTail = (this.stderrTail + `\nRPC protocol error: ${error instanceof Error ? error.message : String(error)}`).slice(-STDERR_TAIL_LIMIT);
-        void this.dispose(0);
-        return;
-      }
-      if (frame.type === "ready") {
-        resolveReady(frame);
-        return;
-      }
-      if (frame.type === "response") {
-        this.handleResponse(frame as unknown as RpcResponseFrame);
-        return;
-      }
-      for (const listener of this.frameListeners) {
-        try {
-          listener(frame);
-        } catch {
-          // Listener bugs must not break the protocol reader.
-        }
-      }
+    this.transport.onLine((line) => {
+      if (this.heldFrames && !this.holdable(line)) return;
+      const parsed = parseLine(line);
+      if (parsed !== undefined) this.receive(parsed);
     });
 
-    this.child.stderr.on("data", (chunk: Buffer) => {
-      this.stderrTail = (this.stderrTail + chunk.toString("utf8")).slice(-STDERR_TAIL_LIMIT);
+    this.transport.onStderr((chunk) => {
+      this.stderrTail = (this.stderrTail + chunk).slice(-STDERR_TAIL_LIMIT);
     });
 
-    const finalize = (code: number | null, signal: NodeJS.Signals | null) => {
+    this.transport.onExit((code, signal) => {
       if (this.exited) return;
       this.exited = true;
       this.exitInfo = { code, signal };
       const exitError = new Error(
         `omp exited (code ${code ?? "null"}, signal ${signal ?? "none"})${this.stderrTail ? `: ${this.stderrTail.slice(-500)}` : ""}`,
       );
-      rejectReady(exitError);
+      ready.reject(exitError);
       for (const [, entry] of this.pending) {
-        if (entry.timer) clearTimeout(entry.timer);
+        clearTimeout(entry.timer);
         entry.reject(exitError);
       }
       this.pending.clear();
+      exitDeferred.resolve();
       options.onExit?.({ code, signal, stderrTail: this.stderrTail });
-    };
-    this.child.on("exit", finalize);
-    this.child.on("error", (error) => {
-      this.stderrTail = (this.stderrTail + `\nspawn error: ${error.message}`).slice(-STDERR_TAIL_LIMIT);
-      finalize(null, null);
     });
   }
 
@@ -215,25 +202,15 @@ export class RpcProcess {
     return this.exitInfo ? { ...this.exitInfo, stderrTail: this.stderrTail } : null;
   }
 
-  /** Resolves with the `ready` frame; rejects if the process dies first or the
+  /** Resolves with `{type:"ready", ...hello}`; rejects if the process dies first or the
    * timeout elapses. omp startup can take a few seconds (extensions, LSP). */
   waitReady(timeoutMs = 60_000): Promise<RpcFrame> {
     const timeout = new Promise<never>((_, reject) => {
-      const timer = setTimeout(() => reject(new Error(`omp RPC ready timeout after ${timeoutMs}ms`)), timeoutMs);
+      const timer = setTimeout(() => reject(new Error(`omp ready timeout after ${timeoutMs}ms`)), timeoutMs);
       timer.unref?.();
       this.readyPromise.finally(() => clearTimeout(timer)).catch(() => {});
     });
     return Promise.race([this.readyPromise, timeout]);
-  }
-
-  /** Enables bounded protocol-v2 framing when the ready frame advertises it. */
-  async negotiateProtocol(ready: RpcFrame): Promise<RpcProtocolVersion> {
-    const supported = Array.isArray(ready.supportedProtocolVersions) ? ready.supportedProtocolVersions : [];
-    if (!supported.includes(2)) return this.protocolVersion;
-    const response = await this.sendCommand<{ protocolVersion?: unknown }>({ type: "negotiate_protocol", protocolVersion: 2 });
-    if (response?.protocolVersion !== 2) throw new Error("OMP rejected RPC protocol v2 negotiation");
-    this.protocolVersion = 2;
-    return this.protocolVersion;
   }
 
   onFrame(listener: (frame: RpcFrame) => void): () => void {
@@ -241,31 +218,115 @@ export class RpcProcess {
     return () => this.frameListeners.delete(listener);
   }
 
+  /** Adopted child: feeds the daemon's raw lines of its still-open requests as
+   * if just read. They are older than anything held, which `release` delivers next. */
+  replay(lines: string[]): void {
+    if (this.heldOverflow) throw this.heldOverflow;
+    for (const line of lines) {
+      const parsed = parseLine(line);
+      if (parsed !== undefined) this.receive(parsed, true);
+    }
+  }
+
+  /** Adopted child, after `replay`: delivers the frames held since and stops holding. A request
+   * opened while the old server stopped is in both (replayed, and resent unacked): it is delivered once. */
+  release(): void {
+    if (this.heldOverflow) throw this.heldOverflow;
+    const held = this.heldFrames ?? [];
+    this.heldFrames = null;
+    for (const frame of held) {
+      const id = requestId(frame);
+      if (id === null || !this.replayedRequests.has(id)) this.dispatch(frame);
+    }
+    this.replayedRequests.clear();
+  }
+
+  /**
+   * Counts an adopted child's output until `release`, up to LINK_LIMITS.channelBufferBytes
+   * as RemoteRpcTransport holds it. Past that the adoption fails: its commands
+   * reject, `replay` and `release` throw, and the output is dropped while the wrapper kills it.
+   */
+  private holdable(line: string): boolean {
+    if (this.heldOverflow) return false;
+    this.heldBytes += Buffer.byteLength(line);
+    if (this.heldBytes <= LINK_LIMITS.channelBufferBytes) return true;
+    const overflow = new Error(`omp's output during adoption exceeded ${LINK_LIMITS.channelBufferBytes} bytes`);
+    this.heldOverflow = overflow;
+    this.heldFrames = [];
+    for (const [, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      entry.reject(overflow);
+    }
+    this.pending.clear();
+    return false;
+  }
+
+  /** One channel frame from omp. `replayed`: a daemon line (see `replay`), delivered past the frames still held. */
+  private receive(parsed: unknown, replayed = false): void {
+    if (!isRecord(parsed) || typeof parsed.t !== "string") return;
+    const { t, ...rest } = parsed;
+    switch (t) {
+      case "hello":
+        this.resolveReady({ type: "ready", ...rest });
+        return;
+      case "res":
+        this.handleResponse(rest);
+        return;
+      case "event":
+        if (isRecord(rest.event) && typeof rest.event.type === "string") this.dispatch(rest.event as RpcFrame, replayed);
+        return;
+      default:
+        this.dispatch({ type: t, ...rest, ...(COMMAND_ID_FRAMES.has(t) && typeof rest.id === "number" ? { id: String(rest.id) } : {}) }, replayed);
+    }
+  }
+
+  private dispatch(frame: RpcFrame, replayed = false): void {
+    if (this.heldFrames && !replayed) {
+      this.heldFrames.push(frame);
+      return;
+    }
+    const id = replayed ? requestId(frame) : null;
+    if (id !== null) this.replayedRequests.add(id);
+    for (const listener of this.frameListeners) {
+      try {
+        listener(frame);
+      } catch {
+        // Listener bugs must not break the protocol reader.
+      }
+    }
+  }
+
   /** Send a command and await its response `data`. A failed response rejects
    * with RpcCommandError. No timeout by default — some commands (login,
    * long prompts via bash) legitimately take minutes, and the session wrapper
    * reclaims wedged children via idle-kill and dispose(). Callers that want a
    * cap pass `timeoutMs` (>0); when set, the timer is unref'd so it never
-   * keeps the event loop alive on its own. */
-  sendCommand<T = unknown>(command: { type: string; [key: string]: unknown }, timeoutMs?: number): Promise<T> {
+   * keeps the event loop alive on its own. `onReply` runs synchronously when
+   * the response is read, before any frame after it is dispatched; it is told whether the command succeeded and its
+   * wire id as a string (what `prompt_result`, `prompt_error` and `bash_output` name). */
+  sendCommand<T = unknown>(command: { type: string; [key: string]: unknown }, timeoutMs?: number, onReply?: (success: boolean, id: string) => void): Promise<T> {
     if (this.exited) {
-      return Promise.reject(new Error("omp RPC process has exited"));
+      return Promise.reject(new Error("omp process has exited"));
     }
-    const id = `w${this.nextId++}`;
+    if (this.heldOverflow) return Promise.reject(this.heldOverflow);
+    const dispatchedAt = Date.now();
+    const id = this.nextId++;
+    const { type: op, ...args } = command;
     return new Promise<T>((resolve, reject) => {
       const entry: PendingCommand = {
-        command: command.type,
+        command: op,
         resolve: resolve as (data: unknown) => void,
         reject,
+        onReply,
       };
       if (timeoutMs && timeoutMs > 0) {
         entry.timer = setTimeout(() => {
-          // Only reject if this exact entry is still pending — a reused id or a
-          // response that landed between the timer firing and this callback must
-          // not spuriously reject a different command.
+          // Only reject if this exact entry is still pending — a response that
+          // landed between the timer firing and this callback must not
+          // spuriously reject.
           if (this.pending.get(id) === entry) {
             this.pending.delete(id);
-            reject(new RpcCommandTimeoutError(command.type, timeoutMs));
+            reject(new RpcCommandTimeoutError(op, timeoutMs, undefined, dispatchedAt));
           }
         }, timeoutMs);
         // A pending command timer must never keep the event loop alive on its own
@@ -273,12 +334,12 @@ export class RpcProcess {
         entry.timer.unref?.();
       }
       this.pending.set(id, entry);
-      this.writeFrame({ ...command, id }, (error) => {
+      this.writeFrame({ t: "cmd", id, op, args }, (error) => {
         if (error) {
           const pending = this.pending.get(id);
           if (pending) {
             this.pending.delete(id);
-            if (pending.timer) clearTimeout(pending.timer);
+            clearTimeout(pending.timer);
             reject(error);
           }
         }
@@ -286,30 +347,29 @@ export class RpcProcess {
     });
   }
 
-  /** Fire-and-forget frame write (extension_ui_response, host_tool_result). */
+  /** Fire-and-forget frame (ui_response, ui_input, host_tool_result, login_input_response, …). */
   sendFrame(frame: { type: string; [key: string]: unknown }): void {
     if (this.exited) return;
-    this.writeFrame(frame, () => {});
+    const { type, ...rest } = frame;
+    this.writeFrame({ t: type, ...rest }, () => {});
   }
 
-  private writeFrame(frame: RpcFrame, callback: (error?: Error | null) => void): void {
-    let line: string;
-    try {
-      line = encodeRpcCommand(frame);
-    } catch (error) {
-      callback(error instanceof Error ? error : new Error(String(error)));
+  private writeFrame(frame: { t: string; [key: string]: unknown }, callback: (error?: Error | null) => void): void {
+    const line = `${JSON.stringify(frame)}\n`;
+    if (Buffer.byteLength(line, "utf8") > MAX_INBOUND_LINE_BYTES) {
+      callback(new Error(`omp command exceeds the ${MAX_INBOUND_LINE_BYTES}-byte inbound transport limit`));
       return;
     }
-    // Commands are serialized so two of them never interleave on the pipe and a
-    // failed write cannot reorder the responses callers are awaiting.
+    // Serialized so two lines never interleave on the pipe and a failed write
+    // cannot reorder the responses callers are awaiting.
     this.writeQueue = this.writeQueue.then(
       () => new Promise<void>((resolve) => {
-        if (this.exited || this.child.stdin.destroyed) {
-          callback(new Error("RPC process is not running"));
+        if (this.exited) {
+          callback(new Error("omp process is not running"));
           resolve();
           return;
         }
-        this.child.stdin.write(line, (error) => {
+        this.transport.write(line, (error) => {
           callback(error ?? null);
           resolve();
         });
@@ -317,70 +377,43 @@ export class RpcProcess {
     );
   }
 
-  private handleResponse(response: RpcResponseFrame): void {
+  /** A `res`; one for no pending command (timed out, or another server's) is dropped. */
+  private handleResponse(response: Record<string, unknown>): void {
     const id = response.id;
-    const entry = id ? this.pending.get(id) : undefined;
-    if (!entry || !id) {
-      // Unsolicited response (or a command we already timed out) — surface to
-      // frame listeners so nothing is silently dropped.
-      for (const listener of this.frameListeners) {
-        try {
-          listener(response as unknown as RpcFrame);
-        } catch {}
-      }
-      return;
-    }
+    const entry = typeof id === "number" ? this.pending.get(id) : undefined;
+    if (!entry || typeof id !== "number") return;
     this.pending.delete(id);
-    if (entry.timer) clearTimeout(entry.timer);
-    if (response.success) {
+    clearTimeout(entry.timer);
+    entry.onReply?.(response.ok === true, String(id));
+    if (response.ok === true) {
       entry.resolve(response.data);
     } else {
-      entry.reject(new RpcCommandError(response.command, response.error ?? "RPC command failed", response.code));
+      entry.reject(new RpcCommandError(entry.command, typeof response.error === "string" ? response.error : "omp command failed", typeof response.code === "string" ? response.code : undefined));
     }
   }
 
-  /** Graceful shutdown: close stdin (omp exits on EOF), escalate to SIGTERM
-   * then SIGKILL on the whole process group. Resolves once the process has
-   * exited. Safe to call during server teardown — escalation timers are
-   * unref'd so they never keep the event loop alive on their own. */
-  async dispose(gracePeriodMs = 5_000): Promise<void> {
+  /** Close shared membership unless explicitly stopping the child. Local shutdown
+   * closes stdin, escalates to SIGTERM/SIGKILL and waits for actual exit. */
+  async dispose(gracePeriodMs = 5_000, stopShared = false): Promise<void> {
     if (this.exited) return;
-    const exited = new Promise<void>((resolve) => {
-      if (this.exited) return resolve();
-      this.child.once("exit", () => resolve());
-    });
-    try {
-      this.child.stdin.end();
-    } catch {}
-    // POSIX can signal the detached process group directly. Windows has no
-    // portable negative-pid equivalent, so use taskkill's tree operation to
-    // avoid orphaning extension and LSP grandchildren.
-    const killTree = (force: boolean, signal: NodeJS.Signals) => {
-      const pid = this.child.pid;
-      if (!pid) return;
-      if (process.platform === "win32") {
-        const args = ["/pid", String(pid), "/t", ...(force ? ["/f"] : [])];
-        const reaper = this.spawnProcess("taskkill", args, { windowsHide: true, stdio: "ignore" });
-        reaper.once("error", () => {
-          try { this.child.kill(signal); } catch {}
-        });
+    if (this.transport.hostOwnedLifecycle) {
+      if (!stopShared) {
+        this.transport.close!();
         return;
       }
-      try {
-        process.kill(-pid, signal);
-      } catch {
-        try { this.child.kill(signal); } catch {}
-      }
-    };
+      this.transport.killTree(false);
+    } else {
+      this.transport.endInput();
+    }
     const timer = setTimeout(() => {
-      if (!this.exited) killTree(false, "SIGTERM");
+      if (!this.exited) this.transport.killTree(false);
     }, gracePeriodMs);
     const killTimer = setTimeout(() => {
-      if (!this.exited) killTree(true, "SIGKILL");
+      if (!this.exited) this.transport.killTree(true);
     }, gracePeriodMs * 2);
     timer.unref?.();
     killTimer.unref?.();
-    await exited;
+    await this.exitedPromise;
     clearTimeout(timer);
     clearTimeout(killTimer);
   }

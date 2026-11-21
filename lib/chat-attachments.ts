@@ -55,10 +55,10 @@ export interface TextAttachmentSelection<T> {
 }
 
 /**
- * Per-file, aggregate, and slot rules for text attachments — the single place
- * the composer and draft restore both enforce them. Candidates past the
- * remaining slots are dropped silently, matching the count cap handled by the
- * caller; a candidate too large on its own is reported before a budget miss so
+ * Per-file, aggregate, and slot rules when adding text attachments. Persisted
+ * drafts bypass picker budgets so recovery never silently drops saved files.
+ * Candidates beyond remaining slots match the caller's count-cap handling;
+ * a lone oversized candidate is reported before an aggregate-budget miss so
  * the banner names the limit the user actually hit.
  */
 export function selectTextAttachments<T extends { size: number }>(
@@ -84,19 +84,6 @@ export function selectTextAttachments<T extends { size: number }>(
     accepted.push(candidate);
   }
   return { accepted, tooLarge, overBudget };
-}
-
-/** Banner text for a batch that produced no usable attachments. */
-export function describeTextAttachmentSkip(
-  selection: Pick<TextAttachmentSelection<unknown>, "tooLarge" | "overBudget">,
-): string | null {
-  if (selection.tooLarge > 0) {
-    return `${selection.tooLarge} file(s) skipped: files up to ${formatAttachmentBytes(MAX_ATTACHED_TEXT_BYTES)} are supported.`;
-  }
-  if (selection.overBudget > 0) {
-    return `${selection.overBudget} file(s) skipped: attachments are limited to ${formatAttachmentBytes(MAX_TOTAL_ATTACHED_TEXT_BYTES)} per message.`;
-  }
-  return null;
 }
 
 export function isTextAttachmentFile(file: Pick<File, "name" | "type">): boolean {

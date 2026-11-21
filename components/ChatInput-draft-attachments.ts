@@ -1,17 +1,13 @@
 import type { ChatDraftFile, ChatDraftImage } from "@/lib/draft-store";
-import {
-  selectTextAttachments,
-  type AttachedTextFileData,
-} from "@/lib/chat-attachments";
-import {
-  MAX_ATTACHED_IMAGES,
-  isBase64ImageWithinLimits,
-} from "@/lib/image-attachments";
+import type { AttachedTextFileData } from "@/lib/chat-attachments";
+import { isBase64ImageWithinLimits } from "@/lib/image-attachments";
 
 export interface AttachedImage {
   data: string;   // base64, no prefix
   mimeType: string;
   previewUrl: string; // object URL for display
+  /** The picked file, so a switch to As file uploads its exact bytes; absent for one restored from a draft. */
+  file?: File;
 }
 
 export type AttachedTextFile = AttachedTextFileData;
@@ -27,10 +23,11 @@ export function draftImageToAttachedImage(image: ChatDraftImage): AttachedImage 
   };
 }
 
+/** Every image comes back, even past MAX_ATTACHED_IMAGES (recovered queue
+ *  messages can exceed it); sending enforces the cap, so the user chooses. */
 export function draftImagesToAttachedImages(images: ChatDraftImage[] | undefined): AttachedImage[] {
   return (images ?? [])
     .filter(isBase64ImageWithinLimits)
-    .slice(0, MAX_ATTACHED_IMAGES)
     .map(draftImageToAttachedImage);
 }
 
@@ -38,12 +35,16 @@ export function textFileToDraftFile(file: AttachedTextFile): ChatDraftFile {
   return { name: file.name, mimeType: file.mimeType, content: file.content, size: file.size };
 }
 
+/** Recovery and Edit relocation can merge individually valid drafts past picker
+ *  budgets. Keep every well-formed file; sending validates the composed request,
+ *  not the picker file-count or text-byte limits. */
 export function draftFilesToAttachedFiles(files: ChatDraftFile[] | undefined): AttachedTextFile[] {
-  const shaped = (files ?? []).filter((file) => typeof file.name === "string"
+  return (files ?? []).filter((file) => file !== null && typeof file === "object"
+    && typeof file.name === "string"
     && typeof file.mimeType === "string"
     && typeof file.content === "string"
-    && Number.isFinite(file.size));
-  return selectTextAttachments(shaped, { usedBytes: 0, usedSlots: 0 }).accepted;
+    && Number.isFinite(file.size)
+    && file.size >= 0);
 }
 
 export function revokeImagePreview(image: AttachedImage): void {

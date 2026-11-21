@@ -1,3 +1,4 @@
+import type { Link, Nodes, Root } from "mdast";
 import { normalizeFilePathSlashes } from "./file-paths";
 
 function safeDecode(value: string): string {
@@ -12,7 +13,7 @@ function stripLineSuffix(filePath: string): string {
   return filePath.replace(/:\d+(?::\d+)?$/, "");
 }
 
-function normalizeLocalPath(filePath: string): string {
+export function normalizeLocalPath(filePath: string): string {
   const normalized = normalizeFilePathSlashes(filePath);
   const isWindowsDrive = /^[a-zA-Z]:\//.test(normalized);
   const isUnc = normalized.startsWith("//");
@@ -86,7 +87,7 @@ export function resolveLocalFileHref(
   const normalizedHref = normalizeFilePathSlashes(decodedHref);
   const lowerHref = normalizedHref.toLowerCase();
 
-  if (lowerHref.startsWith("/api/") || lowerHref.startsWith("/_next/")) return null;
+  if (lowerHref.startsWith("/api/")) return null;
   if (!isBackslashUncPath && normalizedHref.startsWith("//")) return null;
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/i.test(normalizedHref) && !lowerHref.startsWith("file:") && !/^[a-zA-Z]:\//.test(normalizedHref)) {
     return null;
@@ -101,6 +102,10 @@ export function resolveLocalFileHref(
   } else if (normalizedHref.startsWith("/")) {
     candidate = normalizedHref;
     candidateKind = "absolute";
+  } else if (normalizedHref.startsWith("~/")) {
+    // Kept as `~/…`: the file API expands it to the server user's home.
+    candidate = normalizedHref;
+    candidateKind = "absolute";
   } else if (baseDir && looksLikeRelativeFileHref(normalizedHref)) {
     candidate = `${normalizeFilePathSlashes(baseDir).replace(/\/+$/, "")}/${normalizedHref}`;
     candidateKind = "relative";
@@ -110,5 +115,49 @@ export function resolveLocalFileHref(
 
   const filePath = stripLineSuffix(normalizeLocalPath(candidate));
   if (candidateKind === "relative" && relativeRoot && !isPathInside(filePath, relativeRoot)) return null;
+  // `~/../x` normalizes out of the home dir; it no longer names a home path.
+  if (normalizedHref.startsWith("~/") && !filePath.startsWith("~/")) return null;
   return filePath;
+}
+
+const PATH_SEGMENT = String.raw`[\w.@+~\[\]-]+`;
+/**
+ * Inline code that is exactly one local path, with an optional `:line[:col]`.
+ * Conservative on purpose — anything with spaces, quotes, parens, `?`, `#` or
+ * a scheme stays code:
+ * - POSIX absolute with 2+ segments (`/var/tmp/x.png`; `/compact` stays a command)
+ * - `~/` home paths and `C:\` / `C:/` drive paths
+ * - relative paths with a directory AND a letter-led extension (`src/a.ts`,
+ *   `./b.md`; `a/b`, `foo.bar`, `x/2.5` stay code)
+ * ponytail: `a/b.length` still reads as a path; clicking it shows "not found".
+ */
+const INLINE_CODE_PATH_RE = new RegExp(
+  "^(?:"
+    + `/${PATH_SEGMENT}(?:/${PATH_SEGMENT})+`
+    + `|~/${PATH_SEGMENT}(?:/${PATH_SEGMENT})*`
+    + String.raw`|[A-Za-z]:[\\/]${PATH_SEGMENT}(?:[\\/]${PATH_SEGMENT})*`
+    + `|(?:${PATH_SEGMENT}/)+[\\w.@+~\\[\\]-]*\\.[A-Za-z][A-Za-z0-9]*`
+    + String.raw`)(?::\d+(?::\d+)?)?$`,
+);
+
+/**
+ * Remark plugin: inline code holding exactly one local file path becomes a
+ * link, which MarkdownBody's `a` renderer opens in the file panel through the
+ * same `resolveLocalFileHref` call. Code already inside a link stays as is.
+ */
+export function remarkInlineCodeFileLinks({ cwd }: { cwd?: string } = {}) {
+  const linkInlineCode = (node: Nodes): void => {
+    if (!("children" in node) || node.type === "link" || node.type === "linkReference") return;
+    const children = node.children as Nodes[];
+    children.forEach((child, index) => {
+      if (child.type === "inlineCode" && INLINE_CODE_PATH_RE.test(child.value) && resolveLocalFileHref(child.value, cwd)) {
+        // react-markdown's URL sanitizer reads a colon before any `/` (`C:\`, or
+        // `b.txt:3` once `\` is %-encoded) as a scheme; the resolver decodes `%3A`.
+        children[index] = { type: "link", url: child.value.replaceAll(":", "%3A"), children: [child] } satisfies Link;
+      } else {
+        linkInlineCode(child);
+      }
+    });
+  };
+  return (tree: Root) => linkInlineCode(tree);
 }

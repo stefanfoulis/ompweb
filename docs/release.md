@@ -3,7 +3,7 @@
 Each release publishes two artifacts:
 
 - npm package: `@kahme247/ompweb`
-- GitHub Release: [kahme247/ompweb](https://github.com/kahme247/ompweb)
+- GitHub Release: [ompweb-dev/ompweb](https://github.com/ompweb-dev/ompweb)
 
 After the initial bootstrap release, publishing is performed by GitHub Actions
 with npm trusted publishing. No npm access token is stored in this repository
@@ -32,7 +32,7 @@ version.
 
 1. In npm, open the `@kahme247/ompweb` package settings and add a **GitHub Actions**
    trusted publisher with:
-   - Owner: `kahme247`
+   - Owner: `ompweb-dev`
    - Repository: `ompweb`
    - Workflow filename: `publish.yml`
    - Environment: `npm`
@@ -69,10 +69,27 @@ trusted publisher and makes that release public only after npm accepts the
 package. A rerun can safely finish a release if npm has already accepted its
 version.
 
+### Build identity in the UI
+
+Click or tap the ompweb logo to reveal the package version. If the build's
+Git `HEAD` has no tag, the reveal also shows the full commit hash and the
+committer date in `YYYY-MM-DD` format. Any tag pointing exactly at `HEAD`
+keeps the version-only display; a tag on an ancestor does not.
+
+Both the production build and development server resolve this metadata from
+the source checkout, ignoring inherited repository-location overrides. Explicit
+`safe.directory` trust from Git's configured files or `GIT_CONFIG_COUNT` is preserved.
+The metadata is bundled into the client, including in npm packages and binary
+releases; no Git command runs when a user clicks the logo.
+Source archives without Git metadata keep the version-only display.
+
+The development bootstrap initializes missing browser constants once. Empty
+commit fields are valid, and later hot reloads keep the existing listener.
+
 ## Verify
 
 ```bash
-gh run list --repo kahme247/ompweb --workflow publish.yml --limit 1
+gh run list --repo ompweb-dev/ompweb --workflow publish.yml --limit 1
 npm view @kahme247/ompweb@<version> version --registry https://registry.npmjs.org/
 npm view @kahme247/ompweb@<version> --json --registry https://registry.npmjs.org/
 ```

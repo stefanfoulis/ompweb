@@ -1,0 +1,76 @@
+name: Binary prerelease
+
+# Every commit on main that passed Verify PR becomes a GitHub prerelease carrying the five single binaries,
+# titled with the time it was created (2026-11-01T10:30:00Z), tag 20261101T103000Z-<short sha> (git tags
+# cannot hold ":"; the sha keeps parallel runs apart). Prereleases are never "latest", so the in-app update
+# notice and `v*` releases are unaffected.
+on:
+  workflow_run:
+    workflows: [Verify PR]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# One group per commit: a shared group keeps only one pending run, so a burst of merges would drop commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prerelease:
+    # A manual run publishes main only: from another branch it would ship that branch's unverified code.
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.SHA }}
+          # npm ci runs dependency install scripts: keep the write token out of .git/config (gh reads GH_TOKEN).
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+      # The omp runner every binary bundles and records: the newest published release of the fork (ompweb-dev/oh-my-pi,
+      # which builds and releases it) that attaches every platform's runner and whose ompweb-omp.json names this ompweb's
+      # RUNNER_PROTOCOL, written into omp-runner.json here (the binaries bake it in; not committed back). None fails the
+      # release. The build below downloads each platform's runner (SHA-256-checked) from it.
+      - name: Pin the newest omp runner of the fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          npx bun scripts/fetch-runner.ts --latest linux-x64
+          echo "OMP_TAG=$(node -p 'require("./omp-runner.json").tag')" >> "$GITHUB_ENV"
+      - run: npm run build
+      - name: Pin the binary release identity
+        run: |
+          now=$(date -u +%s)
+          echo "RELEASE_TITLE=$(date -u -d "@$now" +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$(date -u -d "@$now" +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=10 "$SHA")" >> "$GITHUB_ENV"
+      - name: Build the release binaries
+        env:
+          OMP_WEB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: sh scripts/build-release-binaries.sh
+      - run: npm run smoke -- --binary release/ompweb-linux-x64/ompweb
+
+      - name: Publish the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="$RELEASE_TITLE"
+          tag="$RELEASE_TAG"
+          subject=$(git log -1 --format=%s "$SHA")
+          # A draft first, so a failed upload never leaves a published prerelease missing archives.
+          gh release create "$tag" release/ompweb-*.tar.gz release/ompweb-*.zip \
+            --repo "$GITHUB_REPOSITORY" --target "$SHA" --draft --prerelease --title "$title" \
+            --notes "Binaries built from $GITHUB_REPOSITORY@$SHA ($subject), omp: ompweb-dev/oh-my-pi $OMP_TAG. Not a release: no npm package, no update notice."
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false

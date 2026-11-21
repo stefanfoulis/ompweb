@@ -1,23 +1,33 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect, useLayoutEffect } from "react";
-import dynamic from "next/dynamic";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } from "react";
+import dynamic from "@/lib/dynamic";
+import { useRouter, useSearchParams } from "@/lib/navigation";
 import { useGlobalKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { useSidebarHistory } from "@/hooks/useSidebarHistory";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { useNavigationHistory } from "@/hooks/useNavigationHistory";
+import { isMacPlatform, navigateShortcutHint, NAVIGATION_HISTORY_MAX_ENTRIES } from "@/lib/navigation-history";
+import { useMobileSidebarGestures } from "@/hooks/useMobileSidebarGestures";
 import { SessionSidebar } from "./SessionSidebar";
+import type { SearchMatchTarget } from "./SessionSearchMatches";
+import type { WorktreeContext } from "./SessionSidebar-helpers";
 import { ToastProvider } from "./ui/toast";
 import { toast } from "./ui/toast";
+import { notificationHistory, useUnreadNotificationCount } from "@/lib/notification-history";
 import { ConfirmDialog } from "./ui/field";
+import { ThemedSelect } from "./ui/primitives";
 import { ChatWindow } from "./ChatWindow";
 import { type Tab } from "./TabBar";
 import { type FileExplorerHandle } from "./FileExplorer";
 import type { RightPanelView } from "./RightPanel";
+import { useConnectionDiagnosticsEnabled } from "@/lib/connection-diagnostics-prefs";
+import { NotificationBell } from "./NotificationBell";
 import { BranchNavigator } from "./BranchNavigator";
 import { LanguageSwitcher } from "./LanguageSwitcher";
 import { CommandPaletteMount } from "./CommandPaletteMount";
-import { Check, ChevronDown, Command, Ellipsis, Folder, History, Menu, PanelLeft, PanelRight, Terminal, Wand2, X, Zap } from "lucide-react";
+import { useDocumentTitle } from "./AppShell-document-title";
+import { Check, ChevronDown, Command, Ellipsis, Folder, GitBranch, History, Menu, PanelLeft, PanelRight, Server, Terminal, Wand2, Zap } from "lucide-react";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import { translate, useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
@@ -25,12 +35,20 @@ import { formatGenerationSpeed } from "@/lib/generation-speed";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useIsCompactOverlay } from "@/hooks/useIsCompactOverlay";
 import { copyText } from "@/lib/clipboard";
-import { encodeFilePathForApi, getFileName, getRelativeFilePath } from "@/lib/file-paths";
+import { getFileApiUrl, getFileName, getRelativeFilePath, joinFilePath } from "@/lib/file-paths";
+import { normalizeLocalPath } from "@/lib/file-links";
+import type { WorkspaceFileSource } from "@/lib/workspace-types";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
-import { getInitialNavigation } from "@/lib/initial-navigation";
+import { findSessionTarget, getInitialNavigation, sameSessionTarget, sessionNavigationUrl } from "@/lib/initial-navigation";
+import { buildAppUrl } from "@/lib/app-url";
 import { comparableProjectPath } from "@/lib/comparable-path";
+import { foldedHostProjectKey, hostProjectKey, LOCAL_HOST_ID, remoteHostId, projectIdentity, projectTargetId } from "@/lib/project-ordering";
+import { isClusterTarget } from "@/lib/hosts/cluster";
+import { useHostRows } from "@/hooks/useHostRows";
+import { LocalDaemonBanner } from "./LocalDaemonBanner";
+import { hostName } from "./host-status";
 import { clearDraft } from "@/lib/draft-store";
-import { showCompletionNotification } from "@/lib/browser-notifications";
+import { useNotifications } from "@/hooks/useNotifications";
 import {
   APP_UPDATE_COMPLETED_RELOAD_MS,
   APP_UPDATE_POLL_MS,
@@ -41,9 +59,12 @@ import {
   AppUpdateTransportError,
   COMPLETED_APP_UPDATE_KEY,
   DISMISSED_APP_UPDATE_KEY,
-  DISMISSED_OMP_UPDATE_KEY,
+  commitAppUpdate,
   fetchAppUpdateJson,
+  isAwaitingAppUpdateApproval,
   isExactLegacyTargetCompletion,
+  isStaleAppUpdatePlanError,
+  prepareAppUpdate,
   readDismissedVersion,
   rememberDismissedVersion,
   sanitizeAppUpdateError,
@@ -62,7 +83,11 @@ import {
   projectLabel,
   WorkspaceState,
 } from "./AppShell-layout";
-import type { ManagedProject, SessionInfo, SessionTreeNode } from "@/lib/types";
+import type { CrossSessionHostToolCall, ManagedProject, SessionInfo, SessionTreeNode } from "@/lib/types";
+import { runHostTool } from "@/hooks/useAgentSession-stream";
+import { sendAgentCommand } from "@/lib/agent-client";
+import { onServerBuild, openEventStream } from "@/lib/event-stream";
+import { randomUUID } from "@/lib/random-uuid";
 import type { ChatInputHandle } from "./ChatInput";
 import type { SessionStatsInfo, GenerationSpeedInfo } from "@/lib/pi-types";
 import type { SettingsTab } from "./SettingsTabs";
@@ -74,19 +99,29 @@ import {
   getMonotonicAppUpdateStage,
   type AppUpdateInfo,
   type AppUpdatePhase,
+  type AppUpdatePlanStatus,
   type AppUpdateStage,
 } from "./AppUpdateDialog";
+import type { UpgradeApproval, UpgradePlan } from "@/lib/upgrade-types";
+import { ServerBuildToastBody, UpdateToastBody } from "./UpdateToast";
 import { ArchiveBrowser } from "./ArchiveBrowser";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
-// The settings shell is part of the app bundle so opening it does not fetch or compile a modal chunk. The right panel (viewer included) remains on demand.
+// The settings shell is part of the app bundle so opening it does not fetch or compile a modal chunk. The right panel (viewer included) is a separate chunk, preloaded on the first pointerdown or keydown and mounted on first open.
+// No loading placeholder: it would take the panel's place in the layout (on
+// phones, squeezing out the chat) for a frame even when the code is cached.
 const RightPanel = dynamic(() => import("./RightPanel").then((m) => m.RightPanel), {
-  ssr: false,
-  loading: () => <PanelLoadingFallback />,
+  loading: () => null,
 });
 
 const TOOL_CALLS_COLLAPSED_STORAGE_KEY = "omp-web:tool-calls-collapsed";
+const HIDE_TOOL_ACTIVITY_STORAGE_KEY = "omp-web:hide-tool-activity";
+const NEVER_FOLD_ACTIVITY_STORAGE_KEY = "omp-web:never-fold-activity";
+const SHOW_TOOL_CALLS_UNFOLDED_STORAGE_KEY = "omp-web:show-tool-calls-unfolded";
+// Off by default, so the transcript keeps collapsing reasoning until asked.
+const EXPAND_THINKING_STORAGE_KEY = "omp-web:expand-thinking";
 const PROVIDER_USAGE_VISIBLE_STORAGE_KEY = "omp-web:provider-usage-visible";
 const NATIVE_SELECT_ALL_STORAGE_KEY = "omp-web:scope-native-select-all";
+const OPEN_URL_AUTOMATICALLY_STORAGE_KEY = "omp-web:open-url-automatically";
 
 
 type AutoNameStatus =
@@ -96,7 +131,7 @@ type AutoNameStatus =
   | { kind: "error"; message: string };
 type TimerHandle = NodeJS.Timeout;
 
-export function AppShell() {
+export function AppShell({ appName }: { appName: string }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [initialNavigation] = useState(() => getInitialNavigation(searchParams));
@@ -104,12 +139,27 @@ export function AppShell() {
   const isMobile = useIsMobile();
   const isCompactOverlay = useIsCompactOverlay();
   const [selectedSession, setSelectedSession] = useState<SessionInfo | null>(null);
-  // When user clicks +, we only store the cwd — no fake session id
+  // The transient identity belongs to one intentional new chat, not one request attempt.
   const [newSessionCwd, setNewSessionCwd] = useState<string | null>(null);
-  const [workspaceOptions, setWorkspaceOptions] = useState<{ projects: ManagedProject[]; selectedProject: string | null; cwd: string | null }>({ projects: [], selectedProject: null, cwd: null });
+  // Host of newSessionCwd; undefined is this machine. Every host-aware state
+  // here uses that form (see remoteHostId).
+  const [newSessionHostId, setNewSessionHostId] = useState<string | undefined>(undefined);
+  const [newSessionCreation, setNewSessionCreation] = useState<{ id?: string; initialization?: string }>({});
+  const newSessionCreationId = newSessionCreation.id;
+  const handleNewSessionInitialization = useCallback((initialization: string) => {
+    setNewSessionCreation((current) => current.id === newSessionCreationId && current.initialization === undefined ? { ...current, initialization } : current);
+  }, [newSessionCreationId]);
+  const [newSessionPoolProject, setNewSessionPoolProject] = useState<ManagedProject | null>(null);
+  const [workspaceOptions, setWorkspaceOptions] = useState<{ projects: ManagedProject[]; selectedProject: string | null; cwd: string | null; hostId: string }>({ projects: [], selectedProject: null, cwd: null, hostId: LOCAL_HOST_ID });
   const [addProjectOpen, setAddProjectOpen] = useState(false);
-  const handleWorkspaceOptionsChange = useCallback((projects: ManagedProject[], selectedProject: string | null, cwd: string | null) => {
-    setWorkspaceOptions({ projects, selectedProject, cwd });
+  const [addProjectHostId, setAddProjectHostId] = useState<string>(LOCAL_HOST_ID);
+  const openAddProject = useCallback((open: boolean, hostId: string = LOCAL_HOST_ID) => {
+    setAddProjectHostId(hostId);
+    setAddProjectOpen(open);
+  }, []);
+  const { hosts, pools, poolsLoaded } = useHostRows();
+  const handleWorkspaceOptionsChange = useCallback((projects: ManagedProject[], selectedProject: string | null, cwd: string | null, hostId: string) => {
+    setWorkspaceOptions({ projects, selectedProject, cwd, hostId });
   }, []);
   const [initialCwdStatus, setInitialCwdStatus] = useState<"idle" | "validating" | "ready" | "error">(
     () => initialNavigation.requestedCwd ? "validating" : "idle",
@@ -122,12 +172,33 @@ export function AppShell() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [archiveBrowserOpen, setArchiveBrowserOpen] = useState(false);
   const [modelsRefreshKey, setModelsRefreshKey] = useState(0);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(() => initialNavigation.sidebarOpen);
   const [mobileSidebarReady, setMobileSidebarReady] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(SIDEBAR_DEFAULT_WIDTH);
   const [toolCallsDefaultCollapsed, setToolCallsDefaultCollapsed] = useState(true);
+  const [hideToolActivity, setHideToolActivity] = useState(true);
+  const [neverFoldActivity, setNeverFoldActivity] = useState(false);
+  const [showToolCallsUnfolded, setShowToolCallsUnfolded] = useState(false);
+  // "Expand thinking blocks by default" — like the tool-call preference, a
+  // UI-only behavior, so it lives in localStorage rather than omp's config.
+  const [expandThinkingByDefault, setExpandThinkingByDefault] = useState(false);
+  const [hideThinkingBlock, setHideThinkingBlock] = useState(false);
+  useEffect(() => {
+    // omp's own setting, so the transcript hides thinking when the TUI does.
+    // Re-read on focus: the TUI or another tab may have changed it.
+    const load = () => {
+      fetch("/api/omp-settings")
+        .then((response) => (response.ok ? response.json() : null))
+        .then((data: { settings?: { hideThinkingBlock?: boolean } } | null) => { if (data) setHideThinkingBlock(data.settings?.hideThinkingBlock === true); })
+        .catch(() => {});
+    };
+    load();
+    window.addEventListener("focus", load);
+    return () => window.removeEventListener("focus", load);
+  }, []);
   const [providerUsageVisible, setProviderUsageVisible] = useState(true);
   const [scopeNativeSelectAll, setScopeNativeSelectAll] = useState(false);
+  const [openUrlAutomatically, setOpenUrlAutomatically] = useState(false);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   // Active drag handlers so an unmount mid-drag can detach them.
   const sidebarResizeHandlersRef = useRef<{ onMove: (ev: MouseEvent) => void; onUp: () => void } | null>(null);
@@ -141,8 +212,13 @@ export function AppShell() {
     setSidebarWidth(loadSidebarWidth());
     try {
       setToolCallsDefaultCollapsed(window.localStorage.getItem(TOOL_CALLS_COLLAPSED_STORAGE_KEY) !== "false");
+      setHideToolActivity(window.localStorage.getItem(HIDE_TOOL_ACTIVITY_STORAGE_KEY) !== "false");
+      setNeverFoldActivity(window.localStorage.getItem(NEVER_FOLD_ACTIVITY_STORAGE_KEY) === "true");
+      setShowToolCallsUnfolded(window.localStorage.getItem(SHOW_TOOL_CALLS_UNFOLDED_STORAGE_KEY) === "true");
+      setExpandThinkingByDefault(window.localStorage.getItem(EXPAND_THINKING_STORAGE_KEY) === "true");
       setProviderUsageVisible(window.localStorage.getItem(PROVIDER_USAGE_VISIBLE_STORAGE_KEY) !== "false");
       setScopeNativeSelectAll(window.localStorage.getItem(NATIVE_SELECT_ALL_STORAGE_KEY) === "true");
+      setOpenUrlAutomatically(window.localStorage.getItem(OPEN_URL_AUTOMATICALLY_STORAGE_KEY) === "true");
     } catch {
       // Keep the compact default when storage is unavailable.
     }
@@ -151,6 +227,38 @@ export function AppShell() {
     setToolCallsDefaultCollapsed(collapsed);
     try {
       window.localStorage.setItem(TOOL_CALLS_COLLAPSED_STORAGE_KEY, String(collapsed));
+    } catch {
+      // The preference still applies for this page load.
+    }
+  }, []);
+  const handleHideToolActivityChange = useCallback((hide: boolean) => {
+    setHideToolActivity(hide);
+    try {
+      window.localStorage.setItem(HIDE_TOOL_ACTIVITY_STORAGE_KEY, String(hide));
+    } catch {
+      // The preference still applies for this page load.
+    }
+  }, []);
+  const handleNeverFoldActivityChange = useCallback((never: boolean) => {
+    setNeverFoldActivity(never);
+    try {
+      window.localStorage.setItem(NEVER_FOLD_ACTIVITY_STORAGE_KEY, String(never));
+    } catch {
+      // The preference still applies for this page load.
+    }
+  }, []);
+  const handleShowToolCallsUnfoldedChange = useCallback((show: boolean) => {
+    setShowToolCallsUnfolded(show);
+    try {
+      window.localStorage.setItem(SHOW_TOOL_CALLS_UNFOLDED_STORAGE_KEY, String(show));
+    } catch {
+      // The preference still applies for this page load.
+    }
+  }, []);
+  const handleExpandThinkingByDefaultChange = useCallback((expand: boolean) => {
+    setExpandThinkingByDefault(expand);
+    try {
+      window.localStorage.setItem(EXPAND_THINKING_STORAGE_KEY, String(expand));
     } catch {
       // The preference still applies for this page load.
     }
@@ -167,6 +275,14 @@ export function AppShell() {
     setScopeNativeSelectAll(enabled);
     try {
       window.localStorage.setItem(NATIVE_SELECT_ALL_STORAGE_KEY, String(enabled));
+    } catch {
+      // The preference still applies for this page load.
+    }
+  }, []);
+  const handleOpenUrlAutomaticallyChange = useCallback((enabled: boolean) => {
+    setOpenUrlAutomatically(enabled);
+    try {
+      window.localStorage.setItem(OPEN_URL_AUTOMATICALLY_STORAGE_KEY, String(enabled));
     } catch {
       // The preference still applies for this page load.
     }
@@ -201,6 +317,21 @@ export function AppShell() {
   const appUpdateRecoveryCommitAttemptRef = useRef<string | null>(null);
   const appUpdateStageFlowRef = useRef(0);
   const appUpdateAcknowledgementsRef = useRef<Map<string, Promise<boolean>>>(new Map());
+  const appUpdateStalledRef = useRef<{ attemptId: string; targetVersion: string } | null>(null);
+  // A prepared plan is only a proposal; `appUpdateApprovalRef` is set solely by an explicit user approval.
+  const [appUpdatePlan, setAppUpdatePlan] = useState<UpgradePlan | null>(null);
+  const [appUpdatePlanStatus, setAppUpdatePlanStatus] = useState<AppUpdatePlanStatus>("idle");
+  const appUpdatePlanRequestRef = useRef<number | null>(null);
+  const appUpdatePlanSeqRef = useRef(0);
+  const appUpdatePlanAttemptRef = useRef<{ attemptId: string; targetVersion: string } | null>(null);
+  const appUpdateApprovalRef = useRef<{ attemptId: string; approval: UpgradeApproval } | null>(null);
+  const discardAppUpdatePlan = useCallback(() => {
+    appUpdatePlanRequestRef.current = null;
+    appUpdatePlanAttemptRef.current = null;
+    appUpdateApprovalRef.current = null;
+    setAppUpdatePlan(null);
+    setAppUpdatePlanStatus("idle");
+  }, []);
   const advanceAppUpdateVisibleStage = useCallback((next: AppUpdateStage) => {
     const visible = getMonotonicAppUpdateStage(appUpdateVisibleStageRef.current, next);
     if (visible === appUpdateVisibleStageRef.current) return;
@@ -241,10 +372,6 @@ export function AppShell() {
       advanceAppUpdateVisibleStage(next);
     }
   }, [advanceAppUpdateVisibleStage]);
-  const [ompUpdateAvailable, setOmpUpdateAvailable] = useState(false);
-  const [ompUpdatesDisabled, setOmpUpdatesDisabled] = useState(false);
-  // Bumped on visibilitychange so the mount-time update checks re-run.
-  const [updateCheckKey, setUpdateCheckKey] = useState(0);
   // On mobile the sidebar is an overlay drawer; hide it by default so the chat
   // is visible on load. Runs once the breakpoint resolves after hydration.
   useEffect(() => {
@@ -266,71 +393,6 @@ export function AppShell() {
       active.blur();
     }
   }, [sidebarOpen, mobileSidebarReady]);
-  useEffect(() => {
-    const controller = new AbortController();
-    void fetch("/api/omp-update", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "check" }),
-      signal: controller.signal,
-    })
-      .then((response) => response.ok ? response.json() : null)
-      .then((data: { currentVersion?: string | null; availableVersion?: string | null; updateAvailable?: boolean; updateCommand?: string; updatesDisabled?: boolean } | null) => {
-        setOmpUpdateAvailable(Boolean(data?.updateAvailable));
-        setOmpUpdatesDisabled(Boolean(data?.updatesDisabled));
-        if (!data?.updateAvailable || !data.availableVersion) return;
-        // This check re-runs on every visibilitychange back to the tab, so a
-        // version the user already dismissed must not be re-announced.
-        if (readDismissedVersion(DISMISSED_OMP_UPDATE_KEY) === data.availableVersion) return;
-        const version = data.availableVersion;
-        const cmd = data.updateCommand || "omp update";
-        toast.info(
-          translate("appShell.ompUpdateAvailable"),
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
-            <div>{translate("appShell.updateVersion", { current: data.currentVersion ?? "?", available: data.availableVersion })}</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-              <code style={{ background: "var(--bg-panel)", padding: "3px 7px", borderRadius: "var(--radius-control)", fontSize: 11, fontFamily: "var(--font-mono)" }}>
-                {cmd}
-              </code>
-              <button
-                type="button"
-                onClick={() => {
-                  void copyText(cmd)
-                    .then(() => toast.success(translate("appShell.commandCopied")))
-                    .catch(() => toast.error(translate("appShell.commandCopyFailed")));
-                }}
-                style={{ padding: "3px 7px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11 }}
-              >
-                {translate("appShell.copyCommand")}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setSettingsTab("system");
-                  toast.close("omp-update-available");
-                }}
-                style={{ padding: "3px 7px", border: "1px solid var(--accent-strong)", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}
-              >
-                {translate("settingsConfig.ompUpdateAction")}
-              </button>
-            </div>
-          </div>,
-          { id: "omp-update-available", timeout: 0, onClose: () => rememberDismissedVersion(DISMISSED_OMP_UPDATE_KEY, version) }
-        );
-      })
-      .catch(() => {});
-    return () => controller.abort();
-  }, [updateCheckKey]);
-  useEffect(() => {
-    const recheck = () => {
-      if (document.visibilityState !== "visible") return;
-      // A transient failure on mount reads as "no update" forever otherwise;
-      // re-running the checks below on re-focus gives them another chance.
-      setUpdateCheckKey((key) => key + 1);
-    };
-    document.addEventListener("visibilitychange", recheck);
-    return () => document.removeEventListener("visibilitychange", recheck);
-  }, []);
   const refreshAppUpdate = useCallback(async (force = false, autoOpen = false): Promise<AppUpdateInfo | null> => {
     const data = await fetchAppUpdateJson<AppUpdateInfo>(
       force ? "/api/app-update?force=1" : "/api/app-update",
@@ -343,7 +405,7 @@ export function AppShell() {
 
     setAppUpdate(data);
 
-    if (autoOpen && !data.selfUpdateStatus && data.updateAvailable && data.availableVersion) {
+    if (autoOpen && (!data.selfUpdateStatus || isAwaitingAppUpdateApproval(data)) && data.updateAvailable && data.availableVersion) {
       if (data.selfUpdateSupported === true) {
         if (readDismissedVersion(DISMISSED_APP_UPDATE_KEY) !== data.availableVersion) {
           setAppUpdatePhase("idle");
@@ -351,41 +413,26 @@ export function AppShell() {
           setAppUpdateDialogOpen(true);
         }
       } else {
-        const cmd = data.updateCommand || "npm install -g @kahme247/ompweb";
         const version = data.availableVersion;
         if (readDismissedVersion(DISMISSED_APP_UPDATE_KEY) === version) return data;
+        // The compiled binary updates by download: its target is the release page, and there is nothing to run here.
+        const binary = data.installMethod === "binary";
         toast.info(
           translate("appShell.appUpdateAvailable"),
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
-            <div>{translate("appShell.updateVersion", { current: data.currentVersion ?? "?", available: data.availableVersion })}</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-              <code style={{ background: "var(--bg-panel)", padding: "3px 7px", borderRadius: "var(--radius-control)", fontSize: 11, fontFamily: "var(--font-mono)" }}>
-                {cmd}
-              </code>
-              <button
-                type="button"
-                onClick={() => {
-                  void copyText(cmd)
-                    .then(() => toast.success(translate("appShell.commandCopied")))
-                    .catch(() => toast.error(translate("appShell.commandCopyFailed")));
-                }}
-                style={{ padding: "3px 7px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11 }}
-              >
-                {translate("appShell.copyCommand")}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setSettingsTab("system");
-                  toast.close("app-update-available");
-                }}
-                style={{ padding: "3px 7px", border: "1px solid var(--accent-strong)", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}
-              >
-                {translate("settingsConfig.appUpdateAction")}
-              </button>
-            </div>
-          </div>,
-          { id: "app-update-available", timeout: 0, onClose: () => rememberDismissedVersion(DISMISSED_APP_UPDATE_KEY, version) }
+          <UpdateToastBody
+            currentVersion={data.currentVersion}
+            availableVersion={version}
+            target={data.updateCommand || "npm install -g @kahme247/ompweb"}
+            link={binary}
+            action={binary ? undefined : {
+              label: translate("settingsConfig.appUpdateAction"),
+              onClick: () => {
+                setSettingsTab("system");
+                toast.close(`app-update-available:${version}`);
+              },
+            }}
+          />,
+          { id: `app-update-available:${version}`, timeout: 0, onClose: () => rememberDismissedVersion(DISMISSED_APP_UPDATE_KEY, version) }
         );
       }
     }
@@ -426,13 +473,17 @@ export function AppShell() {
     setAppUpdateDialogOpen(true);
   }, []);
 
-  const submitAppUpdateCommit = useCallback((attemptId: string) => {
-    void fetchAppUpdateJson<{ error?: string }>("/api/app-update", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "commit", attemptId }),
-      keepalive: true,
-    }, 202).then(() => {
+  const reviewChangedAppUpdatePlan = useCallback(() => {
+    appUpdateAttemptRef.current = null;
+    appUpdateStartInFlightRef.current = false;
+    resetAppUpdateVisibleStage();
+    discardAppUpdatePlan();
+    setAppUpdateError(t("appUpdateDialog.planChanged"));
+    setAppUpdatePhase("idle");
+  }, [discardAppUpdatePlan, resetAppUpdateVisibleStage, t]);
+
+  const submitAppUpdateCommit = useCallback((attemptId: string, approval: UpgradeApproval) => {
+    void commitAppUpdate(attemptId, approval).then(() => {
       if (appUpdateAttemptRef.current === attemptId) {
         appUpdateCommittedAttemptRef.current = attemptId;
       }
@@ -444,9 +495,14 @@ export function AppShell() {
         return;
       }
       if (appUpdateAttemptRef.current !== attemptId) return;
+      // The plan or hosts changed after approval: show a fresh plan; the old approval is never reused.
+      if (isStaleAppUpdatePlanError(error)) {
+        reviewChangedAppUpdatePlan();
+        return;
+      }
       showAppUpdateFailure(error);
     });
-  }, [showAppUpdateFailure]);
+  }, [reviewChangedAppUpdatePlan, showAppUpdateFailure]);
 
   const recoverPreparedAppUpdate = useCallback((data: AppUpdateInfo, attemptId: string) => {
     const status = data.selfUpdateStatus;
@@ -455,9 +511,14 @@ export function AppShell() {
       || status.state !== "prepared"
       || (status.stage !== "preparing" && status.stage !== "stopping")
     ) return;
+    // Only a recorded approval may be redelivered; an unapproved prepared attempt stays a proposal.
+    const recorded = appUpdateApprovalRef.current?.attemptId === attemptId ? appUpdateApprovalRef.current.approval : null;
+    const approved = data.upgradePlan?.approved;
+    const approval = recorded ?? (approved && data.upgradePlan ? { planId: data.upgradePlan.id, force: approved.force } : null);
+    if (!approval) return;
     if (appUpdateRecoveryCommitAttemptRef.current === attemptId) return;
     appUpdateRecoveryCommitAttemptRef.current = attemptId;
-    submitAppUpdateCommit(attemptId);
+    submitAppUpdateCommit(attemptId, approval);
   }, [submitAppUpdateCommit]);
 
   const completeAppUpdate = useCallback(async (targetVersion: string) => {
@@ -537,10 +598,23 @@ export function AppShell() {
         return;
       }
     }
+    // The backend keeps the update alive past this deadline: report "still running" and let the user re-read status. Never fail, resubmit or force.
     if (appUpdateAttemptRef.current === attemptId) {
-      showAppUpdateFailure(t("appUpdateDialog.timeout"));
+      appUpdateStalledRef.current = { attemptId, targetVersion };
+      setAppUpdateError(null);
+      setAppUpdatePhase("stalled");
     }
-  }, [advanceAppUpdateVisibleStage, completeAppUpdate, handleTerminalAppUpdate, recoverPreparedAppUpdate, refreshAppUpdate, showAppUpdateFailure, showAppUpdateStagesThrough, t]);
+  }, [advanceAppUpdateVisibleStage, completeAppUpdate, handleTerminalAppUpdate, recoverPreparedAppUpdate, refreshAppUpdate, showAppUpdateFailure, showAppUpdateStagesThrough]);
+
+  // Reads status again for the same attempt; it submits nothing.
+  const checkStalledAppUpdate = useCallback(() => {
+    const stalled = appUpdateStalledRef.current;
+    if (!stalled) return;
+    appUpdateStalledRef.current = null;
+    appUpdateAttemptRef.current = null;
+    setAppUpdatePhase("restarting");
+    void monitorAppUpdate(stalled.attemptId, stalled.targetVersion);
+  }, [monitorAppUpdate]);
 
   useEffect(() => {
     try {
@@ -556,7 +630,7 @@ export function AppShell() {
     void refreshAppUpdate(false, true)
       .then(async (data) => {
         const status = data?.selfUpdateStatus;
-        if (!data || !status) return;
+        if (!data || !status || isAwaitingAppUpdateApproval(data)) return;
         const recoveredStage = status.stage ?? "stopping";
         const initialStage = recoveredStage === "preparing" ? "preparing" : "stopping";
         if (initialStage === "stopping") appUpdateCommittedAttemptRef.current = status.attemptId;
@@ -571,24 +645,39 @@ export function AppShell() {
       .catch(() => {});
   }, [advanceAppUpdateVisibleStage, handleTerminalAppUpdate, monitorAppUpdate, recoverPreparedAppUpdate, refreshAppUpdate, showAppUpdateStagesThrough, t]);
 
-  const proceedWithAppUpdate = useCallback(async () => {
-    if (appUpdateStartInFlightRef.current) return;
+  // A tab's bundle id (inlined at build time) vs. the server's (server/app.ts's dist/build-id, forwarded through
+  // the worker's hello): dev and an unbuilt bundle have no id, so neither side ever prompts. `serverBuildShownRef`
+  // keeps the toast to once per page load; the worker repeats the same build on every reconnect's hello.
+  const serverBuildShownRef = useRef(false);
+  useEffect(() => {
+    const bundleBuild = process.env.OMP_WEB_PUBLIC_BUILD_ID;
+    if (!bundleBuild) return;
+    return onServerBuild((build) => {
+      if (serverBuildShownRef.current || build === bundleBuild) return;
+      serverBuildShownRef.current = true;
+      toast.info(t("appShell.newBuildAvailable"), <ServerBuildToastBody />, { id: "server-build-updated", timeout: 0 });
+    });
+  }, [t]);
+
+  const proceedWithAppUpdate = useCallback(async (approval: UpgradeApproval) => {
+    const prepared = appUpdatePlanAttemptRef.current;
+    if (
+      appUpdateStartInFlightRef.current
+      || appUpdateAttemptRef.current !== null
+      || !prepared
+      || appUpdatePlan === null
+      || approval.planId !== appUpdatePlan.id
+      || (appUpdatePlan.requiresForce && !approval.force)
+    ) return;
     appUpdateStartInFlightRef.current = true;
     appUpdateCompletingRef.current = false;
     resetAppUpdateVisibleStage();
+    appUpdateApprovalRef.current = { attemptId: prepared.attemptId, approval };
     advanceAppUpdateVisibleStage("preparing");
     setAppUpdatePhase("preparing");
     setAppUpdateError(null);
     try {
-      const prepared = await fetchAppUpdateJson<{ attemptId?: string; targetVersion?: string }>("/api/app-update", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "prepare" }),
-      });
-      if (!prepared.attemptId || !prepared.targetVersion) {
-        throw new Error("Invalid update response");
-      }
-      submitAppUpdateCommit(prepared.attemptId);
+      submitAppUpdateCommit(prepared.attemptId, approval);
       void monitorAppUpdate(prepared.attemptId, prepared.targetVersion);
       await showAppUpdateStagesThrough("stopping");
       if (appUpdateAttemptRef.current !== prepared.attemptId) return;
@@ -596,7 +685,27 @@ export function AppShell() {
     } catch (error) {
       showAppUpdateFailure(error);
     }
-  }, [advanceAppUpdateVisibleStage, monitorAppUpdate, resetAppUpdateVisibleStage, showAppUpdateFailure, showAppUpdateStagesThrough, submitAppUpdateCommit]);
+  }, [advanceAppUpdateVisibleStage, appUpdatePlan, monitorAppUpdate, resetAppUpdateVisibleStage, showAppUpdateFailure, showAppUpdateStagesThrough, submitAppUpdateCommit]);
+
+  // Prepare a plan whenever the dialog is open and idle without one. Preparing never commits.
+  useEffect(() => {
+    if (!appUpdateDialogOpen || appUpdatePhase !== "idle" || appUpdateStartInFlightRef.current || appUpdateAttemptRef.current !== null || appUpdatePlanStatus !== "idle" || appUpdatePlanRequestRef.current !== null) return;
+    const request = ++appUpdatePlanSeqRef.current;
+    appUpdatePlanRequestRef.current = request;
+    setAppUpdatePlanStatus("loading");
+    void prepareAppUpdate().then((prepared) => {
+      if (appUpdatePlanRequestRef.current !== request) return;
+      appUpdatePlanRequestRef.current = null;
+      appUpdatePlanAttemptRef.current = { attemptId: prepared.attemptId, targetVersion: prepared.targetVersion };
+      setAppUpdatePlan(prepared.plan);
+      setAppUpdatePlanStatus("ready");
+    }, (error: unknown) => {
+      if (appUpdatePlanRequestRef.current !== request) return;
+      appUpdatePlanRequestRef.current = null;
+      setAppUpdateError(sanitizeAppUpdateError(error) || null);
+      setAppUpdatePlanStatus("failed");
+    });
+  }, [appUpdateDialogOpen, appUpdatePhase, appUpdatePlanStatus]);
 
   const dismissAppUpdate = useCallback(() => {
     if (appUpdatePhase === "idle" && appUpdate?.availableVersion) {
@@ -604,21 +713,42 @@ export function AppShell() {
       toast.info(t("appUpdateDialog.settingsLater"));
     }
     setAppUpdateDialogOpen(false);
+    if (appUpdateStalledRef.current !== null) return;
     setAppUpdatePhase("idle");
     setAppUpdateError(null);
     appUpdateAttemptRef.current = null;
+    appUpdateStalledRef.current = null;
+    discardAppUpdatePlan();
     resetAppUpdateVisibleStage();
-  }, [appUpdate?.availableVersion, appUpdatePhase, resetAppUpdateVisibleStage, t]);
+  }, [appUpdate?.availableVersion, appUpdatePhase, discardAppUpdatePlan, resetAppUpdateVisibleStage, t]);
+
+  // Retry after a failure, an expired plan or a failed prepare: always a fresh plan, never a resumed approval.
+  const refreshAppUpdatePlan = useCallback(() => {
+    appUpdateAttemptRef.current = null;
+    appUpdateStartInFlightRef.current = false;
+    appUpdateCompletingRef.current = false;
+    discardAppUpdatePlan();
+    resetAppUpdateVisibleStage();
+    setAppUpdateError(null);
+    setAppUpdatePhase("idle");
+  }, [discardAppUpdatePlan, resetAppUpdateVisibleStage]);
 
   const requestAppUpdateFromSettings = useCallback(() => {
     setSettingsTab(null);
+    if (appUpdateStalledRef.current !== null) {
+      checkStalledAppUpdate();
+      window.requestAnimationFrame(() => setAppUpdateDialogOpen(true));
+      return;
+    }
+    discardAppUpdatePlan();
     resetAppUpdateVisibleStage();
     setAppUpdateError(null);
     setAppUpdatePhase("idle");
     window.requestAnimationFrame(() => setAppUpdateDialogOpen(true));
-  }, [resetAppUpdateVisibleStage]);
+  }, [checkStalledAppUpdate, discardAppUpdatePlan, resetAppUpdateVisibleStage]);
   const chatInputRef = useRef<ChatInputHandle | null>(null);
   const topBarRef = useRef<HTMLDivElement>(null);
+  const [sessionInfoContainer, setSessionInfoContainer] = useState<HTMLDivElement | null>(null);
 
   // Branch navigator state — populated by ChatWindow via onBranchDataChange
   const [branchTree, setBranchTree] = useState<SessionTreeNode[]>([]);
@@ -655,12 +785,20 @@ export function AppShell() {
   const [sessionStats, setSessionStats] = useState<SessionStatsInfo | null>(null);
   const [autoNameStatus, setAutoNameStatus] = useState<AutoNameStatus>({ kind: "idle" });
   const autoNameTimerRef = useRef<TimerHandle | undefined>(undefined);
-  const activeSessionIdRef = useRef<string | null>(selectedSession?.id ?? null);
+  const activeSelectedSessionId = selectedSession?.id ?? null;
+  const activeSelectedSessionHostId = selectedSession?.hostId;
+  const activeSessionIdRef = useRef<string | null>(activeSelectedSessionId);
+  const activeSessionTargetRef = useRef<{ id: string; hostId?: string } | null>(
+    activeSelectedSessionId ? { id: activeSelectedSessionId, hostId: activeSelectedSessionHostId } : null,
+  );
+  const activeSettingsTabRef = useRef(settingsTab);
   const archiveRetryTimerRef = useRef<TimerHandle | undefined>(undefined);
   useEffect(() => () => clearTimeout(archiveRetryTimerRef.current), []);
   useLayoutEffect(() => {
-    activeSessionIdRef.current = selectedSession?.id ?? null;
-  }, [selectedSession?.id]);
+    activeSessionIdRef.current = activeSelectedSessionId;
+    activeSessionTargetRef.current = activeSelectedSessionId ? { id: activeSelectedSessionId, hostId: activeSelectedSessionHostId } : null;
+    activeSettingsTabRef.current = settingsTab;
+  }, [activeSelectedSessionId, activeSelectedSessionHostId, settingsTab]);
   const handleSessionStatsChange = useCallback((stats: SessionStatsInfo | null) => {
     setSessionStats(stats);
   }, []);
@@ -733,8 +871,7 @@ export function AppShell() {
     });
   }, [activeTopPanel, systemPrompt, systemPromptLoading, toggleTopPanel]);
 
-  // The topbar session panel is gone (its content lives in the composer ring
-  // popover), so /session opens that instead.
+  // /session opens the same information panel as the top-bar control.
   const openSessionStatsPanel = useCallback(() => {
     chatInputRef.current?.openContextPanel();
   }, []);
@@ -861,8 +998,7 @@ export function AppShell() {
     // Live rect, not state: it always reflects the committed width (custom or
     // fluid default), and keeps this callback above the state declarations
     // without a TDZ cycle. The handle only exists while the panel is open.
-    const startWidth = rightPanelRef.current?.getBoundingClientRect().width
-      ?? RIGHT_PANEL_MIN_WIDTH;
+    const measuredWidth = rightPanelRef.current?.getBoundingClientRect().width;
     // Same --ui-scale ground truth as the left sidebar handle: clientX is in
     // viewport pixels while the panel width is zoomed layout pixels.
     let uiScale = 1;
@@ -873,18 +1009,27 @@ export function AppShell() {
     } catch {
       // SSR/unavailable: fall back to unscaled math.
     }
+    const startWidth = measuredWidth === undefined ? RIGHT_PANEL_MIN_WIDTH : measuredWidth / uiScale;
     setRightPanelResizing(true);
+    let frame: number | null = null;
+    const cancelFrame = () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = null;
+    };
+    const applyWidth = () => {
+      frame = null;
+      rightPanelRef.current?.style.setProperty("--right-panel-width", `${pendingRightPanelWidthRef.current}px`);
+    };
     const onMove = (ev: MouseEvent) => {
       // Dragging the left edge left grows the panel: inverse of the sidebar.
-      const next = clampRightPanelWidth(startWidth - (ev.clientX - startX) / uiScale);
-      // Write the CSS variable straight to the DOM: the flex row follows the
-      // pointer without re-rendering the whole AppShell on every mousemove.
-      rightPanelRef.current?.style.setProperty("--right-panel-width", `${next}px`);
-      pendingRightPanelWidthRef.current = next;
+      pendingRightPanelWidthRef.current = clampRightPanelWidth(startWidth - (ev.clientX - startX) / uiScale);
+      if (frame === null) frame = requestAnimationFrame(applyWidth);
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      cancelFrame();
+      applyWidth();
       rightResizeHandlersRef.current = null;
       setRightPanelResizing(false);
       // Commit the final width so state and the persisted value agree with
@@ -896,7 +1041,7 @@ export function AppShell() {
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
     pendingRightPanelWidthRef.current = startWidth;
-    rightResizeHandlersRef.current = { onMove, onUp };
+    rightResizeHandlersRef.current = { onMove, onUp, cancelFrame };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }, [isMobile]);
@@ -908,6 +1053,7 @@ export function AppShell() {
     if (!handlers) return;
     window.removeEventListener("mousemove", handlers.onMove);
     window.removeEventListener("mouseup", handlers.onUp);
+    handlers.cancelFrame();
     rightResizeHandlersRef.current = null;
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
@@ -940,27 +1086,112 @@ export function AppShell() {
   // Right panel tabs: Explorer | Git changes | open files (Tauri parity).
   const [fileTabs, setFileTabs] = useState<Tab[]>([]);
   const [activeFileTabId, setActiveFileTabId] = useState<string | null>(null);
-  const [rightPanelOpen, setRightPanelOpen] = useState(false);
+  const [rightPanelOpen, setRightPanelOpen] = useState(() => initialNavigation.rightPanelOpen);
+  const closeRightPanel = useCallback(() => {
+    setRightPanelOpen(false);
+    if (!isCompactOverlay) {
+      topBarRef.current?.querySelector<HTMLButtonElement>(".shell-panel-opener")?.focus();
+    }
+  }, [isCompactOverlay]);
   const [rightPanelHasOpened, setRightPanelHasOpened] = useState(false);
-  const [rightView, setRightView] = useState<"explorer" | "git" | "file">("explorer");
+  const [rightView, setRightView] = useState<RightPanelView>("explorer");
+  const connectionDiagnosticsOn = useConnectionDiagnosticsEnabled();
+  // The Connection tab exists only while its setting is on; a selected one falls back to Explorer.
+  useEffect(() => {
+    if (!connectionDiagnosticsOn) setRightView((view) => view === "connection" ? "explorer" : view);
+  }, [connectionDiagnosticsOn]);
+  const unreadNotifications = useUnreadNotificationCount();
+  // Desktop shows the history in the top-bar bell's popover; mobile in the right panel's tab.
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  useEffect(() => {
+    if (!isMobile) setRightView((view) => view === "notifications" ? "explorer" : view);
+  }, [isMobile]);
+  // Settings replaces the top bar; the popover must not reopen on the way back.
+  useEffect(() => {
+    if (isMobile || settingsTab) setNotificationsOpen(false);
+  }, [isMobile, settingsTab]);
+  // Unread entries stay highlighted while the notifications are shown and
+  // become read once the user leaves them (switches tab, closes the panel or popover).
+  const viewingNotifications = (notificationsOpen || (rightPanelOpen && rightView === "notifications")) && !settingsTab;
+  const wasViewingNotificationsRef = useRef(false);
+  // Layout effect: marks read before a notification arriving after the close can join the list.
+  useLayoutEffect(() => {
+    if (wasViewingNotificationsRef.current && !viewingNotifications) notificationHistory.markAllRead();
+    wasViewingNotificationsRef.current = viewingNotifications;
+  }, [viewingNotifications]);
+  const opensNotifications = isMobile && unreadNotifications > 0 && !viewingNotifications;
+  const panelOpenerLabel = opensNotifications
+    ? t("appShell.showNotifications", { count: unreadNotifications })
+    : rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel");
   // User-chosen pixel width (null = fluid 42% default), persisted.
   const [rightPanelWidth, setRightPanelWidth] = useState<number | null>(null);
   const [rightPanelResizing, setRightPanelResizing] = useState(false);
+  // The panel is code-split and mounts a render after its first open, so the
+  // dialog behavior (focus, Escape, Tab wrap) waits until the element exists.
+  // The rest of the page goes inert at the same moment: made inert earlier,
+  // it would drop focus from the opener (e.g. a file link in the chat) before
+  // the dialog records it, and closing could not return focus there.
+  const [rightPanelMounted, setRightPanelMounted] = useState(false);
+  const rightPanelIsModal = isCompactOverlay && rightPanelMounted && rightPanelOpen && !settingsTab;
   const rightPanelRef = useModalDialog<HTMLDivElement>({
-    onClose: () => setRightPanelOpen(false),
-    active: isCompactOverlay && rightPanelHasOpened && rightPanelOpen && !settingsTab,
+    onClose: closeRightPanel,
+    active: rightPanelIsModal,
   });
-  const rightPanelIsModal = isCompactOverlay && rightPanelHasOpened && rightPanelOpen && !settingsTab;
+  const attachRightPanel = useCallback((element: HTMLDivElement | null) => {
+    rightPanelRef.current = element;
+    setRightPanelMounted(element !== null);
+  }, [rightPanelRef]);
+  useMobileSidebarGestures({
+    enabled: isMobile && mobileSidebarReady && !settingsTab,
+    leftOpen: sidebarOpen,
+    rightOpen: rightPanelOpen,
+    onLeftOpenChange: setSidebarOpen,
+    onRightOpenChange: setRightPanelOpen,
+  });
   const pendingRightPanelWidthRef = useRef<number | null>(null);
-  const rightResizeHandlersRef = useRef<{ onMove: (ev: MouseEvent) => void; onUp: () => void } | null>(null);
+  const rightResizeHandlersRef = useRef<{ onMove: (ev: MouseEvent) => void; onUp: () => void; cancelFrame: () => void } | null>(null);
   useEffect(() => {
     setRightPanelWidth(loadRightPanelWidth());
   }, []);
   useEffect(() => {
     if (rightPanelOpen) setRightPanelHasOpened(true);
   }, [rightPanelOpen]);
+  // On a narrow viewport the right panel becomes a full-screen modal; it
+  // always starts closed there, the same way the left sidebar's overlay does
+  // on mobile (see the `isMobile` effect above) — a URL that opened it on a
+  // wide screen must not surface a stuck overlay on a reload at phone width.
+  useEffect(() => {
+    if (isCompactOverlay) setRightPanelOpen(false);
+  }, [isCompactOverlay]);
+  // Overlays the live sidebar/right-panel collapse state onto `base` — a
+  // session href from `sessionNavigationUrl`, or the bare "/" — for every
+  // `router.replace` below. Switching sessions this way never drops the
+  // panel params, and toggling a panel never drops the session or host.
+  // Mobile's sidebar overlay and the compact-overlay right panel are
+  // transient UI, not navigable state, so their params are never written
+  // from those viewports.
+  const buildUrl = useCallback((base: string) => buildAppUrl(base, {
+    left: !isMobile && !sidebarOpen,
+    right: !isCompactOverlay && rightPanelOpen,
+  }), [isMobile, isCompactOverlay, sidebarOpen, rightPanelOpen]);
+  // Fetch the panel's code on the first interaction, so the first open rarely
+  // waits for a download while pages nobody touches never fetch it. A failed
+  // preload is retried by the first open.
+  useEffect(() => {
+    const preload = () => {
+      window.removeEventListener("pointerdown", preload, true);
+      window.removeEventListener("keydown", preload, true);
+      import("./RightPanel").catch(() => {});
+    };
+    window.addEventListener("pointerdown", preload, true);
+    window.addEventListener("keydown", preload, true);
+    return () => {
+      window.removeEventListener("pointerdown", preload, true);
+      window.removeEventListener("keydown", preload, true);
+    };
+  }, []);
   // One-shot request asking the explorer tab to expand + scroll to a file.
-  const [revealPath, setRevealPath] = useState<string | null>(null);
+  const [revealTarget, setRevealTarget] = useState<{ path: string; hostId: string } | null>(null);
   const [fileSearchOpen, setFileSearchOpen] = useState(false);
   const [explorerUploadBusy, setExplorerUploadBusy] = useState(false);
   const [explorerGitCount, setExplorerGitCount] = useState(0);
@@ -1004,6 +1235,10 @@ export function AppShell() {
 
   const initialSessionId = initialNavigation.sessionId;
   const [activeCwd, setActiveCwd] = useState<string | null>(null);
+  const [activeHostId, setActiveHostId] = useState<string | undefined>(undefined);
+  const [activePoolProject, setActivePoolProject] = useState<ManagedProject | null>(null);
+  // Owned by the sidebar; rendered by the file panel's Worktrees tab.
+  const [worktreeCtx, setWorktreeCtx] = useState<WorktreeContext | null>(null);
   // True once the initial ?session= URL param has been resolved (or confirmed absent)
   const [initialSessionRestored, setInitialSessionRestored] = useState<boolean>(() => !initialSessionId);
   // During the initial URL restore the sidebar adopts the restored cwd and
@@ -1023,11 +1258,12 @@ export function AppShell() {
     void fetch("/api/cwd/validate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: requestedCwd }),
+      body: JSON.stringify({ cwd: requestedCwd, hostId: initialNavigation.hostId }),
       signal: controller.signal,
     })
       .then(async (response) => {
         const data = await response.json().catch(() => ({})) as { cwd?: string; error?: string; code?: string };
+        if (controller.signal.aborted) return;
         if (!response.ok || !data.cwd) {
           throw new Error(data.error || data.code ? formatApiError(data) : `HTTP ${response.status}`);
         }
@@ -1035,6 +1271,10 @@ export function AppShell() {
         // The sidebar will notify us when it adopts this cwd. Avoid remounting
         // the just-created empty chat during that initial synchronization.
         suppressCwdRef.current = data.cwd;
+        setNewSessionCwd(data.cwd);
+        setNewSessionHostId(remoteHostId(initialNavigation.hostId));
+        setActiveCwd(data.cwd);
+        setActiveHostId(remoteHostId(initialNavigation.hostId));
         setInitialCwdStatus("ready");
       })
       .catch((error: unknown) => {
@@ -1046,10 +1286,30 @@ export function AppShell() {
     return () => controller.abort();
   }, [initialNavigation]);
 
-  const handleCwdChange = useCallback((cwd: string | null, projectRoot?: string | null) => {
-    setActiveCwd(cwd);
-    // Skip if cwd is null (initial mount) or during the initial URL restore.
+  const handleCwdChange = useCallback((cwd: string | null, projectRoot: string | null, hostId: string, project?: ManagedProject) => {
+    setActivePoolProject(project?.poolId ? project : null);
+    setActiveCwd(project?.poolId ? null : cwd);
+    setActiveHostId(project?.poolId ? undefined : remoteHostId(hostId));
+    if (project?.poolId) {
+      if (selectedSession?.poolId === project.poolId && selectedSession.projectId === project.projectId) return;
+      if (newSessionPoolProject?.poolId === project.poolId && newSessionPoolProject.projectId === project.projectId) return;
+      setNewSessionPoolProject(project);
+      setNewSessionCreation({ id: randomUUID() });
+      setNewSessionCwd(null);
+      setNewSessionHostId(undefined);
+      setSelectedSession(null);
+      setSessionKey((key) => key + 1);
+      setBranchTree([]);
+      setBranchActiveLeafId(null);
+      setSystemPrompt(null);
+      setSystemPromptLoading(false);
+      setActiveTopPanel(null);
+      router.replace(buildUrl("/"));
+      return;
+    }
+    // A standalone path is never a fallback for a pending pool placement.
     if (!cwd) return;
+    setNewSessionPoolProject(null);
     // Skip only when the notification matches the cwd we're suppressing for.
     if (suppressCwdRef.current !== null && suppressCwdRef.current === cwd) {
       suppressCwdRef.current = null;
@@ -1063,7 +1323,7 @@ export function AppShell() {
     // sidebar's resolved project root.
     const newProject = projectRoot ?? cwd;
     const sessionProject = selectedSession ? (selectedSession.projectRoot ?? selectedSession.cwd) : null;
-    if (sessionProject && comparableProjectPath(sessionProject) === comparableProjectPath(newProject)) {
+    if (sessionProject && remoteHostId(selectedSession?.hostId) === remoteHostId(hostId) && comparableProjectPath(sessionProject) === comparableProjectPath(newProject)) {
       return;
     }
     // Close any session that belongs to a different project — it no longer
@@ -1073,14 +1333,16 @@ export function AppShell() {
       if (prev && prev !== cwd) return null;
       return prev;
     });
+    setNewSessionHostId(remoteHostId(hostId));
+    setNewSessionCreation({ id: randomUUID() });
     setSessionKey((k) => k + 1);
     setBranchTree([]);
     setBranchActiveLeafId(null);
     setSystemPrompt(null);
     setSystemPromptLoading(false);
     setActiveTopPanel(null);
-    router.replace("/", { scroll: false });
-  }, [router, selectedSession]);
+    router.replace(buildUrl("/"));
+  }, [router, selectedSession, newSessionPoolProject, buildUrl]);
 
   const handleSelectSession = useCallback((session: SessionInfo, isRestore = false) => {
     // Re-picking the already-open session (sidebar double-click, palette
@@ -1093,8 +1355,9 @@ export function AppShell() {
       setSidebarOpen(false);
       requestAnimationFrame(() => chatInputRef.current?.focus());
     }
-    if (!isRestore && session.id === selectedSession?.id) return;
+    if (!isRestore && selectedSession && sameSessionTarget(session, selectedSession)) return;
     setNewSessionCwd(null);
+    setNewSessionPoolProject(null);
     setSelectedSession(session);
     setSessionKey((k) => k + 1);
     setSystemPrompt(null);
@@ -1108,17 +1371,20 @@ export function AppShell() {
       // genuine project switch.
       suppressCwdRef.current = session.cwd;
     }
-    // Skip router.replace when restoring from URL — the param is already correct
-    // and calling replace in production Next.js triggers a Suspense remount loop
+    // Skip router.replace when restoring from the URL: the param is already correct.
     if (!isRestore) {
-      router.replace(`?session=${encodeURIComponent(session.id)}`, { scroll: false });
+      router.replace(buildUrl(sessionNavigationUrl(session)));
     }
-  }, [router, isMobile, selectedSession?.id]);
+  }, [router, isMobile, selectedSession, buildUrl]);
 
-  const handleNewSession = useCallback((_sessionId: string, cwd: string) => {
+  const handleNewSession = useCallback((creationId: string, cwd: string | null, hostId?: string, project?: ManagedProject, initialization?: string) => {
     setSettingsTab(null);
     setSelectedSession(null);
-    setNewSessionCwd(cwd);
+    const target = project ?? (cwd === activeCwd ? activePoolProject : null);
+    setNewSessionCreation({ id: creationId || randomUUID(), initialization });
+    setNewSessionPoolProject(target?.poolId ? target : null);
+    setNewSessionCwd(target?.poolId ? null : cwd);
+    setNewSessionHostId(target?.poolId ? undefined : remoteHostId(hostId));
     setSessionKey((k) => k + 1);
     setBranchTree([]);
     setBranchActiveLeafId(null);
@@ -1129,14 +1395,113 @@ export function AppShell() {
       setSidebarOpen(false);
       requestAnimationFrame(() => chatInputRef.current?.focus());
     }
-    router.replace("/", { scroll: false });
-  }, [router, isMobile]);
+    router.replace(buildUrl("/"));
+  }, [router, isMobile, activeCwd, activePoolProject, buildUrl]);
+
+  // ---- In-app Navigate back / forward over visited chat views ----
+  // Own stack, not the browser History API (that one belongs to the mobile
+  // back-gesture/exit-guard machinery — see lib/navigation-history.ts).
+  const navigationHistory = useNavigationHistory();
+  const {
+    record: recordNavigationView,
+    peekBack: peekNavigationBack,
+    peekForward: peekNavigationForward,
+  } = navigationHistory;
+  // Bumped by the recording effect on every view change. navigateInHistory
+  // captures it across its await and bails if the user moved on meanwhile,
+  // so a slow session-list fetch can never yank the chat out from under a
+  // view the user just switched to.
+  const navViewVersionRef = useRef(0);
+  const navSessionId = selectedSession?.id ?? null;
+  const navSessionCwd = selectedSession?.cwd ?? null;
+  const navHostId = navSessionId ? remoteHostId(selectedSession?.hostId) : newSessionHostId;
+  useEffect(() => {
+    navViewVersionRef.current += 1;
+    recordNavigationView({
+      sessionId: navSessionId,
+      cwd: navSessionId ? navSessionCwd : newSessionCwd,
+      ...(navHostId ? { hostId: navHostId } : {}),
+      ...(!navSessionId && newSessionPoolProject ? { poolId: newSessionPoolProject.poolId, projectId: newSessionPoolProject.projectId } : {}),
+      ...(!navSessionId ? { creationId: newSessionCreationId } : {}),
+      ...(!navSessionId && newSessionPoolProject && newSessionCreation.initialization ? { initialization: newSessionCreation.initialization } : {}),
+    });
+  }, [navSessionId, navSessionCwd, navHostId, newSessionCwd, newSessionPoolProject, newSessionCreation, newSessionCreationId, recordNavigationView]);
+
+  // Resolves a history entry's session id against the live list. `null`
+  // means the id is gone (entry should be dropped); "unavailable" means the
+  // list itself could not be fetched (keep the entry, abort this navigation).
+  const fetchSessionForNavigation = useCallback(async (sessionId: string, hostId?: string): Promise<SessionInfo | null | "unavailable"> => {
+    try {
+      const res = await fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`);
+      if (!res.ok) return "unavailable";
+      const data = (await res.json()) as { sessions?: SessionInfo[] };
+      return data.sessions?.find((session) => sameSessionTarget(session, { id: sessionId, hostId })) ?? null;
+    } catch {
+      return "unavailable";
+    }
+  }, []);
+
+  const navigateInHistory = useCallback(async (direction: -1 | 1): Promise<void> => {
+    // Dead entries (deleted sessions) are skipped, like browser history
+    // skipping a dead slot; bound the loop by the stack's own cap.
+    for (let attempt = 0; attempt <= NAVIGATION_HISTORY_MAX_ENTRIES; attempt++) {
+      const entry = direction === -1 ? peekNavigationBack() : peekNavigationForward();
+      // Nothing that way: stay put. An exhausted stack never falls through to
+      // the browser's own back/forward — the keystroke is swallowed by the
+      // keyboard layer, so the app can never be backed out of by accident.
+      if (!entry) return;
+      if (entry.sessionId === null) {
+        if (direction === -1) navigationHistory.commitBack();
+        else navigationHistory.commitForward();
+        const project = entry.poolId ? workspaceOptions.projects.find((candidate) => candidate.poolId === entry.poolId && candidate.projectId === entry.projectId) : undefined;
+        if (entry.poolId && !project) { toast.error(translate("errors.generic")); return; }
+        handleNewSession(entry.creationId ?? randomUUID(), entry.cwd, entry.hostId, project, entry.initialization);
+        return;
+      }
+      const versionAtPress = navViewVersionRef.current;
+      const session = await fetchSessionForNavigation(entry.sessionId, entry.hostId);
+      if (navViewVersionRef.current !== versionAtPress) return; // user moved on: do nothing
+      if (session === "unavailable") return; // list fetch failed: keep the entry, try again next press
+      if (session) {
+        if (direction === -1) navigationHistory.commitBack();
+        else navigationHistory.commitForward();
+        handleSelectSession(session, false);
+        return;
+      }
+      if (direction === -1) navigationHistory.dropPeekedBack();
+      else navigationHistory.dropPeekedForward();
+    }
+  }, [navigationHistory, peekNavigationBack, peekNavigationForward, fetchSessionForNavigation, handleNewSession, handleSelectSession, workspaceOptions.projects]);
+
+  // Shared by the sidebar buttons and the global shortcuts. The keyboard
+  // layer always swallows the keystroke, so both directions stop dead at the
+  // ends of the stack instead of continuing into browser history.
+  const handleNavigateBack = useCallback(() => {
+    void navigateInHistory(-1);
+  }, [navigateInHistory]);
+  const handleNavigateForward = useCallback(() => {
+    void navigateInHistory(1);
+  }, [navigateInHistory]);
+
+  // Tooltip shortcut labels follow the platform (⌘[ vs Alt+←). Computed from
+  // navigator after mount state to keep SSR markup stable.
+  const [navIsMac] = useState(() => isMacPlatform());
+  const sidebarNavigation = useMemo(() => ({
+    canBack: navigationHistory.canBack,
+    canForward: navigationHistory.canForward,
+    onBack: handleNavigateBack,
+    onForward: handleNavigateForward,
+    backShortcut: navigateShortcutHint(-1, navIsMac),
+    forwardShortcut: navigateShortcutHint(1, navIsMac),
+  }), [navigationHistory.canBack, navigationHistory.canForward, handleNavigateBack, handleNavigateForward, navIsMac]);
 
 
   // Global keyboard shortcuts (handles Esc, Ctrl+Alt+N etc.)
   useGlobalKeyboardShortcuts({
-    onNewSession: (cwd: string) => handleNewSession(`kb-${Date.now()}`, cwd),
-    activeCwd,
+    onNewSession: (cwd: string) => handleNewSession(randomUUID(), activePoolProject ? null : cwd, activeHostId, activePoolProject ?? undefined),
+    onNavigateBack: handleNavigateBack,
+    onNavigateForward: handleNavigateForward,
+    activeCwd: activePoolProject ? projectIdentity(activePoolProject) : activeCwd,
     scopeNativeSelectAll,
   });
 
@@ -1144,13 +1509,14 @@ export function AppShell() {
   // server-computed projectRoot, which the same-project check in
   // handleCwdChange relies on. Hydrate it from the session list so switching
   // worktrees right after creating a session doesn't close the chat.
-  const hydrateSelectedSession = useCallback((sessionId: string) => {
+  const hydrateSelectedSession = useCallback((sessionId: string, hostId?: string) => {
+    const target = { id: sessionId, hostId };
     void fetch("/api/sessions")
       .then((r) => (r.ok ? (r.json() as Promise<{ sessions: SessionInfo[] }>) : null))
       .then((d) => {
-        const full = d?.sessions.find((s) => s.id === sessionId);
+        const full = findSessionTarget(d?.sessions ?? [], target);
         if (!full) return;
-        setSelectedSession((prev) => (prev && prev.id === sessionId && !prev.projectRoot ? full : prev));
+        setSelectedSession((prev) => (prev && sameSessionTarget(prev, target) && (!prev.projectRoot || prev.path === "") ? full : prev));
       })
       .catch(() => {});
   }, []);
@@ -1158,41 +1524,63 @@ export function AppShell() {
   // Called by ChatWindow when a new session gets its real id from pi
   const handleSessionCreated = useCallback((session: SessionInfo) => {
     setNewSessionCwd(null);
+    setNewSessionPoolProject(null);
     setSelectedSession(session);
     setRefreshKey((k) => k + 1);
-    hydrateSelectedSession(session.id);
-    router.replace(`?session=${encodeURIComponent(session.id)}`, { scroll: false });
-  }, [router, hydrateSelectedSession]);
+    hydrateSelectedSession(session.id, session.hostId);
+    router.replace(buildUrl(sessionNavigationUrl(session)));
+  }, [router, hydrateSelectedSession, buildUrl]);
+
+  const handleSessionMoved = useCallback((oldId: string, newId: string) => {
+    if (activeSessionIdRef.current !== oldId) return;
+    const hostId = activeSelectedSessionHostId;
+    activeSessionIdRef.current = newId;
+    activeSessionTargetRef.current = { id: newId, hostId };
+    setSelectedSession((current) => current && sameSessionTarget(current, { id: oldId, hostId }) ? { ...current, id: newId, path: "" } : current);
+    setRefreshKey((key) => key + 1);
+    hydrateSelectedSession(newId, hostId);
+    // This is the same conversation. Preserve ChatWindow's run/edit fences
+    // and its mounted composer, including unfinished attachments and audio.
+    router.replace(buildUrl(sessionNavigationUrl({ id: newId, hostId })));
+  }, [router, hydrateSelectedSession, activeSelectedSessionHostId, buildUrl]);
 
   const handleAgentEnd = useCallback(() => {
     setRefreshKey((k) => k + 1);
     setExplorerRefreshKey((k) => k + 1);
-    if (document.visibilityState !== "hidden" || !("Notification" in window)) return;
+  }, []);
 
-    const targetSession = selectedSession;
-    const notify = () => {
-      showCompletionNotification(
-        targetSession?.name ?? translate("appShell.sessionComplete"),
-        translate("appShell.taskFinished"),
-        () => {
-          window.focus();
-          if (targetSession) handleSelectSession(targetSession);
-        },
-      );
-    };
-    if (Notification.permission === "granted") notify();
-    else if (Notification.permission === "default") {
-      void Notification.requestPermission().then((permission) => { if (permission === "granted") notify(); });
-    } else {
-      // "denied": the OS blocks notifications, so surface the completion as an
-      // in-app toast instead of leaving background completions silent.
-      toast.info(targetSession?.name ?? translate("appShell.sessionComplete"), translate("appShell.taskFinished"));
-    }
-  }, [handleSelectSession, selectedSession]);
+  // Session links and notification clicks name a session id; links may also
+  // carry its host so copied IDs on different machines stay distinct.
+  const openSessionById = useCallback((sessionId: string, hostId?: string) => {
+    window.focus();
+    // On narrow screens the file panel covers the chat it is about to show.
+    if (isCompactOverlay) setRightPanelOpen(false);
+    // A full load (not router navigation) so an expired sign-in reaches proxy.ts and the login page.
+    const query = `/?session=${encodeURIComponent(sessionId)}${hostId ? `&host=${encodeURIComponent(hostId)}` : ""}`;
+    const sessionUrl = new URL(query, window.location.origin).href;
+    void fetch("/api/sessions")
+      .then((r) => {
+        if (!r.ok) {
+          window.location.assign(sessionUrl);
+          return;
+        }
+        return (r.json() as Promise<{ sessions: SessionInfo[] }>).then((d) => {
+          const session = d.sessions.find((candidate) => candidate.id === sessionId
+            && (!hostId || (candidate.hostId ?? "local") === hostId));
+          if (session) handleSelectSession(session);
+          else toast.error(translate("notifications.sessionNotFound"));
+        });
+      })
+      .catch(() => window.location.assign(sessionUrl));
+  }, [handleSelectSession, isCompactOverlay]);
+
+  // Full-page Settings hides the chat, so its session counts as not viewed.
+  useNotifications({ sessionId: settingsTab ? null : selectedSession?.id ?? null, locale, onOpenSession: openSessionById });
 
   const handleAutoName = useCallback(async () => {
-    const sessionId = selectedSession?.id;
-    if (!sessionId || autoNameStatus.kind === "naming") return;
+    if (!activeSelectedSessionId || autoNameStatus.kind === "naming") return;
+    const sessionId = activeSelectedSessionId;
+    const sessionTarget = { id: sessionId, hostId: activeSelectedSessionHostId };
     clearTimeout(autoNameTimerRef.current);
     setActiveTopPanel(null);
     setAutoNameStatus({ kind: "naming" });
@@ -1207,24 +1595,24 @@ export function AppShell() {
       }
 
       const title = body.title.trim();
-      if (activeSessionIdRef.current !== sessionId) return;
+      if (!activeSessionTargetRef.current || !sameSessionTarget(activeSessionTargetRef.current, sessionTarget)) return;
       setRefreshKey((key) => key + 1);
-      setSelectedSession((current) => current?.id === sessionId ? { ...current, name: title } : current);
+      setSelectedSession((current) => current && sameSessionTarget(current, sessionTarget) ? { ...current, name: title } : current);
       setSessionStats((current) => current?.sessionId === sessionId ? { ...current, sessionName: title } : current);
       setAutoNameStatus({ kind: "success" });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 1800);
     } catch (error) {
-      if (activeSessionIdRef.current !== sessionId) return;
+      if (!activeSessionTargetRef.current || !sameSessionTarget(activeSessionTargetRef.current, sessionTarget)) return;
       const message = error instanceof Error ? error.message : String(error);
       setAutoNameStatus({ kind: "error", message });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 5000);
     }
-  }, [autoNameStatus.kind, selectedSession?.id]);
+  }, [autoNameStatus.kind, activeSelectedSessionId, activeSelectedSessionHostId]);
 
   useEffect(() => {
     clearTimeout(autoNameTimerRef.current);
     setAutoNameStatus({ kind: "idle" });
-  }, [selectedSession?.id]);
+  }, [activeSelectedSessionId, activeSelectedSessionHostId]);
 
   const handleExplorerRefresh = useCallback(() => {
     setExplorerRefreshing(true);
@@ -1236,9 +1624,11 @@ export function AppShell() {
   }, []);
 
   const handleSessionForked = useCallback((newSessionId: string) => {
+    const hostId = activeSelectedSessionHostId;
     setRefreshKey((k) => k + 1);
     setSessionKey((k) => k + 1);
     setNewSessionCwd(null);
+    setNewSessionPoolProject(null);
     setSelectedSession((prev) => ({
       ...(prev ?? { path: "", cwd: "", created: "", modified: "", messageCount: 0, firstMessage: "" }),
       id: newSessionId,
@@ -1246,9 +1636,9 @@ export function AppShell() {
       // fork shows up immediately instead of waiting for a refresh.
       path: "",
     }));
-    hydrateSelectedSession(newSessionId);
-    router.replace(`?session=${encodeURIComponent(newSessionId)}`, { scroll: false });
-  }, [router, hydrateSelectedSession]);
+    hydrateSelectedSession(newSessionId, hostId);
+    router.replace(buildUrl(sessionNavigationUrl({ id: newSessionId, hostId })));
+  }, [router, hydrateSelectedSession, activeSelectedSessionHostId, buildUrl]);
 
   const handleSessionDeleted = useCallback((sessionId: string) => {
     // The composer for this session can never be reopened, so its draft would
@@ -1258,18 +1648,38 @@ export function AppShell() {
     if (selectedSession?.id === sessionId) {
       const cwd = selectedSession.cwd;
       setSelectedSession(null);
-      setNewSessionCwd(cwd ?? null);
+      setNewSessionCwd(selectedSession.poolId ? null : cwd ?? null);
+      setNewSessionCreation({ id: randomUUID() });
+      setNewSessionPoolProject(selectedSession.poolId ? workspaceOptions.projects.find((project) => project.poolId === selectedSession.poolId && project.projectId === selectedSession.projectId) ?? null : null);
+      setNewSessionHostId(remoteHostId(selectedSession.hostId));
       setSessionKey((k) => k + 1);
       setBranchTree([]);
       setBranchActiveLeafId(null);
       setSystemPrompt(null);
       setActiveTopPanel(null);
-      router.replace("/", { scroll: false });
+      router.replace(buildUrl("/"));
     }
-  }, [selectedSession, router]);
+  }, [selectedSession, router, workspaceOptions.projects, buildUrl]);
   const handleInitialRestoreDone = useCallback(() => {
     setInitialSessionRestored(true);
   }, []);
+  // Mirrors a panel toggle into the URL so a reload restores the same
+  // layout. Read through a ref rather than a dependency: the goal is to
+  // skip only while the ?session= restore above is still in flight (same
+  // Suspense remount risk as a redundant router.replace there), not to
+  // re-fire this effect the moment that restore finishes.
+  const initialSessionRestoredRef = useRef(initialSessionRestored);
+  initialSessionRestoredRef.current = initialSessionRestored;
+  const panelUrlMountedRef = useRef(false);
+  useEffect(() => {
+    if (!panelUrlMountedRef.current) {
+      panelUrlMountedRef.current = true;
+      return;
+    }
+    if (!initialSessionRestoredRef.current) return;
+    router.replace(buildUrl(selectedSession ? sessionNavigationUrl(selectedSession) : "/"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only sidebarOpen/rightPanelOpen should retrigger the replace; selectedSession/buildUrl/router are read at fire time via closure.
+  }, [sidebarOpen, rightPanelOpen]);
 
   const handleArchiveRestored = useCallback(async (sessionId: string) => {
     setArchiveBrowserOpen(false);
@@ -1301,12 +1711,12 @@ export function AppShell() {
       if (attemptsLeft > 0) {
         archiveRetryTimerRef.current = setTimeout(() => void selectRestoredSession(attemptsLeft - 1), 300);
       } else if (activeSessionIdRef.current === sessionAtRestoreStart) {
-        router.replace(`?session=${encodeURIComponent(sessionId)}`, { scroll: false });
+        router.replace(buildUrl(`?session=${encodeURIComponent(sessionId)}`));
       }
     };
 
     void selectRestoredSession();
-  }, [handleSelectSession, router]);
+  }, [handleSelectSession, router, buildUrl]);
 
   const handleCloseFileTab = useCallback((tabId: string) => {
     // Compute everything from the current list outside the updaters: no side
@@ -1324,14 +1734,14 @@ export function AppShell() {
     });
   }, [fileTabs]);
 
-  const handleOpenFile = useCallback((filePath: string, fileName: string, sourceSessionId?: string | null) => {
-    const tabId = `file:${filePath}`;
-    setFileTabs((prev) => {
-      const existing = prev.find((t) => t.id === tabId);
-      if (!existing) return [...prev, { id: tabId, label: fileName, filePath, sourceSessionId }];
-      if (!sourceSessionId || existing.sourceSessionId === sourceSessionId) return prev;
-      return prev.map((t) => t.id === tabId ? { ...t, sourceSessionId } : t);
-    });
+  const handleOpenFile = useCallback((filePath: string, fileName: string, source: WorkspaceFileSource) => {
+    const absolute = filePath.startsWith("/") || filePath.startsWith("~/") || filePath.startsWith("\\\\") || /^[a-zA-Z]:[\\/]/.test(filePath);
+    const rooted = !absolute && source.cwd ? joinFilePath(source.cwd, filePath) : filePath;
+    const target = filePath.startsWith("~/") ? filePath : normalizeLocalPath(rooted);
+    const tabId = `file:${source.sessionId ?? hostProjectKey(source.hostId, source.cwd ?? "")}:${target}`;
+    setFileTabs((prev) => prev.some((tab) => tab.id === tabId)
+      ? prev
+      : [...prev, { id: tabId, label: fileName, filePath: target, hostId: source.hostId, sourceCwd: source.cwd, sourceSessionId: source.sessionId }]);
     setActiveFileTabId(tabId);
     setRightView("file");
     setRightPanelOpen(true);
@@ -1339,34 +1749,142 @@ export function AppShell() {
     if (isMobile) setSidebarOpen(false);
   }, [isMobile]);
 
+  // Agent open requests that wait for the user. URLs always ask unless the
+  // user opted into opening links from the viewed session automatically; URLs
+  // and files from a session this tab is not viewing always ask, so they cannot
+  // take over the current view. The click is also the user gesture that lets
+  // the new tab through pop-up blockers.
+  const [pendingOpens, setPendingOpens] = useState<Array<{
+    target: string; name: string; sessionId: string; crossSession: boolean;
+  } & ({ kind: "url" } | { kind: "file"; source: WorkspaceFileSource })>>([]);
+  const pendingOpen = pendingOpens[0] ?? null;
+  // Keep the last request on screen while the dialog animates closed.
+  const shownOpenRef = useRef(pendingOpen);
+  if (pendingOpen) shownOpenRef.current = pendingOpen;
+  const shownOpen = pendingOpen ?? shownOpenRef.current;
+  const dismissPendingOpen = useCallback(() => setPendingOpens((queue) => queue.slice(1)), []);
+  const requestOpenUrl = useCallback((url: string, sessionId: string, crossSession: boolean): string => {
+    if (!crossSession && openUrlAutomatically) {
+      window.open(url, "_blank", "noopener,noreferrer")?.focus?.();
+      return `Opened ${url}`;
+    }
+    setPendingOpens((queue) => [...queue, { kind: "url", target: url, name: url, sessionId, crossSession }]);
+    return crossSession
+      ? `Asked the user to confirm opening ${url}; they are viewing another omp-web session.`
+      : `Asked the user to confirm opening ${url}.`;
+  }, [openUrlAutomatically]);
+  const handleSessionOpenUrl = useCallback((url: string) => requestOpenUrl(url, selectedSession?.id ?? "", false), [requestOpenUrl, selectedSession?.id]);
+  const pendingCrossHostToolsRef = useRef(new Map<string, AbortController>());
+  // Drives the open session's tab-favicon "waiting" dot: an open_url (OAuth/login
+  // included) confirmation is pending for the session shown in this tab.
+  const pendingOpenUrlForSession = useMemo(
+    () => pendingOpens.some((open) => open.kind === "url" && open.sessionId === selectedSession?.id),
+    [pendingOpens, selectedSession?.id],
+  );
+  const handleCrossSessionHostTool = useCallback(async (call: CrossSessionHostToolCall) => {
+    const key = JSON.stringify([call.sessionId, call.id]);
+    if (pendingCrossHostToolsRef.current.has(key)) return;
+    const controller = new AbortController();
+    pendingCrossHostToolsRef.current.set(key, controller);
+    // Full-page Settings hides the chat, so its session counts as not viewed.
+    const viewing = () => call.sessionId === activeSessionIdRef.current && !activeSettingsTabRef.current;
+
+    try {
+      const { text, isError } = await runHostTool(call.toolName, call.arguments, {
+        openUrl: (url) => requestOpenUrl(url, call.sessionId, !viewing()),
+        openFile: (path, name, owner) => {
+          const source = owner ? { ...call, sessionId: owner } : call;
+          if (viewing()) return handleOpenFile(path, name, source);
+          setPendingOpens((queue) => [...queue, { kind: "file", target: path, name, sessionId: call.sessionId, source, crossSession: true }]);
+          return `Asked the user to confirm opening ${path}; they are viewing another omp-web session.`;
+        },
+      }, call.sessionId, controller.signal);
+      if (controller.signal.aborted) return;
+      await sendAgentCommand(call.sessionId, {
+        type: "host_tool_result",
+        id: call.id,
+        isError,
+        result: { content: [{ type: "text", text }] },
+      });
+    } catch (e) {
+      console.error("Failed to send host tool result:", e);
+    } finally {
+      pendingCrossHostToolsRef.current.delete(key);
+    }
+  }, [handleOpenFile, requestOpenUrl]);
+  const crossSessionHostToolRef = useRef(handleCrossSessionHostTool);
+  useEffect(() => { crossSessionHostToolRef.current = handleCrossSessionHostTool; }, [handleCrossSessionHostTool]);
+  useEffect(() => {
+    // Mounted with the shell (not the sidebar) so it keeps listening on the
+    // full-page Settings view too.
+    const pending = pendingCrossHostToolsRef.current;
+    const source = openEventStream({ kind: "host-tools" });
+    source.onmessage = (e) => {
+      try {
+        const call = JSON.parse(e.data);
+        if (call.type === "host_tool_cancel" && typeof call.sessionId === "string" && typeof call.targetId === "string") {
+          pending.get(JSON.stringify([call.sessionId, call.targetId]))?.abort();
+        } else if (call.type === "host_tool_call" && call.sessionId && call.id && call.toolName
+          && typeof call.hostId === "string" && typeof call.cwd === "string") {
+          void crossSessionHostToolRef.current(call);
+        }
+      } catch {
+        // ignore malformed frames
+      }
+    };
+    // A drop loses the server-side subscription, and with it the calls routed to this tab (rejectCrossSessionHostTools).
+    source.onerror = () => { for (const controller of pending.values()) controller.abort(); };
+    return () => {
+      for (const controller of pending.values()) controller.abort();
+      source.close();
+    };
+  }, []);
+
   const activeFileTab = fileTabs.find((tab) => tab.id === activeFileTabId) ?? null;
-  // Explorer tab browses the active workspace: live cwd first, then the
-  // selected / new-session cwd (mirrors what the sidebar used to pass down).
-  const explorerCwd = activeCwd ?? selectedSession?.cwd ?? newSessionCwd ?? null;
-  const handleOpenLinkedFile = useCallback((filePath: string) => {
-    handleOpenFile(filePath, getFileName(filePath), selectedSession?.id ?? null);
-  }, [handleOpenFile, selectedSession?.id]);
+  // Explorer, Git, and the file viewers follow the open session's folder, then
+  // the sidebar's live cwd, then the new-session cwd. Relative paths (mention,
+  // copy path) resolve against the same folder so they match the Explorer.
+  // A session whose worktree was removed (its repo's worktree list no longer
+  // contains its folder) falls back to the sidebar's cwd, the repo root.
+  const sessionCwd = selectedSession?.cwd ?? null;
+  const sessionWorktreeRemoved = sessionCwd !== null && worktreeCtx !== null && (selectedSession?.hostId ?? LOCAL_HOST_ID) === worktreeCtx.hostId
+    && comparableProjectPath(selectedSession?.projectRoot ?? sessionCwd) === comparableProjectPath(worktreeCtx.projectRoot)
+    && !worktreeCtx.worktrees.some((wt) => {
+      const root = comparableProjectPath(wt.path);
+      const cwd = comparableProjectPath(sessionCwd);
+      return cwd === root || cwd.startsWith(`${root}/`);
+    });
+  // Host of what the user is looking at: the open session's, else the new
+  // chat's, else the sidebar's selection. Undefined is this machine.
+  const currentHostId = selectedSession ? remoteHostId(selectedSession.hostId) : newSessionCwd !== null ? newSessionHostId : activeHostId;
+  const remoteHost = currentHostId !== undefined;
+  const workspaceHostId = currentHostId ?? LOCAL_HOST_ID;
+  const sidebarCwd = (activeHostId ?? LOCAL_HOST_ID) === workspaceHostId ? activeCwd : null;
+  const explorerCwd = selectedSession
+    ? (sessionWorktreeRemoved ? sidebarCwd : sessionCwd)
+    : newSessionPoolProject || activePoolProject ? null : newSessionCwd ?? sidebarCwd;
 
   // File-panel integrations: every action works on the active tab so the right
   // panel behaves like an editor toolbar, not just a tab strip.
   const handleMentionActiveFile = useCallback(() => {
-    if (!activeFileTab) return;
-    handleAtMention(getRelativeFilePath(activeFileTab.filePath, activeCwd ?? undefined), false);
-  }, [activeFileTab, activeCwd, handleAtMention]);
+    if (!activeFileTab || activeFileTab.sourceSessionId !== (selectedSession?.id ?? null)) return;
+    if (activeFileTab.hostId !== workspaceHostId) { toast.info(t("hosts.fileOtherHost")); return; }
+    handleAtMention(getRelativeFilePath(activeFileTab.filePath, activeFileTab.sourceCwd ?? undefined), false);
+  }, [activeFileTab, selectedSession?.id, handleAtMention, workspaceHostId, t]);
 
   const handleCopyActiveFilePath = useCallback(() => {
     if (!activeFileTab) return;
-    const relative = getRelativeFilePath(activeFileTab.filePath, activeCwd ?? undefined);
+    const relative = getRelativeFilePath(activeFileTab.filePath, activeFileTab.sourceCwd ?? undefined);
     copyText(relative).then(
       () => toast.success(t("appShell.copied")),
       () => toast.error(t("appShell.commandCopyFailed")),
     );
-  }, [activeFileTab, activeCwd, t]);
+  }, [activeFileTab, t]);
 
   const handleDownloadActiveFile = useCallback(() => {
     if (!activeFileTab) return;
     const link = document.createElement("a");
-    link.href = `/api/files/${encodeFilePathForApi(activeFileTab.filePath)}?type=download`;
+    link.href = getFileApiUrl(activeFileTab.filePath, "download", activeFileTab.hostId, activeFileTab.sourceSessionId);
     link.download = activeFileTab.label;
     document.body.appendChild(link);
     link.click();
@@ -1374,10 +1892,15 @@ export function AppShell() {
   }, [activeFileTab]);
   const handleRevealActiveFile = useCallback(() => {
     if (!activeFileTab) return;
-    setRevealPath(activeFileTab.filePath);
+    if (activeFileTab.sourceSessionId !== (selectedSession?.id ?? null)) {
+      toast.info(t("appShell.revealSourceSession"));
+      return;
+    }
+    if (activeFileTab.hostId !== workspaceHostId) { toast.info(t("hosts.fileOtherHost")); return; }
+    setRevealTarget({ path: activeFileTab.filePath, hostId: activeFileTab.hostId });
     setRightView("explorer");
     setRightPanelOpen(true);
-  }, [activeFileTab]);
+  }, [activeFileTab, selectedSession?.id, workspaceHostId, t]);
 
   const handleSelectFileTab = useCallback((tabId: string) => {
     setActiveFileTabId(tabId);
@@ -1390,8 +1913,8 @@ export function AppShell() {
   }, []);
 
   const handleRevealDone = useCallback(() => {
-    setRevealPath(null);
-  }, []);
+    setRevealTarget((current) => current === revealTarget ? null : current);
+  }, [revealTarget]);
 
   const handleToggleFileSearch = useCallback(() => {
     setFileSearchOpen((open) => !open);
@@ -1418,9 +1941,25 @@ export function AppShell() {
   }, [selectedSession]);
 
   // Show chat area if a session is selected, or if we have a cwd to start a new session in
-  const effectiveNewSessionCwd = newSessionCwd ?? (selectedSession === null && activeCwd ? activeCwd : null);
-  const newSessionProject = (workspaceOptions.cwd === effectiveNewSessionCwd ? workspaceOptions.selectedProject : null) ?? effectiveNewSessionCwd ?? "";
-  const showChat = selectedSession !== null || effectiveNewSessionCwd !== null;
+  const effectivePoolProject = selectedSession ? null : newSessionPoolProject ?? activePoolProject;
+  const effectiveNewSessionCwd = effectivePoolProject ? null : newSessionCwd ?? (selectedSession === null && activeCwd ? activeCwd : null);
+  const newSessionHost = effectivePoolProject ? undefined : newSessionCwd !== null ? newSessionHostId : activeHostId;
+  const newSessionHostKey = effectivePoolProject ? projectTargetId(effectivePoolProject) : newSessionHost ?? LOCAL_HOST_ID;
+  const newSessionProject = effectivePoolProject ? projectIdentity(effectivePoolProject) : (workspaceOptions.cwd === effectiveNewSessionCwd && workspaceOptions.hostId === newSessionHostKey ? workspaceOptions.selectedProject : null) ?? effectiveNewSessionCwd ?? "";
+  // The panel's target is the group the sidebar lists the project under: the cluster for a member's pinned project. The real host (above) is where the session runs.
+  const newSessionGroupKey = projectTargetId(effectivePoolProject ?? { hostId: newSessionHostKey }, pools);
+  // Pool projects first (stable), as in the sidebar's cluster group.
+  const hostProjects = workspaceOptions.projects.filter((project) => projectTargetId(project, pools) === newSessionGroupKey).sort((a, b) => Number(Boolean(b.poolId)) - Number(Boolean(a.poolId)));
+  // Two members' projects can share a path, so a non-pool option's value carries its host.
+  const newSessionWorkspaceValue = effectivePoolProject ? projectIdentity(effectivePoolProject) : effectiveNewSessionCwd ? hostProjectKey(newSessionHost, effectiveNewSessionCwd) : "";
+  const memberIds = new Set(pools.flatMap((pool) => pool.members.map((member) => member.hostId)));
+  const creationTargets = [...(hosts ?? []).filter((host) => !memberIds.has(host.id) && (poolsLoaded || host.id === LOCAL_HOST_ID)).map((host) => ({ id: host.id, label: hostName(t, host) })), ...pools.map((pool) => ({ id: `pool:${pool.id}`, label: pool.label }))];
+  const chatHost = remoteHost ? hosts?.find((host) => host.id === currentHostId) : undefined;
+  const settingsHostId = activeCwd ? activeHostId : currentHostId;
+  // What Settings act for, as settingsHostId picks it: the sidebar's project, else the open session, the new chat, the pool project.
+  const settingsTarget = activeCwd ? { hostId: activeHostId } : selectedSession ?? (newSessionCwd !== null ? { hostId: newSessionHostId } : effectivePoolProject);
+  const clusterSettings = isClusterTarget(settingsTarget, settingsHostId, pools);
+  const showChat = selectedSession !== null || effectiveNewSessionCwd !== null || effectivePoolProject !== null;
   const currentRate = generationSpeed?.current;
   const rate = currentRate ?? generationSpeed?.average;
   const speed = showChat ? formatGenerationSpeed(rate) : null;
@@ -1445,23 +1984,30 @@ export function AppShell() {
         !["absolute", "fixed"].includes(getComputedStyle(child).position));
       const contentStyle = getComputedStyle(content);
       const headerStyle = getComputedStyle(header);
-      const rightStyle = getComputedStyle(right);
       const controlsWidth = children.reduce((width, child) => {
         const style = getComputedStyle(child);
         return width + child.getBoundingClientRect().width
           + parseFloat(style.marginLeft) + parseFloat(style.marginRight);
       }, 0) + Math.max(0, children.length - 1) * parseFloat(contentStyle.columnGap);
-      const required = controlsWidth
+      const leftNeed = controlsWidth
         + (tools.firstElementChild?.getBoundingClientRect().width ?? 0)
         + parseFloat(getComputedStyle(tools).columnGap)
-        + parseFloat(headerStyle.paddingLeft) + parseFloat(headerStyle.paddingRight)
-        + parseFloat(headerStyle.columnGap)
-        + parseFloat(rightStyle.minWidth)
-        + parseFloat(rightStyle.paddingLeft) + parseFloat(rightStyle.paddingRight);
+        + parseFloat(headerStyle.paddingLeft);
+      const rightNeed = parseFloat(headerStyle.paddingRight) + right.offsetWidth;
+      const required = leftNeed + parseFloat(headerStyle.columnGap) + rightNeed;
       if (closed) details.open = false;
       content.style.display = display;
       content.style.visibility = visibility;
-      const compact = required > header.clientWidth;
+      // Title pill: same inset on both sides = widest real cluster (+8px gap), so it
+      // is truly centered and never under a control. Expand the tools only if the
+      // pill still keeps >= 200px (the container-query hide threshold) with them.
+      header.style.setProperty(
+        "--topbar-side",
+        `${Math.ceil(Math.max(tools.offsetLeft + tools.offsetWidth, header.clientWidth - right.offsetLeft)) + 8}px`,
+      );
+      const titleFits = header.querySelector(".shell-topbar-center") === null
+        || 2 * Math.max(leftNeed, rightNeed) + 216 <= header.clientWidth;
+      const compact = required > header.clientWidth || !titleFits;
       if (compact && details.dataset.compact !== "true" && hadControlsFocus) {
         restoreToolsFocusRef.current = true;
       }
@@ -1469,6 +2015,8 @@ export function AppShell() {
     };
     const observer = new ResizeObserver(update);
     observer.observe(header);
+    observer.observe(right);
+    observer.observe(tools);
     observer.observe(content);
     for (const child of content.children) observer.observe(child);
     document.fonts.addEventListener("loadingdone", update);
@@ -1477,7 +2025,7 @@ export function AppShell() {
       observer.disconnect();
       document.fonts.removeEventListener("loadingdone", update);
     };
-  }, [hasGenerationSpeed, isMobile, locale, rightPanelOpen, showChat]);
+  }, [isMobile, locale, settingsTab, showChat]);
   // While restoring initial session from URL, don't show the placeholder
   const showPlaceholder = initialSessionRestored && !showChat;
 
@@ -1486,6 +2034,8 @@ export function AppShell() {
     ready: mobileSidebarReady,
     sidebarOpen,
     setSidebarOpen,
+    panelOpen: rightPanelIsModal,
+    closePanel: closeRightPanel,
     url: searchParams.toString(),
   });
   useEffect(() => {
@@ -1495,18 +2045,23 @@ export function AppShell() {
   }, [sidebarHistory.exitNeedsNativeBack, t]);
 
   const activeCwdName = activeCwd ? getFileName(activeCwd) || activeCwd : null;
-  const windowTitle = activeCwdName ? `${activeCwdName} - omp web` : "omp web";
+  // The tab shows just the session title (else the workspace); the favicon identifies the app.
+  useDocumentTitle(selectedSession?.name || selectedSession?.firstMessage || activeCwdName || appName);
 
+  // The sidebar search drives the chat's find-in-page highlights.
+  const [chatSearchQuery, setChatSearchQuery] = useState("");
+  // One jump per click: dropped once the chat used it, so reopening that session later starts at the bottom.
+  const [searchMatchTarget, setSearchMatchTarget] = useState<SearchMatchTarget | null>(null);
+  const clearSearchMatchTarget = useCallback(() => setSearchMatchTarget(null), []);
+  // The sidebar reports only changes: a pending target belongs to the query it was picked under.
+  const handleSearchQueryChange = useCallback((query: string) => {
+    setChatSearchQuery(query);
+    setSearchMatchTarget(null);
+  }, []);
+  // A target still pending when another session opens must not jump when its own session reopens.
   useEffect(() => {
-    const syncWindowTitle = () => {
-      if (document.title !== windowTitle) document.title = windowTitle;
-    };
-
-    syncWindowTitle();
-    const observer = new MutationObserver(syncWindowTitle);
-    observer.observe(document.head, { childList: true, subtree: true, characterData: true });
-    return () => observer.disconnect();
-  }, [windowTitle]);
+    setSearchMatchTarget((target) => (target && target.sessionId !== selectedSession?.id ? null : target));
+  }, [selectedSession?.id]);
 
   const sidebarContent = (
     <SessionSidebar
@@ -1515,20 +2070,29 @@ export function AppShell() {
       onSelectSession={handleSelectSession}
       onNewSession={handleNewSession}
       initialSessionId={initialSessionId}
+      initialSessionHostId={initialNavigation.hostId}
       skipInitialProjectSelection={initialNavigation.requestedCwd !== null}
       onInitialRestoreDone={handleInitialRestoreDone}
       refreshKey={refreshKey}
       onSessionDeleted={handleSessionDeleted}
       selectedCwd={selectedSession?.cwd ?? newSessionCwd ?? null}
+      selectedHostId={selectedSession ? selectedSession.hostId ?? LOCAL_HOST_ID : newSessionHostId ?? LOCAL_HOST_ID}
+      selectedLogicalProjectKey={selectedSession?.poolId ? selectedSession.projectKey : effectivePoolProject ? projectIdentity(effectivePoolProject) : null}
       onCwdChange={handleCwdChange}
       onWorkspaceOptionsChange={handleWorkspaceOptionsChange}
+      onWorktreeContextChange={setWorktreeCtx}
       addProjectOpen={addProjectOpen}
-      setAddProjectOpen={setAddProjectOpen}
+      addProjectHostId={addProjectHostId}
+      setAddProjectOpen={openAddProject}
       usageVisible={providerUsageVisible}
       settingsOpen={Boolean(settingsTab)}
       onOpenSettings={() => setSettingsTab((prev) => prev ? null : "general")}
       onOpenArchive={() => setArchiveBrowserOpen(true)}
-      updateAvailable={Boolean(appUpdate?.updateAvailable) || ompUpdateAvailable}
+      navigation={sidebarNavigation}
+      updateAvailable={Boolean(appUpdate?.updateAvailable)}
+      onClose={isMobile ? handleSidebarToggle : undefined}
+      onSearchQueryChange={handleSearchQueryChange}
+      onOpenSearchMatch={setSearchMatchTarget}
     />
   );
 
@@ -1545,17 +2109,36 @@ export function AppShell() {
         danger
         onConfirm={sidebarHistory.leave}
       />
+      <ConfirmDialog
+        open={pendingOpen !== null}
+        onOpenChange={(open) => { if (!open) dismissPendingOpen(); }}
+        title={t(shownOpen?.kind === "file" ? "appShell.openFileTitle" : shownOpen?.crossSession ? "appShell.openUrlTitle" : "appShell.openUrlSameSessionTitle")}
+        description={t(shownOpen?.crossSession ? "appShell.openUrlDescription" : "appShell.openUrlSameSessionDescription", { url: shownOpen?.target ?? "" })}
+        confirmLabel={t("appShell.openUrlConfirm")}
+        cancelLabel={t("appShell.openUrlCancel")}
+        onConfirm={() => {
+          if (pendingOpen?.kind === "url") window.open(pendingOpen.target, "_blank", "noopener,noreferrer");
+          else if (pendingOpen) {
+            // The file panel is hidden behind full-page Settings.
+            setSettingsTab(null);
+            handleOpenFile(pendingOpen.target, pendingOpen.name, pendingOpen.source);
+          }
+          dismissPendingOpen();
+        }}
+      />
       <CommandPaletteMount
         onSelectSession={handleSelectSession}
         onNewSession={() => {
           // An empty cwd is truthy, so showChat would render the shell while
           // useAgentSession refuses to start — every send a silent no-op.
           // Fall back to the server's default cwd (~/omp-cwd-<date>) instead.
-          if (activeCwd) {
-            handleNewSession(`palette-${Date.now()}`, activeCwd);
+          if (activeCwd || activePoolProject) {
+            handleNewSession(randomUUID(), activeCwd, activeHostId, activePoolProject ?? undefined);
             return;
           }
-          void fetch("/api/default-cwd", { method: "POST" })
+          const targetHost = currentHostId ?? LOCAL_HOST_ID;
+          const sourceVersion = navViewVersionRef.current;
+          void fetch(`/api/default-cwd?${new URLSearchParams({ hostId: targetHost })}`, { method: "POST" })
             .then(async (response) => {
               if (!response.ok) throw new Error(`HTTP ${response.status}`);
               const data = (await response.json()) as { cwd?: string };
@@ -1564,7 +2147,7 @@ export function AppShell() {
             })
             .then((data) => {
               if (!data.cwd) throw new Error("Empty cwd returned");
-              handleNewSession(`palette-${Date.now()}`, data.cwd);
+              if (navViewVersionRef.current === sourceVersion) handleNewSession(randomUUID(), data.cwd, targetHost);
             })
             .catch(() => toast.error(translate("errors.generic")));
         }}
@@ -1619,13 +2202,8 @@ export function AppShell() {
         }
       }
       @media (max-width: 640px) {
-        .sidebar-overlay-backdrop.sidebar-mobile-pending {
-          opacity: 0 !important;
-          pointer-events: none !important;
-        }
         .sidebar-container.sidebar-mobile-pending.sidebar-open {
           transform: translateX(-100%);
-          box-shadow: none;
         }
       }
     `}
@@ -1635,21 +2213,6 @@ export function AppShell() {
       {/* Left sidebar: hidden on full-page Settings */}
       {!settingsTab && (
         <>
-      {/* Mobile overlay backdrop */}
-      <div
-        className={`sidebar-overlay-backdrop${mobileSidebarReady ? "" : " sidebar-mobile-pending"}`}
-        onClick={() => setSidebarOpen(false)}
-        style={{
-          position: "fixed",
-          inset: 0,
-          zIndex: 199,
-          background: "color-mix(in srgb, var(--text) 28%, transparent)",
-          opacity: sidebarOpen ? 1 : 0,
-          pointerEvents: sidebarOpen ? "auto" : "none",
-          transition: "opacity var(--dur-slow) var(--ease-out-warm)",
-        }}
-      />
-
       <nav
         id="workspace-sidebar"
         role={isMobile ? "dialog" : undefined}
@@ -1662,7 +2225,7 @@ export function AppShell() {
         inert={mobileSidebarReady && (!sidebarOpen || rightPanelIsModal) ? true : undefined}
         style={{
           background: "var(--bg-panel)",
-          borderRight: "1px solid var(--border)",
+          borderRight: isMobile ? "none" : "1px solid var(--border)",
           display: "flex",
           flexDirection: "column",
           flexShrink: 0,
@@ -1712,19 +2275,29 @@ export function AppShell() {
             activeTab={settingsTab}
             toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
             onToolCallsDefaultCollapsedChange={handleToolCallsDefaultCollapsedChange}
+            hideToolActivity={hideToolActivity}
+            onHideToolActivityChange={handleHideToolActivityChange}
+            neverFoldActivity={neverFoldActivity}
+            onNeverFoldActivityChange={handleNeverFoldActivityChange}
+            showToolCallsUnfolded={showToolCallsUnfolded}
+            onShowToolCallsUnfoldedChange={handleShowToolCallsUnfoldedChange}
+            expandThinkingByDefault={expandThinkingByDefault}
+            onExpandThinkingByDefaultChange={handleExpandThinkingByDefaultChange}
+            onHideThinkingBlockChange={setHideThinkingBlock}
             providerUsageVisible={providerUsageVisible}
             onProviderUsageVisibleChange={handleProviderUsageVisibleChange}
             scopeNativeSelectAll={scopeNativeSelectAll}
             onScopeNativeSelectAllChange={handleScopeNativeSelectAllChange}
+            openUrlAutomatically={openUrlAutomatically}
+            onOpenUrlAutomaticallyChange={handleOpenUrlAutomaticallyChange}
             cwd={activeCwd ?? selectedSession?.cwd ?? newSessionCwd}
+            remoteHost={settingsHostId !== undefined}
+            cluster={clusterSettings}
             sessionId={selectedSession?.id ?? null}
             onModelsSaved={() => setModelsRefreshKey((k) => k + 1)}
             onPluginsReloaded={() => setSessionKey((k) => k + 1)}
             appUpdate={appUpdate}
-            ompUpdateAvailable={ompUpdateAvailable}
-            ompUpdatesDisabled={ompUpdatesDisabled}
             onRefreshAppUpdate={refreshAppUpdate}
-            onOmpUpdateAvailabilityChange={setOmpUpdateAvailable}
             onRequestAppUpdate={requestAppUpdateFromSettings}
             onSelectTab={setSettingsTab}
             onClose={() => setSettingsTab(null)}
@@ -1737,9 +2310,9 @@ export function AppShell() {
           alignItems: "center",
           flexShrink: 0,
           borderBottom: "1px solid var(--border)",
-          minHeight: isMobile ? "calc(44px + env(safe-area-inset-top))" : 36,
+          minHeight: "var(--shell-topbar-height)",
           background: "var(--bg-panel)",
-          padding: isMobile ? "env(safe-area-inset-top) 4px 0" : "0 8px",
+          padding: isMobile ? "env(safe-area-inset-top, 0px) max(4px, env(safe-area-inset-right, 0px)) 0 max(4px, env(safe-area-inset-left, 0px))" : "0 8px",
           gap: "0 8px",
           minWidth: 0,
         }}>
@@ -1772,14 +2345,6 @@ export function AppShell() {
                 <Ellipsis size={16} strokeWidth={1.8} aria-hidden="true" />
               </summary>
               <div ref={mobileToolsContentRef} className="shell-topbar-overflow-content">
-                {showChat && (
-                  <span
-                    className="shell-mobile-context"
-                    title={`${projectLabel(selectedSession?.projectRoot ?? selectedSession?.cwd ?? activeCwd ?? "")} · ${selectedSession?.name || selectedSession?.firstMessage || t("appShell.newSession")}`}
-                  >
-                    {selectedSession?.name || selectedSession?.firstMessage || t("appShell.newSession")}
-                  </span>
-                )}
             <ThemeSwitcher />
             <LanguageSwitcher />
                 <button
@@ -1832,16 +2397,18 @@ export function AppShell() {
                 </button>
               </>
             )}
+              </div>
           {activeTopPanel === "system" && (
             <div data-top-panel className="dropdown-surface" style={{
               position: "absolute",
-              top: "calc(100% + 4px)",
+              // Compact: below the 48px tools bar, which clips its overflow (it scrolls sideways).
+              top: isMobile || compactTopbar ? "calc(100% + 56px)" : "calc(100% + 4px)",
               left: isMobile ? 4 : 8,
               right: "auto",
               width: "auto",
               minWidth: isMobile ? undefined : 420,
               maxWidth: "min(680px, calc(100vw - 24px))",
-              maxHeight: "min(70vh, calc(100dvh - 56px))",
+              maxHeight: isMobile || compactTopbar ? "min(70vh, calc(100dvh - 108px))" : "min(70vh, calc(100dvh - 56px))",
               overflowY: "auto",
               overflowX: "hidden",
               zIndex: 500,
@@ -1879,7 +2446,6 @@ export function AppShell() {
               )}
             </div>
           )}
-              </div>
             </details>
           </div>
 
@@ -1936,7 +2502,8 @@ export function AppShell() {
                     color: "var(--text-muted)",
                     whiteSpace: "nowrap",
                     minWidth: 0,
-                    maxWidth: "min(400px, 30vw)",
+                    width: "fit-content",
+                    justifyContent: "center",
                     flexShrink: 1,
                   }}
                 >
@@ -2016,26 +2583,30 @@ export function AppShell() {
             );
           })()}
 
-          {/* Right Zone: Segmented metric pills (Provider limits, Session Stats/Usage, Speed) */}
+          {/* Right zone: speed, mobile session information, and the file-panel opener. */}
           <div
             data-topbar-right-group
             style={{
               marginLeft: "auto",
               display: "flex",
               alignItems: "center",
-              justifyContent: "flex-end",
-              gap: 6,
-              paddingRight: rightPanelOpen ? 8 : 44,
-              minWidth: hasGenerationSpeed ? "calc(10ch + 33px)" : 0,
-              width: hasGenerationSpeed ? 200 : 0,
-              fontSize: 11,
-              fontFamily: "var(--font-mono)",
-              containerType: "inline-size",
-              containerName: "topbar-speed",
+              gap: isMobile ? 2 : 6,
+              height: isMobile ? 43 : "calc(var(--shell-topbar-height) - 1px)",
               flexShrink: 1,
+              minWidth: 0,
             }}
           >
-
+            {hasGenerationSpeed && <div
+              className="shell-topbar-metrics"
+              style={{
+                flex: "0 1 calc(10ch + 33px)",
+                minWidth: 0,
+                fontSize: 11,
+                fontFamily: "var(--font-mono)",
+                containerType: "inline-size",
+                containerName: "topbar-speed",
+              }}
+            >
             {/* Generation speed pill */}
             {showChat && (() => {
               if (!speed || rate == null) return null;
@@ -2081,6 +2652,40 @@ export function AppShell() {
                 </div>
               );
             })()}
+            </div>}
+            {isMobile && showChat && (
+              <div
+                ref={setSessionInfoContainer}
+                className="shell-session-info"
+                style={{ display: "flex", height: 44, flexShrink: 0, alignSelf: "flex-start" }}
+              />
+            )}
+            {!isMobile && <NotificationBell open={notificationsOpen} onOpenChange={setNotificationsOpen} />}
+            <button
+              type="button"
+              className="shell-toolbar-btn shell-panel-opener ui-focus-ring"
+              onClick={() => {
+                // Unread notifications turn the panel toggle into their shortcut.
+                if (opensNotifications) {
+                  setRightView("notifications");
+                  setRightPanelOpen(true);
+                } else {
+                  setRightPanelOpen((open) => !open);
+                }
+              }}
+              aria-expanded={rightPanelOpen}
+              aria-controls="workspace-file-panel"
+              aria-pressed={rightPanelOpen}
+              title={panelOpenerLabel}
+              aria-label={panelOpenerLabel}
+            >
+              <PanelRight size={16} strokeWidth={1.8} aria-hidden="true" />
+              {isMobile && unreadNotifications > 0 && (
+                <span aria-hidden="true" className="panel-opener-badge">
+                  {unreadNotifications > 99 ? "99+" : unreadNotifications}
+                </span>
+              )}
+            </button>
           </div>
 
         </div>
@@ -2092,8 +2697,49 @@ export function AppShell() {
               key={sessionKey}
               session={selectedSession}
               newSessionCwd={effectiveNewSessionCwd}
-              newSessionWorkspace={effectiveNewSessionCwd && (
+              newSessionHostId={newSessionHost}
+              newSessionCreationId={effectivePoolProject ? newSessionCreationId : undefined}
+              newSessionPoolId={effectivePoolProject?.poolId}
+              newSessionProjectId={effectivePoolProject?.projectId}
+              newSessionInitialization={effectivePoolProject ? newSessionCreation.initialization : undefined}
+              onNewSessionInitialization={handleNewSessionInitialization}
+              hostStatus={chatHost?.status}
+              hostLabel={chatHost ? hostName(t, chatHost) : undefined}
+              newSessionWorkspace={(effectiveNewSessionCwd || effectivePoolProject) && (
                 <div className="new-session-workspace">
+                  {creationTargets.length > 1 && (
+                    <>
+                      <label htmlFor="new-session-host" className="new-session-workspace-label">
+                        {t("hosts.pickerLabel")}
+                      </label>
+                      <div className="new-session-workspace-control">
+                        <span className="new-session-workspace-icon" aria-hidden="true">
+                          <Server size={17} strokeWidth={1.8} />
+                        </span>
+                        <ThemedSelect
+                          className="workspace-select-trigger"
+                          id="new-session-host"
+                          value={newSessionGroupKey}
+                          onChange={(key) => {
+                            const matches = workspaceOptions.projects.filter((project) => projectTargetId(project, pools) === key);
+                            const first = matches.find((project) => project.poolId) ?? matches[0];
+                            if (!first || key === newSessionGroupKey) return;
+                            suppressCwdRef.current = first.path;
+                            setActivePoolProject(first.poolId ? first : null);
+                            setActiveCwd(first.poolId ? null : first.path);
+                            setActiveHostId(first.poolId ? undefined : remoteHostId(first.hostId));
+                            handleNewSession(randomUUID(), first.poolId ? null : first.path, first.hostId, first);
+                          }}
+                          options={creationTargets.map((target) => ({
+                            value: target.id,
+                            label: target.label,
+                            disabled: !workspaceOptions.projects.some((project) => projectTargetId(project, pools) === target.id),
+                          }))}
+                        />
+                        <ChevronDown className="new-session-workspace-chevron" size={16} strokeWidth={1.8} aria-hidden="true" />
+                      </div>
+                    </>
+                  )}
                   <label id="new-session-workspace-label" htmlFor="new-session-workspace" className="new-session-workspace-label">
                     {t("settingsConfig.chipWorkspace")}
                   </label>
@@ -2101,58 +2747,88 @@ export function AppShell() {
                     <span className="new-session-workspace-icon" aria-hidden="true">
                       <Folder size={17} strokeWidth={1.8} />
                     </span>
-                    <select
+                    <ThemedSelect
+                      className="workspace-select-trigger"
                       id="new-session-workspace"
                       aria-describedby="new-session-workspace-path"
-                      value={effectiveNewSessionCwd}
-                      onChange={(event) => {
-                        const cwd = event.target.value;
-                        if (!cwd) {
-                          setAddProjectOpen(true);
-                          return;
-                        }
-                        if (cwd === effectiveNewSessionCwd) return;
-                        suppressCwdRef.current = cwd;
-                        setActiveCwd(cwd);
-                        handleNewSession("", cwd);
+                      value={newSessionWorkspaceValue}
+                      onChange={(key) => {
+                        if (!key) { openAddProject(true, newSessionGroupKey); return; }
+                        const project = hostProjects.find((candidate) => projectIdentity(candidate) === key || (!candidate.poolId && hostProjectKey(candidate.hostId, candidate.path) === key));
+                        if (!project) return;
+                        suppressCwdRef.current = project.path;
+                        setActivePoolProject(project.poolId ? project : null);
+                        setActiveCwd(project.poolId ? null : project.path);
+                        setActiveHostId(project.poolId ? undefined : remoteHostId(project.hostId));
+                        handleNewSession(randomUUID(), project.poolId ? null : project.path, project.hostId, project);
                       }}
-                    >
-                      {!workspaceOptions.projects.some((project) => comparableProjectPath(project.path) === comparableProjectPath(newSessionProject)) && (
-                        <option value={effectiveNewSessionCwd}>{projectLabel(effectiveNewSessionCwd)}</option>
-                      )}
-                      {workspaceOptions.projects.map((project) => {
-                        const current = comparableProjectPath(project.path) === comparableProjectPath(newSessionProject);
-                        const label = project.alias ?? projectLabel(project.path);
-                        const duplicate = workspaceOptions.projects.some((other) => other.path !== project.path && (other.alias ?? projectLabel(other.path)) === label);
-                        return (
-                          <option key={project.path} value={current ? effectiveNewSessionCwd : project.path}>
-                            {duplicate ? `${label} — ${project.path}` : label}
-                          </option>
-                        );
-                      })}
-                      <option value="">+ {t("projects.add")}</option>
-                    </select>
+                      options={[
+                        ...(!effectivePoolProject && effectiveNewSessionCwd && !hostProjects.some((project) => foldedHostProjectKey(project.hostId, project.path) === foldedHostProjectKey(newSessionHost, newSessionProject))
+                          ? [{ value: newSessionWorkspaceValue, label: projectLabel(effectiveNewSessionCwd) }] : []),
+                        ...hostProjects.map((project) => {
+                          const name = project.alias ?? project.name ?? projectLabel(project.path);
+                          // A member's pinned project: its option names the node.
+                          const node = !project.poolId && projectTargetId(project, pools) !== (project.hostId ?? LOCAL_HOST_ID) ? hosts?.find((host) => host.id === (project.hostId ?? LOCAL_HOST_ID)) : undefined;
+                          return {
+                            value: project.poolId ? projectIdentity(project) : hostProjectKey(project.hostId, foldedHostProjectKey(project.hostId, project.path) === foldedHostProjectKey(newSessionHost, newSessionProject) ? effectiveNewSessionCwd ?? project.path : project.path),
+                            label: node ? t("hosts.projectOnNode", { name, node: hostName(t, node) }) : name,
+                          };
+                        }),
+                        { value: "", label: t("projects.add"), action: true },
+                      ]}
+                    />
                     <ChevronDown className="new-session-workspace-chevron" size={16} strokeWidth={1.8} aria-hidden="true" />
                   </div>
-                  <div id="new-session-workspace-path" className="new-session-workspace-path" title={effectiveNewSessionCwd}>
-                    {effectiveNewSessionCwd}
+                  {/* The workspace's worktrees: picking one sets where the new
+                      session starts (same switch as the file panel's Worktrees tab). */}
+                  {worktreeCtx && !worktreeCtx.error && worktreeCtx.hostId === newSessionHostKey && worktreeCtx.worktrees.length > 1
+                    && comparableProjectPath(worktreeCtx.projectRoot) === comparableProjectPath(newSessionProject) && (
+                    <div className="new-session-workspace-control">
+                      <span className="new-session-workspace-icon" aria-hidden="true">
+                        <GitBranch size={17} strokeWidth={1.8} />
+                      </span>
+                      <ThemedSelect
+                        className="workspace-select-trigger"
+                        aria-label={t("sessionSidebar.switchWorktree")}
+                        aria-describedby="new-session-workspace-path"
+                        value={worktreeCtx.currentPath}
+                        onChange={(path) => worktreeCtx.select(path)}
+                        options={worktreeCtx.worktrees.map((wt) => ({ value: wt.path, label: wt.branch ?? getFileName(wt.path) }))}
+                      />
+                      <ChevronDown className="new-session-workspace-chevron" size={16} strokeWidth={1.8} aria-hidden="true" />
+                    </div>
+                  )}
+                  <div id="new-session-workspace-path" className="new-session-workspace-path" title={effectivePoolProject?.origin ?? effectiveNewSessionCwd ?? undefined}>
+                    {effectivePoolProject?.origin ?? effectiveNewSessionCwd}
                   </div>
                 </div>
               )}
               onAgentEnd={handleAgentEnd}
               onSessionCreated={handleSessionCreated}
               onSessionForked={handleSessionForked}
+              onSessionMoved={handleSessionMoved}
               modelsRefreshKey={modelsRefreshKey}
               chatInputRef={chatInputRef}
-              onOpenFile={handleOpenLinkedFile}
+              onOpenFile={selectedSession || !effectivePoolProject ? handleOpenFile : undefined}
+              onOpenUrl={handleSessionOpenUrl}
+              openUrlPending={pendingOpenUrlForSession}
               onBranchDataChange={handleBranchDataChange}
               onSystemPromptChange={handleSystemPromptChange}
               onSystemPromptLoaderChange={handleSystemPromptLoaderChange}
               onSessionStatsChange={handleSessionStatsChange}
               onSessionStatsPanelOpen={openSessionStatsPanel}
+              sessionInfoContainer={sessionInfoContainer}
               onGenerationSpeedChange={handleGenerationSpeedChange}
               onOpenProviders={() => setSettingsTab("providers")}
               toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
+              hideToolActivity={hideToolActivity}
+              neverFoldActivity={neverFoldActivity}
+              showToolCallsUnfolded={showToolCallsUnfolded}
+              expandThinkingByDefault={expandThinkingByDefault}
+              hideThinkingBlock={hideThinkingBlock}
+              searchQuery={chatSearchQuery}
+              searchTarget={searchMatchTarget && searchMatchTarget.sessionId === selectedSession?.id ? searchMatchTarget : null}
+              onSearchTargetHandled={clearSearchMatchTarget}
             />
           ) : initialCwdStatus === "validating" ? (
             <WorkspaceState
@@ -2201,7 +2877,7 @@ export function AppShell() {
                     type="button"
                     onClick={() => {
                       setSidebarOpen(true);
-                      setAddProjectOpen(true);
+                      openAddProject(true);
                     }}
                     style={{ display: "flex", alignItems: "center", gap: 6, width: "fit-content", minHeight: 36, marginTop: 12, padding: "7px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 12, fontWeight: 600, boxShadow: "var(--shadow-card)" }}
                     className="ui-focus-ring"
@@ -2217,11 +2893,11 @@ export function AppShell() {
           </>
         )}
       </main>
-      {!settingsTab && rightPanelHasOpened && rightPanelIsModal && (
+      {rightPanelIsModal && (
         <div
           className="right-panel-backdrop"
           aria-hidden="true"
-          onClick={() => setRightPanelOpen(false)}
+          onClick={closeRightPanel}
         />
       )}
       {!settingsTab && rightPanelHasOpened && (
@@ -2231,14 +2907,18 @@ export function AppShell() {
         rightView={rightView}
         onSelectView={handleSelectRightView}
         rightPanelOpen={rightPanelOpen}
+        onClose={closeRightPanel}
         rightPanelWidth={rightPanelWidth}
         rightPanelResizing={rightPanelResizing}
-        rightPanelRef={rightPanelRef}
+        rightPanelRef={attachRightPanel}
         fileExplorerRef={fileExplorerRef}
-        revealPath={revealPath}
+        revealPath={revealTarget?.hostId === workspaceHostId ? revealTarget.path : null}
         onRevealDone={handleRevealDone}
         explorerCwd={explorerCwd}
-        activeCwd={activeCwd}
+        sourceSessionId={selectedSession?.id ?? null}
+        hostId={workspaceHostId}
+        worktrees={worktreeCtx}
+        connectionDiagnosticsOn={connectionDiagnosticsOn}
         explorerRefreshKey={explorerRefreshKey}
         fileSearchOpen={fileSearchOpen}
         onToggleFileSearch={handleToggleFileSearch}
@@ -2272,26 +2952,8 @@ export function AppShell() {
       )}
 
     </div>
-    {!settingsTab && (
-      <button
-        type="button"
-        className="shell-toolbar-btn shell-panel-toggle ui-focus-ring"
-        onClick={() => setRightPanelOpen((v) => !v)}
-        aria-expanded={rightPanelOpen}
-        aria-controls="workspace-file-panel"
-        aria-pressed={rightPanelOpen}
-        title={rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel")}
-        aria-label={rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel")}
-        style={{
-          position: "fixed", top: "env(safe-area-inset-top, 0px)", right: "env(safe-area-inset-right, 0px)", zIndex: 300,
-          width: isMobile ? 44 : 36, height: isMobile ? 44 : 36, padding: 0,
-          borderLeft: "1px solid var(--border)", borderBottom: "1px solid var(--border)",
-        }}
-      >
-        {rightPanelOpen ? <X size={16} strokeWidth={1.8} aria-hidden="true" /> : <PanelRight size={16} strokeWidth={1.8} aria-hidden="true" />}
-      </button>
-    )}
-    <AppUpdateDialog open={appUpdateDialogOpen} update={appUpdate} phase={appUpdatePhase} visibleStage={appUpdateVisibleStage} error={appUpdateError} onProceed={() => void proceedWithAppUpdate()} onNotNow={dismissAppUpdate} />
+    <LocalDaemonBanner />
+    <AppUpdateDialog open={appUpdateDialogOpen} update={appUpdate} phase={appUpdatePhase} visibleStage={appUpdateVisibleStage} error={appUpdateError} plan={appUpdatePlan} planStatus={appUpdatePlanStatus} onRefreshPlan={refreshAppUpdatePlan} onCheckStatus={checkStalledAppUpdate} onProceed={(approval) => void proceedWithAppUpdate(approval)} onNotNow={dismissAppUpdate} />
     {archiveBrowserOpen && (
       <ArchiveBrowser
         open={archiveBrowserOpen}

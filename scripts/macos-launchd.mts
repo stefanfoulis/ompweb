@@ -12,9 +12,10 @@
 //   OMP_WEB_PKG          npm package spec run via npx               default @kahme247/ompweb@latest
 //   PORT                 Server port                                default 30177
 //   OMP_WEB_HOSTNAME     Server bind host                           default 127.0.0.1
-//   OMP_WEB_PASSWORD     Optional password for web login            default none (auth disabled)
+//   OMP_WEB_PASSWORD     Optional plaintext password, hashed before it is written
+//   OMP_WEB_PASSWORD_HASH  Password hash from `ompweb hash-password` (preferred)
 //   OMP_WEB_NO_OPEN      Set to 0 to auto-open the browser          default 1 (no auto-open)
-//   OMP_WEB_OMP_BIN      Path to omp binary if not on PATH          default auto-detected
+//   OMP_WEB_OMP_BIN      Override for ompweb's own omp (ompweb-omp)  default the bundled one
 //   PI_CODING_AGENT_DIR  Custom omp agent directory                 default ~/.omp/agent
 //
 // Example (loopback-only; require auth + trusted HTTPS proxy/VPN for remote access):
@@ -24,6 +25,8 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+// @ts-expect-error - plain CJS helper, no type declarations
+import { resolvePasswordHash } from "../bin/omp-web-hash-password.js";
 
 const LABEL = "com.kahme247.ompweb";
 const HOME = os.homedir();
@@ -80,16 +83,14 @@ function install(pkgArg?: string): void {
   const siblingNpx = path.join(path.dirname(nodeBin), "npx");
   const npxBin = isExecutableFile(siblingNpx) ? siblingNpx : (which("npx") ?? fail("npx not found on PATH"));
 
-  // omp binary: explicit env var wins, otherwise auto-detect from the current PATH.
-  const ompBin = process.env.OMP_WEB_OMP_BIN ?? which("omp");
-  if (process.env.OMP_WEB_OMP_BIN) {
+  // Only an explicit override: ompweb runs its own omp (ompweb-omp). A stock omp on PATH cannot run its sessions.
+  const ompBin = process.env.OMP_WEB_OMP_BIN || null;
+  if (ompBin) {
     try {
-      fs.accessSync(process.env.OMP_WEB_OMP_BIN, fs.constants.X_OK);
+      fs.accessSync(ompBin, fs.constants.X_OK);
     } catch {
-      fail(`OMP_WEB_OMP_BIN=${process.env.OMP_WEB_OMP_BIN} is not executable`);
+      fail(`OMP_WEB_OMP_BIN=${ompBin} is not executable`);
     }
-  } else if (!ompBin) {
-    console.warn("warning: omp binary not found; live-agent features will be unavailable (set OMP_WEB_OMP_BIN)");
   }
 
   // Service parameters with defaults; the positional package spec wins over env.
@@ -97,7 +98,9 @@ function install(pkgArg?: string): void {
   const port = process.env.PORT ?? "30177";
   const hostname = process.env.OMP_WEB_HOSTNAME ?? "127.0.0.1";
   const noOpen = process.env.OMP_WEB_NO_OPEN ?? "1";
-  const password = process.env.OMP_WEB_PASSWORD;
+  // Only a hash reaches the plist: omp-web no longer reads a plaintext
+  // password, so hash one if it was given here (issue #239).
+  const passwordHash = resolvePasswordHash();
   // launchd does not expand `~` in environment values — resolve it now.
   const agentDir = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=\/|$)/, HOME);
 
@@ -122,7 +125,7 @@ function install(pkgArg?: string): void {
     PORT: port,
     OMP_WEB_HOSTNAME: hostname,
     OMP_WEB_NO_OPEN: noOpen,
-    ...(password ? { OMP_WEB_PASSWORD: password } : {}),
+    ...(passwordHash ? { OMP_WEB_PASSWORD_HASH: passwordHash } : {}),
     ...(ompBin ? { OMP_WEB_OMP_BIN: ompBin } : {}),
     ...(agentDir ? { PI_CODING_AGENT_DIR: agentDir } : {}),
   };

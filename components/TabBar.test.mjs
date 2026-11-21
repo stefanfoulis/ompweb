@@ -2,11 +2,9 @@ import "../tests/setup-dom.mjs";
 import assert from "node:assert/strict";
 import test, { afterEach, beforeEach } from "node:test";
 import React from "react";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react/pure.js";
-import { createJiti } from "jiti";
+const { cleanup, fireEvent, render, screen } = await import("@testing-library/react/pure.js");
 
-const jiti = createJiti(import.meta.url, { jsx: { runtime: "automatic" }, tsconfigPaths: true });
-const { TabBar } = await jiti.import("./TabBar.tsx");
+const { TabBar } = await import("./TabBar.tsx");
 
 beforeEach(() => {
   globalThis.CSS ??= { escape: (value) => value };
@@ -33,7 +31,13 @@ test("right-panel tabs support roving arrows, Home/End, and keyboard close", asy
     onSelectExplorer: () => selected.push("explorer"),
     gitSelected: false,
     onSelectGit: () => selected.push("git"),
+    onSelectNotifications: () => selected.push("notifications"),
+    worktreesSelected: false,
+    onSelectWorktrees: () => selected.push("worktrees"),
   }));
+
+  // Notifications is the first pinned tab, so Home lands there.
+  const notifications = screen.getByRole("tab", { name: "Notifications" });
 
   const explorer = screen.getByRole("tab", { name: "Explorer" });
   const alpha = screen.getByRole("tab", { name: "/workspace/alpha.ts" });
@@ -49,14 +53,24 @@ test("right-panel tabs support roving arrows, Home/End, and keyboard close", asy
 
   fireEvent.keyDown(beta, { key: "Home" });
   await nextFrame();
+  assert.equal(document.activeElement, notifications);
+  assert.deepEqual(selected, ["beta", "notifications"]);
+
+  fireEvent.keyDown(notifications, { key: "ArrowRight" });
+  await nextFrame();
   assert.equal(document.activeElement, explorer);
-  assert.deepEqual(selected, ["beta", "explorer"]);
+  assert.deepEqual(selected, ["beta", "notifications", "explorer"]);
 
   fireEvent.keyDown(explorer, { key: "End" });
   await nextFrame();
   assert.equal(document.activeElement, beta);
-  assert.deepEqual(selected, ["beta", "explorer", "beta"]);
+  assert.deepEqual(selected, ["beta", "notifications", "explorer", "beta"]);
 
   fireEvent.keyDown(beta, { key: "Delete" });
   assert.deepEqual(closed, ["beta"]);
+
+  fireEvent.keyDown(alpha, { key: "ArrowLeft" });
+  await nextFrame();
+  assert.equal(document.activeElement, screen.getByRole("tab", { name: "Worktrees" }));
+  assert.deepEqual(selected, ["beta", "notifications", "explorer", "beta", "worktrees"]);
 });

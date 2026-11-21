@@ -1,8 +1,10 @@
-import { NextResponse } from "next/server";
 import { execFile } from "child_process";
 import { existsSync, promises as fs } from "fs";
 import { basename, extname, join } from "path";
-import { resolveOmpBin } from "@/lib/omp/omp-cli";
+import { ANSI_RE, parseJsonLoose } from "@/lib/omp/plugins-cli";
+import { OMP_NOT_FOUND, resolveOmpBin } from "@/lib/omp/omp-cli";
+import { ensureAgentDir } from "@/lib/omp/paths";
+import { createChildProcessEnvironment } from "@/lib/project-command-env";
 import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
 import type {
   PluginDiagnostic,
@@ -12,8 +14,6 @@ import type {
   PluginScope,
   PluginsResponse,
 } from "@/lib/api-types";
-
-export const dynamic = "force-dynamic";
 
 // Plugin management is delegated to the user's omp binary (`omp plugin ...`);
 // omp-web never embeds the Bun-only SDK. `--json` output shapes are mirrored
@@ -60,8 +60,6 @@ interface OmpPluginList {
   marketplace?: OmpMarketplacePlugin[];
 }
 
-const ANSI_RE = /\x1B\[[0-9;]*m/g;
-
 function emptyCounts(): PluginResourceCounts {
   return { extensions: 0, skills: 0, prompts: 0, themes: 0 };
 }
@@ -72,7 +70,7 @@ function runOmp(
 ): Promise<{ stdout: string; stderr: string }> {
   const bin = resolveOmpBin();
   if (!bin) {
-    return Promise.reject(new Error("omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN."));
+    return Promise.reject(new Error(OMP_NOT_FOUND));
   }
   return new Promise((resolve, reject) => {
     execFile(
@@ -82,7 +80,7 @@ function runOmp(
         cwd: opts.cwd,
         timeout: opts.timeout ?? 60_000,
         maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
+        env: createChildProcessEnvironment({ FORCE_COLOR: "0", NO_COLOR: "1" }),
         windowsHide: true,
       },
       (error, stdout, stderr) => {
@@ -95,18 +93,6 @@ function runOmp(
       },
     );
   });
-}
-
-/** Parse `--json` stdout, tolerating stray non-JSON lines before the payload. */
-function parseJsonLoose<T>(stdout: string): T | null {
-  const cleaned = stdout.replace(ANSI_RE, "");
-  const start = cleaned.search(/[{[]/);
-  if (start < 0) return null;
-  try {
-    return JSON.parse(cleaned.slice(start)) as T;
-  } catch {
-    return null;
-  }
 }
 
 /** Best-effort scan of a plugin's skills/ directory (omp discovers plugin-root
@@ -214,13 +200,15 @@ async function toMarketplacePackageInfo(plugin: OmpMarketplacePlugin): Promise<P
   };
 }
 
-async function readPlugins(cwd: string): Promise<PluginsResponse> {
+/** Without a cwd, the user level only (a cluster member's settings act on this machine's, spec K7): omp runs in its
+ * agent directory, where no project lies, and a project-scope entry is left out all the same. */
+async function readPlugins(cwd: string | null): Promise<PluginsResponse> {
   const diagnostics: PluginDiagnostic[] = [];
   const packages: PluginPackageInfo[] = [];
   const totals = emptyCounts();
 
   try {
-    const { stdout } = await runOmp(["plugin", "list", "--json"], { cwd, timeout: 60_000 });
+    const { stdout } = await runOmp(["plugin", "list", "--json"], { cwd: cwd ?? ensureAgentDir(), timeout: 60_000 });
     const list = parseJsonLoose<OmpPluginList>(stdout);
     if (!list) {
       diagnostics.push({
@@ -232,6 +220,7 @@ async function readPlugins(cwd: string): Promise<PluginsResponse> {
         packages.push(await toNpmPackageInfo(plugin));
       }
       for (const plugin of list.marketplace ?? []) {
+        if (!cwd && plugin.scope === "project") continue;
         const info = await toMarketplacePackageInfo(plugin);
         if (plugin.shadowedBy) {
           diagnostics.push({
@@ -265,31 +254,29 @@ function readScope(scope: unknown): PluginScope {
 
 /** Dynamic CLI failures keep their message; a missing omp binary is the one
  * known cause worth a stable code for client-side localization. */
-function pluginErrorResponse(error: unknown): NextResponse {
+function pluginErrorResponse(error: unknown): Response {
   const message = error instanceof Error ? error.message : String(error);
-  if (message.includes("omp binary not found")) {
-    return NextResponse.json({ error: message, code: "omp_not_found" }, { status: 500 });
+  if (message.includes(OMP_NOT_FOUND)) {
+    return Response.json({ error: message, code: "omp_not_found" }, { status: 500 });
   }
-  return NextResponse.json({ error: message }, { status: 500 });
+  return Response.json({ error: message }, { status: 500 });
 }
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const cwd = searchParams.get("cwd");
-  if (!cwd) return NextResponse.json({ error: "cwd required", code: "cwd_required" }, { status: 400 });
 
   try {
-    const allowedRoots = await getAllowedFileRoots();
-    if (!isExistingFilePathAllowed(cwd, allowedRoots)) {
-      return NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
+    if (cwd && !isExistingFilePathAllowed(cwd, await getAllowedFileRoots())) {
+      return Response.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
     }
-    return NextResponse.json(await readPlugins(cwd));
+    return Response.json(await readPlugins(cwd));
   } catch (error) {
     return pluginErrorResponse(error);
   }
 }
 
-// POST /api/plugins body: { action, source?, scope?, cwd }
+// POST /api/plugins body: { action, source?, scope?, cwd? }; without a cwd, global changes only.
 export async function POST(req: Request) {
   try {
     const body = await req.json() as {
@@ -298,32 +285,34 @@ export async function POST(req: Request) {
       scope?: PluginScope;
       cwd?: string;
     };
-    if (!body.cwd) return NextResponse.json({ error: "cwd required", code: "cwd_required" }, { status: 400 });
-    if (!body.action) return NextResponse.json({ error: "action required", code: "action_required" }, { status: 400 });
-    const allowedRoots = await getAllowedFileRoots();
-    if (!isExistingFilePathAllowed(body.cwd, allowedRoots)) {
-      return NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
+    const cwd = body.cwd || null;
+    const scope = readScope(body.scope);
+    if (!cwd && scope === "project") return Response.json({ error: "cwd required", code: "cwd_required" }, { status: 400 });
+    if (!body.action) return Response.json({ error: "action required", code: "action_required" }, { status: 400 });
+    if (cwd && !isExistingFilePathAllowed(cwd, await getAllowedFileRoots())) {
+      return Response.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
     }
 
     const source = body.source?.trim();
-    const scopeArgs = readScope(body.scope) === "project" ? ["--scope", "project"] : [];
+    const scopeArgs = scope === "project" ? ["--scope", "project"] : [];
+    const dir = cwd ?? ensureAgentDir();
 
     if (body.action === "install") {
-      if (!source) return NextResponse.json({ error: "source required", code: "source_required" }, { status: 400 });
-      await runOmp(["plugin", "install", source, "--json", ...scopeArgs], { cwd: body.cwd, timeout: 300_000 });
+      if (!source) return Response.json({ error: "source required", code: "source_required" }, { status: 400 });
+      await runOmp(["plugin", "install", source, "--json", ...scopeArgs], { cwd: dir, timeout: 300_000 });
     } else if (body.action === "remove") {
-      if (!source) return NextResponse.json({ error: "source required", code: "source_required" }, { status: 400 });
-      await runOmp(["plugin", "uninstall", source, "--json", ...scopeArgs], { cwd: body.cwd, timeout: 120_000 });
+      if (!source) return Response.json({ error: "source required", code: "source_required" }, { status: 400 });
+      await runOmp(["plugin", "uninstall", source, "--json", ...scopeArgs], { cwd: dir, timeout: 120_000 });
     } else if (body.action === "update") {
-      await runOmp(["plugin", "upgrade", ...(source ? [source, ...scopeArgs] : [])], { cwd: body.cwd, timeout: 300_000 });
+      await runOmp(["plugin", "upgrade", ...(source ? [source, ...scopeArgs] : [])], { cwd: dir, timeout: 300_000 });
     } else if (body.action === "disable" || body.action === "enable") {
-      if (!source) return NextResponse.json({ error: "source required", code: "source_required" }, { status: 400 });
-      await runOmp(["plugin", body.action, source, "--json", ...scopeArgs], { cwd: body.cwd, timeout: 60_000 });
+      if (!source) return Response.json({ error: "source required", code: "source_required" }, { status: 400 });
+      await runOmp(["plugin", body.action, source, "--json", ...scopeArgs], { cwd: dir, timeout: 60_000 });
     } else {
-      return NextResponse.json({ error: `Unsupported action: ${body.action}`, code: "plugin_unsupported_action" }, { status: 400 });
+      return Response.json({ error: `Unsupported action: ${body.action}`, code: "plugin_unsupported_action" }, { status: 400 });
     }
 
-    return NextResponse.json(await readPlugins(body.cwd));
+    return Response.json(await readPlugins(cwd));
   } catch (error) {
     return pluginErrorResponse(error);
   }

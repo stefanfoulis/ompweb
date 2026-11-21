@@ -29,8 +29,32 @@ export interface ProjectRegistryEntry {
   alias?: string;
   /** Explicit sidebar position; lower values appear first. */
   sortOrder?: number;
+  /** Present when pinned; position among pinned projects, lower first. */
+  pinOrder?: number;
   /** Workspace-level omp launch configuration. */
   launchConfig?: ProjectLaunchConfig;
+}
+
+export interface ProjectPresentationUpdate {
+  alias?: string | null;
+  sortOrder?: number | null;
+  pinOrder?: number | null;
+  launchConfig?: ProjectLaunchConfig | null;
+}
+
+/** Presentation changes never inspect or modify the project's filesystem. */
+export function applyProjectPresentation<T extends ProjectPresentationUpdate>(project: T, update: ProjectPresentationUpdate): T {
+  const next = { ...project };
+  if (update.alias !== undefined) {
+    const alias = update.alias?.trim();
+    if (alias) next.alias = alias;
+    else delete next.alias;
+  }
+  for (const field of ["sortOrder", "pinOrder", "launchConfig"] as const) {
+    if (update[field] === null) delete next[field];
+    else if (update[field] !== undefined) Object.assign(next, { [field]: update[field] });
+  }
+  return next;
 }
 
 export interface ProjectRegistryFile {
@@ -61,24 +85,27 @@ function canonicalProjectPath(value: string): string {
 
 /** Launch args the web UI manages itself; a workspace config must never carry
  *  them (bare or `--flag=value`), or a stored config could hijack the session
- *  boundary (`--cwd`/`--resume`) or the rpc-ui mode. */
-const RESERVED_LAUNCH_ARGS: Record<string, true> = { "--mode": true, "rpc-ui": true, "--cwd": true, "--resume": true };
-const RESERVED_LAUNCH_ARG_PREFIXES = ["--mode=", "--cwd=", "--resume="];
+ *  boundary (`--cwd`/`--resume`/`--profile`) or the rpc-ui mode. `--profile`
+ *  is reserved too: it would bypass the validated `profile` field and could
+ *  hand omp a name it rejects, failing every session in the workspace. */
+const RESERVED_LAUNCH_ARGS: Record<string, true> = { "--mode": true, "rpc-ui": true, "--cwd": true, "--resume": true, "--profile": true };
+const RESERVED_LAUNCH_ARG_PREFIXES = ["--mode=", "--cwd=", "--resume=", "--profile="];
 export function isReservedLaunchArg(arg: string): boolean {
   return RESERVED_LAUNCH_ARGS[arg] === true || RESERVED_LAUNCH_ARG_PREFIXES.some((prefix) => arg.startsWith(prefix));
 }
 
-/** Parse the on-disk registry's launch config; invalid fields are safely ignored. */
+/** Preserve stored strings so invalid legacy configurations can be corrected,
+ * rather than silently changing the profile or leaving orphaned arguments. */
 function parseLaunchConfig(item: Record<string, unknown>): ProjectLaunchConfig | undefined {
   const raw = item.launchConfig;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const value = raw as Record<string, unknown>;
-  const profile = typeof value.profile === "string" && value.profile.trim() && !value.profile.trim().startsWith("-") ? value.profile.trim() : undefined;
+  const profile = typeof value.profile === "string" ? value.profile : undefined;
   const advisor = value.advisor === true ? true : undefined;
   const extraArgs = Array.isArray(value.extraArgs)
-    ? value.extraArgs.filter((arg): arg is string => typeof arg === "string" && arg.length > 0 && arg.length <= 256 && !isReservedLaunchArg(arg)).slice(0, 32)
+    ? value.extraArgs.filter((arg): arg is string => typeof arg === "string")
     : undefined;
-  if (!profile && advisor === undefined && (!extraArgs || extraArgs.length === 0)) return undefined;
+  if (profile === undefined && advisor === undefined && (!extraArgs || extraArgs.length === 0)) return undefined;
   return { profile, advisor, extraArgs };
 }
 
@@ -101,6 +128,7 @@ export function parseProjectRegistry(raw: string): ProjectRegistryFile {
         hidden: "hidden" in item && item.hidden === true,
         alias: "alias" in item && typeof item.alias === "string" && item.alias.trim() ? item.alias.trim() : undefined,
         sortOrder: "sortOrder" in item && typeof item.sortOrder === "number" && Number.isFinite(item.sortOrder) ? item.sortOrder : undefined,
+        pinOrder: "pinOrder" in item && typeof item.pinOrder === "number" && Number.isFinite(item.pinOrder) ? item.pinOrder : undefined,
         launchConfig: parseLaunchConfig(item as Record<string, unknown>),
       });
     }
@@ -158,14 +186,14 @@ export function upsertProject(
   return { version: 1, projects };
 }
 
-/** Apply display-only updates (alias, sortOrder) to any number of projects in
+/** Apply display-only updates (alias, sortOrder, pinOrder) to any number of projects in
  *  ONE atomic operation — the caller persists the result once, so concurrent
  *  single-entry writes can never lose each other's changes. Paths that match
  *  no registry entry are ignored; callers wanting session-discovered projects
  *  managed must register them in the same cycle (see /api/projects PATCH). */
 export function updateProjectsPresentation(
   registry: ProjectRegistryFile,
-  updates: ReadonlyArray<{ path: string; alias?: string | null; sortOrder?: number | null; launchConfig?: ProjectLaunchConfig | null }>,
+  updates: ReadonlyArray<ProjectPresentationUpdate & { path: string }>,
 ): ProjectRegistryFile {
   const keyed = new Map(updates.map((update) =>
     [comparableProjectPath(canonicalProjectPath(update.path)), update] as const,
@@ -175,21 +203,7 @@ export function updateProjectsPresentation(
     projects: registry.projects.map((project) => {
       const update = keyed.get(comparableProjectPath(project.path));
       if (!update) return project;
-      const next = { ...project };
-      if (update.alias !== undefined) {
-        const alias = update.alias?.trim();
-        if (alias) next.alias = alias;
-        else delete next.alias;
-      }
-      if (update.sortOrder !== undefined) {
-        if (update.sortOrder === null) delete next.sortOrder;
-        else next.sortOrder = update.sortOrder;
-      }
-      if (update.launchConfig !== undefined) {
-        if (update.launchConfig === null) delete next.launchConfig;
-        else next.launchConfig = update.launchConfig;
-      }
-      return next;
+      return applyProjectPresentation(project, update);
     }),
   };
 }
@@ -211,8 +225,13 @@ export function hideProject(registry: ProjectRegistryFile, path: string): Projec
  *  entries. A hidden registry entry suppresses re-discovery, so hiding a
  *  project keeps its sessions off the sidebar until it is added again.
  *  Registered projects come first in most-recently-added order; discovered
- *  projects follow sorted by path. */
-export function mergeProjects(registry: ProjectRegistryFile, discovered: Iterable<string>): ManagedProject[] {
+ *  projects follow sorted by path. `canonical` resolves discovered paths on
+ *  this machine; another host's paths pass through unchanged. */
+export function mergeProjects(
+  registry: ProjectRegistryFile,
+  discovered: Iterable<string>,
+  canonical: (path: string) => string = canonicalProjectPath,
+): ManagedProject[] {
   const hidden = new Set(
     registry.projects.filter((p) => p.hidden).map((p) => comparableProjectPath(p.path)),
   );
@@ -229,11 +248,11 @@ export function mergeProjects(registry: ProjectRegistryFile, discovered: Iterabl
     const key = comparableProjectPath(p.path);
     if (registeredSeen.has(key)) continue; // tolerate hand-edited duplicates
     registeredSeen.add(key);
-    registered.push({ path: p.path, addedAt: p.addedAt, alias: p.alias, sortOrder: p.sortOrder, launchConfig: p.launchConfig });
+    registered.push({ path: p.path, addedAt: p.addedAt, alias: p.alias, sortOrder: p.sortOrder, pinOrder: p.pinOrder, launchConfig: p.launchConfig });
   }
   const extra: ManagedProject[] = [];
   const extraSeen = new Set<string>();
-  for (const raw of new Set([...discovered].filter(Boolean).map(canonicalProjectPath))) {
+  for (const raw of new Set([...discovered].filter(Boolean).map(canonical))) {
     const key = comparableProjectPath(raw);
     if (hidden.has(key) || registeredSeen.has(key) || extraSeen.has(key)) continue;
     extraSeen.add(key);

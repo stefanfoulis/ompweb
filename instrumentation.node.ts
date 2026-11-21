@@ -1,13 +1,15 @@
 import { appendFileSync, mkdirSync, renameSync, statSync } from "fs";
 import { join } from "path";
-import { getConfigRoot } from "@/lib/omp/paths";
+import { getDiagnosticsDir } from "@/lib/omp/paths";
 
 export async function register(): Promise<void> {
-  // Honor HTTP(S)_PROXY/NO_PROXY for server-side fetch (update checks, skill
-  // search, model connection tests). Node's built-in fetch ignores proxy env
-  // vars (NODE_USE_ENV_PROXY is Node 24+ only; engines floor is 22).
-  const { configureHttpDispatcher } = await import("@/lib/http-dispatcher");
-  configureHttpDispatcher();
+  // Modules add SIGINT/SIGTERM cleanup listeners (lib/rpc-manager.ts), and any
+  // listener cancels the default exit: end the process the way a signal would
+  // (130/143, as `next start` did). Their "exit" listeners still run. First,
+  // before any await, so a signal during boot is not swallowed.
+  for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
+    process.on(signal, () => process.exit(code));
+  }
 
   // Startup diagnostics: agent dir. Kept to one line so it greps cleanly;
   // failures here must never block boot.
@@ -19,6 +21,19 @@ export async function register(): Promise<void> {
   } catch {
     // Diagnostics are best-effort.
   }
+
+  // A password that is plaintext, truncated or otherwise unusable must be
+  // visible in the terminal, not only as a 503 in the browser (issue #239).
+  // Requests are refused either way; this is the readable half.
+  void (async () => {
+    try {
+      const { webPasswordConfigurationProblem } = await import("@/lib/web-auth");
+      const problem = webPasswordConfigurationProblem();
+      if (problem) console.error(`[omp-web] password configuration error:\n${problem}`);
+    } catch (error) {
+      console.warn(`[omp-web] password configuration check failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  })();
 
   // Warm the shared utility omp process so the first models/auth request does
   // not pay the multi-second cold spawn (measured 1.2-4s on a real install).
@@ -44,13 +59,72 @@ export async function register(): Promise<void> {
     }
   })();
 
+  // Prepare this server's local link, then start this machine's host unless one already answers. Background: a cold
+  // start takes seconds and boot must not wait on it; a failure is logged, never reported as an online host.
+  if (process.env.NODE_ENV !== "development") {
+    void (async () => {
+      try {
+        const { ensureLocalHostDaemon } = await import("@/lib/hosts/local-daemon-start");
+        const result = await ensureLocalHostDaemon();
+        if (result.skipped) console.warn(`[omp-web] local daemon not started: ${result.skipped}`);
+        else console.log(`[omp-web] local daemon ${result.started ? "started" : "already running"} (pid ${result.pid ?? "unknown"})`);
+      } catch (error) {
+        console.warn(`[omp-web] local daemon not started: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    })();
+  }
+
+  // Each host daemon deletes sent uploads after the configured number of days: tell it the setting whenever it links.
+  try {
+    const { startUploadRetentionSync } = await import("@/lib/hosts/upload-retention-sync");
+    startUploadRetentionSync();
+  } catch (error) {
+    console.warn(`[omp-web] upload retention sync not started: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Cluster members run on this machine's omp configuration: every 30 s a member that is behind gets it (lib/hosts/hub.ts).
+  try {
+    const { startClusterConfigSync } = await import("@/lib/hosts/hub");
+    startClusterConfigSync();
+  } catch (error) {
+    console.warn(`[omp-web] cluster configuration sync not started: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Resume sessions that were mid-run when omp-web last stopped (opt-in
+  // setting). Fire-and-forget: resuming must not block boot.
+  void (async () => {
+    try {
+      const { resumeInterruptedSessions } = await import("@/lib/rpc-manager");
+      await resumeInterruptedSessions();
+    } catch (error) {
+      console.warn(`[omp-web] session auto-resume failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  })();
+
+  // Messages the outbox held when omp-web last stopped go once their hosts link (lib/message-outbox.ts).
+  try {
+    const { startOutbox } = await import("@/lib/message-outbox");
+    startOutbox();
+  } catch (error) {
+    console.warn(`[omp-web] message outbox not started: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // GitHub watches post their updates through that outbox, so they start after it (lib/github/watcher.ts).
+  try {
+    const { startGithubWatcher } = await import("@/lib/github/watcher");
+    startGithubWatcher();
+  } catch (error) {
+    console.warn(`[omp-web] github watcher not started: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
   // Crash/stall journal: a long-running server that dies or wedges while the
   // user is away leaves no trace in a terminal that no longer exists (CLI runs
   // are killed with their terminal; pages then show endless loading until the
   // process is restarted). Append fatal errors and event-loop stalls to a file
   // so the next incident explains itself. Node's default crash semantics are
-  // preserved — this only adds the record before exiting.
-  const logDir = join(getConfigRoot(), "omp-web");
+  // preserved — this only adds the record before exiting — except for client
+  // aborts, which are journaled and survived (see below).
+  const logDir = getDiagnosticsDir();
   const logPath = join(logDir, "diagnostics.log");
   const appendDiag = (kind: string, detail: string) => {
     try {
@@ -63,6 +137,15 @@ export async function register(): Promise<void> {
   };
   const describe = (value: unknown) => (value instanceof Error ? `${value.name}: ${value.message}\n${value.stack ?? ""}` : String(value));
   process.on("uncaughtException", (error) => {
+    // A client disconnecting mid-request can surface here as an unhandled
+    // `Error: aborted` (ECONNRESET) from a request stream nobody listens to.
+    // That is a peer event, not a corrupted server: journal it (one line, no
+    // stack, so aborts cannot rotate real crash records out of the journal
+    // quickly) and keep serving.
+    if (error instanceof Error && error.message === "aborted" && (error as NodeJS.ErrnoException).code === "ECONNRESET") {
+      appendDiag("client-abort", "uncaughtException Error: aborted (ECONNRESET)");
+      return;
+    }
     appendDiag("crash", `uncaughtException ${describe(error)}`);
     // An uncaughtException listener suppresses Node's default exit; keep the
     // crash-visible semantics by exiting explicitly.

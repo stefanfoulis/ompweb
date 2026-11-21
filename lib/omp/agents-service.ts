@@ -1,4 +1,5 @@
 import { execFileSync } from "child_process";
+import { createChildProcessEnvironment } from "../project-command-env";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "path";
@@ -164,7 +165,7 @@ export function unpackBundled(targetDir: string, force = false): { targetDir: st
   const safeTargetDir = secureScopeDir(targetDir);
   const before = new Set(readdirSync(safeTargetDir, { withFileTypes: true }).filter((entry) => entry.name.toLowerCase().endsWith(".md")).map((entry) => entry.name));
   const bin = resolveOmpBin() ?? "omp";
-  execFileSync(bin, ["agents", "unpack", "--dir", safeTargetDir, "--json", ...(force ? ["--force"] : [])], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  execFileSync(bin, ["agents", "unpack", "--dir", safeTargetDir, "--json", ...(force ? ["--force"] : [])], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"], env: createChildProcessEnvironment() });
   const after = readdirSync(safeTargetDir, { withFileTypes: true }).filter((entry) => entry.name.toLowerCase().endsWith(".md")).map((entry) => entry.name);
   const written = after.filter((name) => !before.has(name)).length;
   return { targetDir, total: after.length, written, skipped: Math.max(0, after.length - written) };

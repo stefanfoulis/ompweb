@@ -1,40 +1,95 @@
 "use client";
 
-import { memo, useCallback, useRef, useState, type Dispatch, type ReactNode, type RefObject, type SetStateAction } from "react";
+import { memo, useCallback, useId, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { AgentMessage, ExitedRpcSession, ManagedProject, ProjectLaunchConfig, SessionInfo } from "@/lib/types";
 import { formatExitedSessionNotice, useI18n } from "@/lib/i18n";
-import { comparableProjectPath } from "@/lib/comparable-path";
-import { Check, ChevronDown, ChevronRight, Folder, GitBranch, MoreHorizontal, Plus, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder, GitBranch, MessageCircleQuestion, MoreHorizontal, Pencil, Pin, Plus, Star } from "lucide-react";
 import { Tooltip } from "./ui/primitives";
 import { ConfirmDialog } from "./ui/field";
 import { copyText } from "@/lib/clipboard";
 import { transcriptToMarkdown } from "@/lib/transcript";
 import { toast } from "./ui/toast";
+import { SessionSearchMatches, type SearchMatchTarget } from "./SessionSearchMatches";
+import { hasDraft, subscribeDrafts } from "@/lib/draft-store";
 import {
   MAX_PROJECT_SESSIONS,
-  displayCwd,
   formatRelativeTime,
   projectLabel,
   type SessionTreeNode,
-  type WorktreeState,
 } from "./SessionSidebar-helpers";
 import {
-  PathLabel,
   ExitedSessionIndicator,
+  RecentlyCompletedIndicator,
   RunningSessionIndicator,
   SIDEBAR_BUTTON_TRANSITION,
+  SidebarIconButton,
   SidebarPortalMenu,
   UnreadSessionIndicator,
 } from "./SessionSidebar-chrome";
 
 /**
- * Right-edge status column shared by project headers and session rows.
+ * Shared indicator sizing; session rows keep theirs in the right-edge column.
  *
  * Keep the session indicator outside the timestamp and action controls so it
  * stays visible while the menu is open.
  */
 const SIDEBAR_STATUS_SLOT = 12;
 const SIDEBAR_STATUS_GAP = 2;
+
+/** One host's workspaces: a collapsible header (name, status dot) around the
+ *  usual project list. An unreachable host keeps its last list, dimmed, with
+ *  the reason in a tooltip; adding a workspace there is disabled. */
+function HostGroup({ name, color, statusText, unavailableReason, collapsed, onToggle, onAdd, empty, children }: {
+  name: string;
+  color: string | undefined;
+  statusText: string | null;
+  unavailableReason: string | null;
+  collapsed: boolean;
+  onToggle: () => void;
+  onAdd?: () => void;
+  /** Shown instead of the list when the host has no workspaces. */
+  empty: string | null;
+  children: ReactNode;
+}) {
+  const { t } = useI18n();
+  // The tooltip is invisible to keyboards and screen readers: say it in text too.
+  const reasonId = useId();
+  return (
+    <section aria-label={name} style={{ marginBottom: 6 }}>
+      {unavailableReason && <span id={reasonId} style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0, 0, 0, 0)", whiteSpace: "nowrap" }}>{unavailableReason}</span>}
+      <div style={{ display: "flex", alignItems: "center", gap: 2, padding: "4px 0 2px" }} title={unavailableReason ?? undefined}>
+        <button
+          type="button"
+          className="ui-focus-ring"
+          aria-expanded={!collapsed}
+          aria-describedby={unavailableReason ? reasonId : undefined}
+          aria-label={t(collapsed ? "hosts.expandGroup" : "hosts.collapseGroup", { host: name })}
+          onClick={onToggle}
+          style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 6, padding: "3px 4px", border: "none", borderRadius: 6, background: "none", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", opacity: unavailableReason ? 0.7 : 1 }}
+        >
+          <ChevronRight size={12} strokeWidth={2.2} aria-hidden="true" style={{ flexShrink: 0, transform: collapsed ? undefined : "rotate(90deg)", transition: "transform var(--dur-fast) var(--ease-out-warm)" }} />
+          <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: color ?? "var(--text-dim)" }} />
+          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, fontWeight: 600, letterSpacing: "0.04em", textTransform: "uppercase" }}>{name}</span>
+          {statusText && <span style={{ flexShrink: 0, fontSize: 10.5, color: "var(--text-dim)", textTransform: "none", letterSpacing: 0 }}>{statusText}</span>}
+        </button>
+        {onAdd && <SidebarIconButton label={t("hosts.addWorkspaceOn", { host: name })} onClick={onAdd} disabled={unavailableReason !== null}>
+          <Plus size={14} strokeWidth={1.9} aria-hidden="true" />
+        </SidebarIconButton>}
+      </div>
+      {!collapsed && (
+        <div
+          role="group"
+          aria-label={name}
+          aria-describedby={unavailableReason ? reasonId : undefined}
+          title={unavailableReason ?? undefined}
+          style={{ opacity: unavailableReason ? 0.55 : 1 }}
+        >
+          {empty ? <div style={{ padding: "6px 4px", color: "var(--text-dim)", fontSize: 11.5 }}>{empty}</div> : children}
+        </div>
+      )}
+    </section>
+  );
+}
 
 interface ProjectRowProps {
   project: ManagedProject;
@@ -46,35 +101,37 @@ interface ProjectRowProps {
   hiddenCount: number;
   selectedSessionId: string | null;
   runningSessionIds: Set<string>;
+  awaitingInputIds: Set<string>;
   unreadSessionIds: Set<string>;
+  recentlyCompletedIds?: Set<string>;
   exitedSessions: Map<string, ExitedRpcSession>;
   relativeTimeNow: number;
-  onActivate: (path: string) => void;
-  onToggleExpand: (path: string) => void;
-  onRemoveProject: (path: string) => void;
+  onActivate: (project: ManagedProject) => void;
+  onToggleExpand: (project: ManagedProject) => void;
+  onRemoveProject: (project: ManagedProject) => void;
   onEditLaunchConfig: (project: ManagedProject) => void;
-  onUpdatePresentation: (path: string, updates: { alias?: string | null; sortOrder?: number | null; launchConfig?: ProjectLaunchConfig | null }) => void;
-  onDragPathChange: (path: string | null) => void;
-  onDropProject: (path: string) => void;
-  onMoveProject: (path: string, delta: -1 | 1) => void;
+  onUpdatePresentation: (project: ManagedProject, updates: { alias?: string | null; sortOrder?: number | null; launchConfig?: ProjectLaunchConfig | null }) => Promise<void>;
+  onDragProjectChange: (project: ManagedProject | null) => void;
+  onDropProject: (project: ManagedProject) => void;
+  onMoveProject: (project: ManagedProject, delta: -1 | 1) => void;
+  /** A sort is active: show the pin toggle; only pinned rows reorder by hand. */
+  pinnable: boolean;
+  onTogglePin: (project: ManagedProject) => Promise<void>;
   isDragTarget: boolean;
   removeBusy: boolean;
   onSelectSession: (s: SessionInfo) => void;
   onRenamed?: () => void;
   onSessionDeleted?: (id: string) => void;
-  activeWorktreeSwitcher?: ReactNode;
-  /** Active worktree/branch label shown inline beside the workspace name. */
-  worktreeBranch?: string | null;
-  worktreeToggleRef?: RefObject<HTMLButtonElement | null>;
-  worktreeOpen?: boolean;
-  onToggleWorktrees?: () => void;
-  homeDir: string;
+  /** The active search query; each session row can then list its hits. */
+  searchQuery?: string;
+  onOpenSearchMatch?: (session: SessionInfo, target: SearchMatchTarget) => void;
+  /** A pinned project of a cluster member: its node's name, status text and, while its link is down, why it cannot be used. */
+  node?: { label: string; statusText?: string | null; unavailableReason?: string | null };
 }
 
 /** One project in the sidebar: a card row matching the session items' visual
- *  language, with the active project's worktree selector directly below and
- *  the project's session tree (capped at MAX_PROJECT_SESSIONS roots, with a
- *  show-more toggle) nested under it when expanded. */
+ *  language, with the project's session tree (capped at MAX_PROJECT_SESSIONS
+ *  roots, with a show-more toggle) nested under it when expanded. */
 function ProjectRow({
   project,
   isActive,
@@ -84,7 +141,9 @@ function ProjectRow({
   hiddenCount,
   selectedSessionId,
   runningSessionIds,
+  awaitingInputIds,
   unreadSessionIds,
+  recentlyCompletedIds,
   exitedSessions,
   relativeTimeNow,
   onActivate,
@@ -92,21 +151,23 @@ function ProjectRow({
   onRemoveProject,
   onEditLaunchConfig,
   onUpdatePresentation,
-  onDragPathChange,
+  onDragProjectChange,
   onDropProject,
   onMoveProject,
+  pinnable,
+  onTogglePin,
   isDragTarget,
   removeBusy,
   onSelectSession,
   onRenamed,
   onSessionDeleted,
-  activeWorktreeSwitcher,
-  worktreeBranch,
-  worktreeToggleRef,
-  worktreeOpen,
-  onToggleWorktrees,
+  searchQuery,
+  onOpenSearchMatch,
+  node,
 }: ProjectRowProps) {
   const { t } = useI18n();
+  // The title is invisible to keyboards and screen readers: say the reason in text too.
+  const reasonId = useId();
   const [hovered, setHovered] = useState(false);
   const [showAllSessions, setShowAllSessions] = useState(false);
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
@@ -132,16 +193,20 @@ function ProjectRow({
     const alias = aliasValue.trim();
     setAliasEditing(false);
     if (alias === (project.alias ?? "")) return;
-    void onUpdatePresentation(project.path, { alias });
-  }, [aliasValue, project.alias, project.path, onUpdatePresentation]);
-  const label = project.alias ?? projectLabel(project.path);
+    // The sidebar already reports failed presentation writes in a toast.
+    void onUpdatePresentation(project, { alias }).catch(() => {});
+  }, [aliasValue, project, onUpdatePresentation]);
+  const label = project.alias ?? project.name ?? projectLabel(project.path);
+  const pinned = pinnable && project.pinOrder !== undefined;
+  const canReorder = !pinnable || pinned;
   const hasActivity = Boolean(activity && (activity.running > 0 || activity.unread > 0 || activity.exited > 0));
   const visibleRoots = hiddenCount > 0 && !showAllSessions
     ? tree.slice(0, MAX_PROJECT_SESSIONS)
     : tree;
 
   return (
-    <section className="sidebar-project" data-active={isActive ? "true" : "false"} style={{ marginBottom: 12 }}>
+    <section className="sidebar-project" data-active={isActive ? "true" : "false"} style={{ marginBottom: 12, opacity: node?.unavailableReason ? 0.55 : 1 }}>
+      {node?.unavailableReason && <span id={reasonId} className="sr-only">{node.unavailableReason}</span>}
       <ConfirmDialog
         open={confirmRemove}
         onOpenChange={setConfirmRemove}
@@ -154,16 +219,16 @@ function ProjectRow({
         onConfirm={() => {
           if (removeBusy) return;
           setConfirmRemove(false);
-          onRemoveProject(project.path);
+          onRemoveProject(project);
         }}
       />
       <div
         className="sidebar-project-header"
-        draggable={!aliasEditing}
-        onDragStart={(event) => { event.dataTransfer.setData("text/plain", project.path); event.dataTransfer.effectAllowed = "move"; onDragPathChange(project.path); }}
+        draggable={!aliasEditing && canReorder}
+        onDragStart={(event) => { event.dataTransfer.setData("text/plain", project.path); event.dataTransfer.effectAllowed = "move"; onDragProjectChange(project); }}
         onDragOver={(event) => { if (isDragTarget) { event.preventDefault(); event.dataTransfer.dropEffect = "move"; } }}
-        onDrop={(event) => { event.preventDefault(); onDropProject(project.path); }}
-        onDragEnd={() => onDragPathChange(null)}
+        onDrop={(event) => { event.preventDefault(); onDropProject(project); }}
+        onDragEnd={() => onDragProjectChange(null)}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         onKeyDown={(event) => {
@@ -176,7 +241,7 @@ function ProjectRow({
           display: "flex",
           alignItems: "center",
           gap: 2,
-          height: 30,
+          minHeight: 30,
           margin: 0,
           padding: "0 6px 0 0",
           borderRadius: "var(--radius-control)",
@@ -187,163 +252,158 @@ function ProjectRow({
           ...(isDragTarget ? { outline: "1px solid var(--accent)", outlineOffset: -1 } : {}),
         }}
       >
-        {aliasEditing ? (
-          <div
-            className="sidebar-project-identity"
-            onClick={(event) => event.stopPropagation()}
-            style={{
-              flex: "0 1 auto",
-              minWidth: 0,
-              alignSelf: "stretch",
-              display: "flex",
-              alignItems: "center",
-              gap: 7,
-              padding: "0 4px 0 10px",
-            }}
-          >
-            <Folder
-              size={15}
-              strokeWidth={1.8}
-              style={{ flexShrink: 0, color: "var(--text-muted)" }}
-              aria-hidden="true"
-            />
-            <input
-              ref={aliasInputRef}
-              autoFocus
-              aria-label={t("projects.aliasPrompt")}
-              value={aliasValue}
-              onChange={(event) => setAliasValue(event.target.value)}
-              onBlur={commitAliasEdit}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  commitAliasEdit();
-                }
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  aliasCancelRef.current = true;
-                  setAliasEditing(false);
-                }
-              }}
-              style={{ flex: 1, minWidth: 0, height: 22, padding: "2px 6px", border: "1px solid var(--accent)", borderRadius: "var(--radius-control)", outline: "none", background: "var(--bg)", color: "var(--text)", fontSize: 12, fontFamily: "var(--font-mono)", fontWeight: 600 }}
-            />
-          </div>
-        ) : (
-          <Tooltip
-            content={(
-              <span style={{ display: "grid", gap: 3, maxWidth: 360, whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "var(--font-mono)", fontSize: 11 }}>
-                <strong style={{ fontFamily: "inherit", fontSize: 11 }}>{t("sessionSidebar.launchConfigDirectory")}</strong>
-                <span>{project.path}</span>
-                {project.launchConfig?.profile && <span>profile: {project.launchConfig.profile}</span>}
-                {project.launchConfig?.advisor && <span>--advisor</span>}
-                {project.launchConfig?.extraArgs?.map((arg, index) => <span key={`${arg}-${index}`}>{arg}</span>)}
-              </span>
-            )}
-            side="right"
-          >
-          <button
-            className="sidebar-project-identity"
-            onClick={() => onActivate(project.path)}
-            aria-current={isActive ? "true" : undefined}
-            title={project.path}
-            style={{
-              flex: "0 1 auto",
-              minWidth: 0,
-              alignSelf: "stretch",
-              display: "flex",
-              alignItems: "center",
-              gap: 7,
-              padding: "0 4px 0 10px",
-              background: "none", border: "none",
-              color: isActive ? "var(--text)" : hovered ? "var(--text)" : "var(--text-muted)",
-              cursor: "pointer",
-              textAlign: "left",
-            }}
-          >
-            <Folder
-              size={15}
-              strokeWidth={1.8}
-              style={{ flexShrink: 0, color: isActive ? "var(--accent)" : hovered ? "var(--text-muted)" : "var(--text-dim)", transition: "color var(--dur-fast) var(--ease-out-warm)" }}
-              aria-hidden="true"
-            />
-            <span
+        <div style={{ flex: 1, minWidth: 0, alignSelf: "stretch", display: "flex", alignItems: "center", gap: SIDEBAR_STATUS_GAP }}>
+          {aliasEditing ? (
+            <div
+              className="sidebar-project-identity"
+              onClick={(event) => event.stopPropagation()}
               style={{
+                flex: 1,
                 minWidth: 0,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-                fontFamily: "var(--font-mono)",
-                fontSize: 12,
-                fontWeight: 600,
-                letterSpacing: "-0.01em",
-                lineHeight: 1.25,
+                alignSelf: "stretch",
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+                padding: "0 4px 0 10px",
               }}
             >
-              {label}
-            </span>
-          </button>
-          </Tooltip>
-        )}
-        {worktreeBranch && worktreeToggleRef && (
-          <button
-            type="button"
-            ref={worktreeToggleRef}
-            onClick={onToggleWorktrees}
-            aria-expanded={worktreeOpen}
-            aria-haspopup="menu"
-            title={t("sessionSidebar.switchWorktreeTo", { path: worktreeBranch })}
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 5,
-              flexShrink: 0,
-              minWidth: 0,
-              maxWidth: 104,
-              height: 24,
-              padding: "0 6px",
-              border: "none",
-              borderRadius: "var(--radius-control)",
-              background: worktreeOpen ? "var(--bg-selected)" : "none",
-              color: worktreeOpen ? "var(--accent)" : hovered ? "var(--text-muted)" : "var(--text-dim)",
-              cursor: "pointer",
-              fontFamily: "var(--font-mono)",
-              fontSize: 10.5,
-              lineHeight: 1,
-              transition: "color var(--dur-fast) var(--ease-out-warm), background var(--dur-fast) var(--ease-out-warm)",
-            }}
-          >
-            <span aria-hidden="true" style={{ flexShrink: 0, opacity: 0.7 }}>·</span>
-            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{worktreeBranch}</span>
-          </button>
-        )}
-        <div style={{ flex: 1 }} />
-        {hasActivity && (
-          <span
-            aria-label={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0, exited: activity?.exited ?? 0 })}
-            title={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0, exited: activity?.exited ?? 0 })}
-            className="sidebar-project-activity"
-            data-running={(activity?.running ?? 0) > 0 ? "true" : "false"}
-            role="status"
-            aria-live="polite"
-            style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: SIDEBAR_STATUS_SLOT, height: SIDEBAR_STATUS_SLOT, flexShrink: 0, lineHeight: 0 }}
-          >
-            {(activity?.exited ?? 0) > 0 ? (
-              <ExitedSessionIndicator title={t("projects.exited", { count: activity?.exited ?? 0 })} size={11} />
-            ) : (
-              <span
+              <Folder
+                size={15}
+                strokeWidth={1.8}
+                style={{ flexShrink: 0, color: "var(--text-muted)" }}
                 aria-hidden="true"
-                className="sidebar-project-activity-dot"
-                style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--accent)" }}
               />
+              <input
+                ref={aliasInputRef}
+                autoFocus
+                aria-label={t("projects.aliasPrompt")}
+                value={aliasValue}
+                onChange={(event) => setAliasValue(event.target.value)}
+                onBlur={commitAliasEdit}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitAliasEdit();
+                  }
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    aliasCancelRef.current = true;
+                    setAliasEditing(false);
+                  }
+                }}
+                style={{ flex: 1, minWidth: 0, height: 22, padding: "2px 6px", border: "1px solid var(--accent)", borderRadius: "var(--radius-control)", outline: "none", background: "var(--bg)", color: "var(--text)", fontSize: 12, fontFamily: "var(--font-mono)", fontWeight: 600 }}
+              />
+            </div>
+          ) : (
+            <Tooltip
+              content={(
+                <span style={{ display: "grid", gap: 3, maxWidth: 360, whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "var(--font-mono)", fontSize: 11 }}>
+                  <strong style={{ fontFamily: "inherit", fontSize: 11 }}>{t("sessionSidebar.launchConfigDirectory")}</strong>
+                  <span>{project.poolId ? project.origin : project.path}</span>
+                  {project.launchConfig?.profile && <span>profile: {project.launchConfig.profile}</span>}
+                  {project.launchConfig?.advisor && <span>--advisor</span>}
+                  {project.launchConfig?.extraArgs?.map((arg, index) => <span key={`${arg}-${index}`}>{arg}</span>)}
+                </span>
+              )}
+              side="right"
+            >
+            <button
+              className="sidebar-project-identity"
+              onClick={() => onActivate(project)}
+              aria-current={isActive ? "true" : undefined}
+              title={node?.unavailableReason ? `${project.poolId ? project.origin : project.path}\n${node.unavailableReason}` : project.poolId ? project.origin : project.path}
+              aria-describedby={node?.unavailableReason ? reasonId : undefined}
+              style={{
+                flex: "0 1 auto",
+                minWidth: 0,
+                alignSelf: "stretch",
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+                padding: "0 4px 0 10px",
+                background: "none", border: "none",
+                color: isActive ? "var(--text)" : hovered ? "var(--text)" : "var(--text-muted)",
+                cursor: "pointer",
+                textAlign: "left",
+              }}
+            >
+              <Folder
+                size={15}
+                strokeWidth={1.8}
+                style={{ flexShrink: 0, color: isActive ? "var(--accent)" : hovered ? "var(--text-muted)" : "var(--text-dim)", transition: "color var(--dur-fast) var(--ease-out-warm)" }}
+                aria-hidden="true"
+              />
+              <span
+                style={{
+                  minWidth: 0,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  letterSpacing: "-0.01em",
+                  lineHeight: 1.25,
+                }}
+              >
+                {label}
+              </span>
+              {node && (
+                <>
+                  <span className="sr-only">{t("hosts.onNode", { node: node.label })}</span>
+                  <span
+                    aria-hidden="true"
+                    title={t("hosts.onNode", { node: node.label })}
+                    style={{ flexShrink: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 10.5, color: "var(--text-dim)" }}
+                  >
+                    {node.statusText ? `${node.label} · ${node.statusText}` : node.label}
+                  </span>
+                </>
+              )}
+            </button>
+            </Tooltip>
+          )}
+            {hasActivity && (
+              <span
+                aria-label={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0, exited: activity?.exited ?? 0 })}
+                title={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0, exited: activity?.exited ?? 0 })}
+                className="sidebar-project-activity"
+                data-running={(activity?.running ?? 0) > 0 ? "true" : "false"}
+                role="status"
+                aria-live="polite"
+                style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: SIDEBAR_STATUS_SLOT, height: SIDEBAR_STATUS_SLOT, flexShrink: 0, lineHeight: 0 }}
+              >
+                {(activity?.exited ?? 0) > 0 ? (
+                  <ExitedSessionIndicator title={t("projects.exited", { count: activity?.exited ?? 0 })} size={11} />
+                ) : (
+                  <span
+                    aria-hidden="true"
+                    className="sidebar-project-activity-dot"
+                    style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--accent)" }}
+                  />
+                )}
+              </span>
             )}
-          </span>
-        )}
+        </div>
         <div
           className="sidebar-project-actions"
           style={{
             flexShrink: 0,
           }}
         >
+          {pinnable && (
+            <button
+              type="button"
+              className="sidebar-project-action"
+              onClick={() => void onTogglePin(project)}
+              aria-label={t("projects.pin", { name: label })}
+              title={pinned ? t("projects.unpin", { name: label }) : t("projects.pin", { name: label })}
+              aria-pressed={pinned}
+              style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: pinned ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
+            >
+              <Pin size={13} strokeWidth={2} fill={pinned ? "currentColor" : "none"} aria-hidden="true" />
+            </button>
+          )}
           <button
             type="button"
             ref={actionButtonRef}
@@ -371,12 +431,16 @@ function ProjectRow({
             <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { onEditLaunchConfig(project); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
               {project.launchConfig ? t("sessionSidebar.editLaunchConfig") : t("sessionSidebar.configureLaunchConfig")}
             </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, -1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {t("projects.moveUp")}
-            </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, 1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {t("projects.moveDown")}
-            </button>
+            {canReorder && (
+              <>
+                <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project, -1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
+                  {t("projects.moveUp")}
+                </button>
+                <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project, 1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
+                  {t("projects.moveDown")}
+                </button>
+              </>
+            )}
             <button type="button" role="menuitem" className="sidebar-menu-item" disabled={removeBusy} onClick={() => { setActionMenuOpen(false); setConfirmRemove(true); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: removeBusy ? "default" : "pointer", textAlign: "left", fontSize: 11 }}>
               {t("projects.remove", { name: label })}
             </button>
@@ -384,10 +448,10 @@ function ProjectRow({
         </div>
         <button
           className="sidebar-project-toggle"
-          onClick={() => onToggleExpand(project.path)}
+          onClick={() => onToggleExpand(project)}
           aria-label={isExpanded ? t("projects.collapseProject", { name: label }) : t("projects.expandProject", { name: label })}
           aria-expanded={isExpanded}
-          title={isExpanded ? t("projects.collapseProjectTitle", { path: project.path }) : t("projects.expandProjectTitle", { path: project.path })}
+          title={isExpanded ? t("projects.collapseProjectTitle", { path: project.poolId ? label : project.path }) : t("projects.expandProjectTitle", { path: project.poolId ? label : project.path })}
           style={{
             display: "flex", alignItems: "center", justifyContent: "center",
             width: 22, height: 26, padding: 0, flexShrink: 0,
@@ -406,8 +470,6 @@ function ProjectRow({
         </button>
       </div>
 
-      {isActive && activeWorktreeSwitcher}
-
       {isExpanded && (
         <div className="sidebar-project-sessions" style={{ margin: "2px 0 0" }}>
           {visibleRoots.length === 0 ? (
@@ -422,12 +484,16 @@ function ProjectRow({
                   node={node}
                   selectedSessionId={selectedSessionId}
                   runningSessionIds={runningSessionIds}
+                  awaitingInputIds={awaitingInputIds}
                   unreadSessionIds={unreadSessionIds}
                   exitedSessions={exitedSessions}
+                  recentlyCompletedIds={recentlyCompletedIds}
                   relativeTimeNow={relativeTimeNow}
                   onSelectSession={onSelectSession}
                   onRenamed={onRenamed}
                   onSessionDeleted={onSessionDeleted}
+                  searchQuery={searchQuery}
+                  onOpenSearchMatch={onOpenSearchMatch}
                   depth={0}
                 />
               ))}
@@ -468,285 +534,40 @@ function ProjectRow({
     </section>
   );
 }
-interface ProjectWorktreeSwitcherProps {
-  worktreeState: WorktreeState;
-  selectedCwd: string | null;
-  homeDir: string;
-  wtDropdownOpen: boolean;
-  wtNewOpen: boolean;
-  setWtNewOpen: Dispatch<SetStateAction<boolean>>;
-  wtNewBranch: string;
-  setWtNewBranch: Dispatch<SetStateAction<string>>;
-  wtError: string | null;
-  setWtError: Dispatch<SetStateAction<string | null>>;
-  wtBusy: boolean;
-  wtConfirmRemove: string | null;
-  setWtConfirmRemove: Dispatch<SetStateAction<string | null>>;
-  onSelectWorktree: (path: string) => void;
-  onCreateWorktree: () => void;
-  onRemoveWorktree: (path: string, force: boolean) => void;
-  /** Anchor button — the inline branch label in the workspace row. */
-  anchorRef: RefObject<HTMLButtonElement | null>;
-  newInputRef: RefObject<HTMLInputElement | null>;
-  /** Closes the dropdown and resets its transient state. */
-  onClose: () => void;
-}
-
-/** Worktree dropdown for the active project; opening it exposes all checkouts.
- *  Rendered through the portal menu so it floats above every sidebar row. */
-function ProjectWorktreeSwitcher({
-  worktreeState,
-  selectedCwd,
-  homeDir,
-  wtDropdownOpen,
-  wtNewOpen,
-  setWtNewOpen,
-  wtNewBranch,
-  setWtNewBranch,
-  wtError,
-  setWtError,
-  wtBusy,
-  wtConfirmRemove,
-  setWtConfirmRemove,
-  onSelectWorktree,
-  onCreateWorktree,
-  onRemoveWorktree,
-  anchorRef,
-  newInputRef,
-  onClose,
-}: ProjectWorktreeSwitcherProps) {
-  const { t } = useI18n();
-
-  return (
-    <SidebarPortalMenu
-      anchor={anchorRef}
-      open={wtDropdownOpen}
-      onClose={onClose}
-      placement="below"
-      align="start"
-      minWidth={240}
-      style={{ overflow: "hidden" }}
-    >
-          <div style={{ maxHeight: "min(40vh, 300px)", overflowY: "auto" }}>
-            {worktreeState.worktrees.map((wt) => {
-              const foldedCwd = selectedCwd === null ? null : comparableProjectPath(selectedCwd);
-              const isCurrent = (foldedCwd !== null && comparableProjectPath(wt.path) === foldedCwd)
-                || (wt.isMain && !worktreeState.worktrees.some((w) => comparableProjectPath(w.path) === foldedCwd));
-              if (wtConfirmRemove === wt.path) {
-                return (
-                  <div key={wt.path} style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 10px", borderBottom: "1px solid var(--border)", background: "color-mix(in srgb, var(--accent) 6%, transparent)" }}>
-                    <span style={{ flex: 1, fontSize: 11, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {t("sessionSidebar.uncommittedForceRemove")}
-                    </span>
-                    <button
-                      onClick={() => onRemoveWorktree(wt.path, true)}
-                      disabled={wtBusy}
-                      style={{ padding: "3px 9px", background: "var(--accent-strong)", border: "none", borderRadius: "var(--radius-control)", color: "var(--on-accent)", fontSize: 11, fontWeight: 600, cursor: "pointer", flexShrink: 0 }}
-                    >
-                      {t("sessionSidebar.force")}
-                    </button>
-                    <button
-                      onClick={() => setWtConfirmRemove(null)}
-                      style={{ padding: "3px 9px", background: "var(--bg-hover)", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", color: "var(--text-muted)", fontSize: 11, cursor: "pointer", flexShrink: 0 }}
-                    >
-                      {t("sessionSidebar.cancel")}
-                    </button>
-                  </div>
-                );
-              }
-              return (
-                <div
-                  key={wt.path}
-                  className="wt-row"
-                  style={{ display: "flex", alignItems: "center", borderBottom: "1px solid var(--border)" }}
-                >
-                  <button
-                    onClick={() => onSelectWorktree(wt.path)}
-                    aria-pressed={isCurrent}
-                    title={wt.path}
-                    style={{
-                      flex: 1,
-                      minWidth: 0,
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 7,
-                      padding: "8px 10px",
-                      background: "var(--bg)",
-                      border: "none",
-                      color: isCurrent ? "var(--text)" : "var(--text-muted)",
-                      cursor: "pointer",
-                      textAlign: "left",
-                      fontSize: 11,
-                      fontFamily: "var(--font-mono)",
-                    }}
-                  >
-                    {isCurrent ? (
-                      <Check size={10} strokeWidth={2} style={{ flexShrink: 0, color: "var(--accent)" }} aria-hidden="true" />
-                    ) : (
-                      <span style={{ width: 10, flexShrink: 0 }} />
-                    )}
-                    <PathLabel text={wt.branch ?? displayCwd(wt.path, homeDir)} style={{ flex: 1 }} />
-                    {wt.isMain && <span style={{ flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>{t("sessionSidebar.mainBadge")}</span>}
-                  </button>
-                  {!wt.isMain && (
-                    <button
-                      onClick={() => onRemoveWorktree(wt.path, false)}
-                      disabled={wtBusy}
-                      title={t("sessionSidebar.removeWorktreeTitle", { path: wt.path })}
-                      style={{
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                        width: 34, height: 28, padding: 0, marginRight: 4,
-                        background: "none", border: "none",
-                        color: "var(--text-dim)", cursor: "pointer",
-                        borderRadius: "var(--radius-control)", flexShrink: 0,
-                        transition: "color var(--dur-fast) var(--ease-out-warm), background var(--dur-fast) var(--ease-out-warm)",
-                      }}
-                      onMouseEnter={(e) => { e.currentTarget.style.color = "var(--accent)"; e.currentTarget.style.background = "color-mix(in srgb, var(--accent) 8%, transparent)"; }}
-                      onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-dim)"; e.currentTarget.style.background = "none"; }}
-                    >
-                      <Trash2 size={12} strokeWidth={2} aria-hidden="true" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-
-          {!wtNewOpen ? (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setWtNewOpen(true);
-                setWtError(null);
-                setTimeout(() => newInputRef.current?.focus(), 0);
-              }}
-              title={t("sessionSidebar.newWorktreeTitle")}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 7,
-                width: "100%",
-                padding: "8px 10px",
-                background: "none",
-                border: "none",
-                color: "var(--text-muted)",
-                cursor: "pointer",
-                textAlign: "left",
-                fontSize: 11,
-              }}
-            >
-              <Plus size={12} strokeWidth={1.8} style={{ flexShrink: 0 }} aria-hidden="true" />
-              <span>{t("sessionSidebar.newWorktree")}</span>
-            </button>
-          ) : (
-            <div style={{ padding: "6px 8px" }}>
-              <input
-                ref={newInputRef}
-                value={wtNewBranch}
-                onChange={(e) => {
-                  setWtNewBranch(e.target.value);
-                  setWtError(null);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    onCreateWorktree();
-                  }
-                  if (e.key === "Escape") {
-                    setWtNewOpen(false);
-                    setWtNewBranch("");
-                    setWtError(null);
-                  }
-                }}
-                placeholder={t("sessionSidebar.branchNamePlaceholder")}
-                style={{
-                  width: "100%",
-                  fontSize: 11,
-                  fontFamily: "var(--font-mono)",
-                  padding: "5px 8px",
-                  border: "1px solid var(--accent)",
-                  borderRadius: "var(--radius-control)",
-                  outline: "none",
-                  background: "var(--bg)",
-                  color: "var(--text)",
-                  boxSizing: "border-box",
-                }}
-              />
-              <div style={{ display: "flex", gap: 5, marginTop: 5 }}>
-                <button
-                  onClick={onCreateWorktree}
-                  disabled={wtBusy || !wtNewBranch.trim()}
-                  style={{
-                    flex: 1,
-                    padding: "4px 0",
-                    background: "var(--accent-strong)",
-                    border: "none",
-                    borderRadius: "var(--radius-control)",
-                    color: "var(--on-accent)",
-                    fontSize: 11,
-                    fontWeight: 600,
-                    cursor: wtBusy || !wtNewBranch.trim() ? "not-allowed" : "pointer",
-                    opacity: wtBusy || !wtNewBranch.trim() ? 0.65 : 1,
-                  }}
-                >
-                  {wtBusy ? t("sessionSidebar.creating") : t("sessionSidebar.create")}
-                </button>
-                <button
-                  onClick={() => { setWtNewOpen(false); setWtNewBranch(""); setWtError(null); }}
-                  style={{
-                    flex: 1,
-                    padding: "4px 0",
-                    background: "var(--bg-hover)",
-                    border: "1px solid var(--border)",
-                    borderRadius: "var(--radius-control)",
-                    color: "var(--text-muted)",
-                    fontSize: 11,
-                    cursor: "pointer",
-                  }}
-                >
-                  {t("sessionSidebar.cancel")}
-                </button>
-              </div>
-            </div>
-          )}
-          {wtError && (
-            <div style={{
-              padding: "5px 10px 8px",
-              color: "var(--accent)",
-              fontSize: 11,
-              lineHeight: 1.35,
-              overflowWrap: "anywhere",
-            }}>
-              {wtError}
-            </div>
-          )}
-    </SidebarPortalMenu>
-  );
-}
 const SessionTreeItem = memo(function SessionTreeItem({
   node,
   selectedSessionId,
   runningSessionIds,
+  awaitingInputIds,
   unreadSessionIds,
   exitedSessions,
+  recentlyCompletedIds,
   relativeTimeNow,
   onSelectSession,
   onRenamed,
   onSessionDeleted,
+  searchQuery,
+  onOpenSearchMatch,
   depth,
 }: {
   node: SessionTreeNode;
   selectedSessionId: string | null;
   runningSessionIds: Set<string>;
+  awaitingInputIds: Set<string>;
   unreadSessionIds: Set<string>;
   exitedSessions: Map<string, ExitedRpcSession>;
+  recentlyCompletedIds?: Set<string>;
   relativeTimeNow: number;
   onSelectSession: (s: SessionInfo) => void;
   onRenamed?: () => void;
   onSessionDeleted?: (id: string) => void;
+  searchQuery?: string;
+  onOpenSearchMatch?: (session: SessionInfo, target: SearchMatchTarget) => void;
   depth: number;
 }) {
   const [collapsed, setCollapsed] = useState(false);
+  const [matchesOpen, setMatchesOpen] = useState(false);
+  if (matchesOpen && !searchQuery) setMatchesOpen(false);
   const hasChildren = node.children.length > 0;
   const sessionId = node.session.id;
 
@@ -754,7 +575,9 @@ const SessionTreeItem = memo(function SessionTreeItem({
   // check then never re-renders unless this row's flags actually changed.
   const isSelected = sessionId === selectedSessionId;
   const isRunning = runningSessionIds.has(sessionId);
+  const isAwaitingInput = awaitingInputIds.has(sessionId);
   const isUnread = unreadSessionIds.has(sessionId);
+  const isRecentlyCompleted = !isRunning && (recentlyCompletedIds?.has(sessionId) ?? false);
   const exited = exitedSessions.get(sessionId);
 
   // Stable callbacks: depend only on primitives / stable parent callbacks so
@@ -768,6 +591,12 @@ const SessionTreeItem = memo(function SessionTreeItem({
   const handleToggleCollapse = useCallback(() => {
     setCollapsed((v) => !v);
   }, []);
+  const handleToggleMatches = useCallback(() => {
+    setMatchesOpen((v) => !v);
+  }, []);
+  const handleOpenMatch = useCallback((target: SearchMatchTarget) => {
+    onOpenSearchMatch?.(node.session, target);
+  }, [onOpenSearchMatch, node.session]);
 
   return (
     <div>
@@ -787,8 +616,10 @@ const SessionTreeItem = memo(function SessionTreeItem({
           session={node.session}
           isSelected={isSelected}
           isRunning={isRunning}
+          isAwaitingInput={isAwaitingInput}
           isUnread={isUnread}
           exited={exited}
+          isRecentlyCompleted={isRecentlyCompleted}
           relativeTimeNow={relativeTimeNow}
           onClick={handleClick}
           onRenamed={onRenamed}
@@ -797,8 +628,13 @@ const SessionTreeItem = memo(function SessionTreeItem({
           hasChildren={hasChildren}
           collapsed={collapsed}
           onToggleCollapse={handleToggleCollapse}
+          matchesExpanded={matchesOpen}
+          onToggleMatches={searchQuery && onOpenSearchMatch ? handleToggleMatches : undefined}
         />
       </div>
+      {matchesOpen && searchQuery && onOpenSearchMatch && (
+        <SessionSearchMatches key={searchQuery} sessionId={sessionId} query={searchQuery} depth={depth} onOpen={handleOpenMatch} />
+      )}
       {hasChildren && !collapsed && (
         <div>
           {node.children.map((child) => (
@@ -807,12 +643,16 @@ const SessionTreeItem = memo(function SessionTreeItem({
               node={child}
               selectedSessionId={selectedSessionId}
               runningSessionIds={runningSessionIds}
+              awaitingInputIds={awaitingInputIds}
               unreadSessionIds={unreadSessionIds}
               exitedSessions={exitedSessions}
+              recentlyCompletedIds={recentlyCompletedIds}
               relativeTimeNow={relativeTimeNow}
               onSelectSession={onSelectSession}
               onRenamed={onRenamed}
               onSessionDeleted={onSessionDeleted}
+              searchQuery={searchQuery}
+              onOpenSearchMatch={onOpenSearchMatch}
               depth={depth + 1}
             />
           ))}
@@ -832,6 +672,14 @@ const SessionTreeItem = memo(function SessionTreeItem({
     const id = prev.node.session.id;
     if (prev.runningSessionIds.has(id) !== next.runningSessionIds.has(id)) return false;
   }
+  if (prev.awaitingInputIds !== next.awaitingInputIds) {
+    const id = prev.node.session.id;
+    if (prev.awaitingInputIds.has(id) !== next.awaitingInputIds.has(id)) return false;
+  }
+  if (prev.recentlyCompletedIds !== next.recentlyCompletedIds) {
+    const id = prev.node.session.id;
+    if ((prev.recentlyCompletedIds?.has(id) ?? false) !== (next.recentlyCompletedIds?.has(id) ?? false)) return false;
+  }
   if (prev.unreadSessionIds !== next.unreadSessionIds) {
     const id = prev.node.session.id;
     if (prev.unreadSessionIds.has(id) !== next.unreadSessionIds.has(id)) return false;
@@ -840,15 +688,19 @@ const SessionTreeItem = memo(function SessionTreeItem({
   if (prev.relativeTimeNow !== next.relativeTimeNow) return false;
   if (prev.onSelectSession !== next.onSelectSession
     || prev.onRenamed !== next.onRenamed
-    || prev.onSessionDeleted !== next.onSessionDeleted) return false;
+    || prev.onSessionDeleted !== next.onSessionDeleted
+    || prev.searchQuery !== next.searchQuery
+    || prev.onOpenSearchMatch !== next.onOpenSearchMatch) return false;
   return true;
 });
 const SessionItem = memo(function SessionItem({
   session,
   isSelected,
   isRunning,
+  isAwaitingInput,
   isUnread,
   exited,
+  isRecentlyCompleted,
   onClick,
   onRenamed,
   onDeleted,
@@ -857,12 +709,17 @@ const SessionItem = memo(function SessionItem({
   collapsed = false,
   relativeTimeNow,
   onToggleCollapse,
+  matchesExpanded = false,
+  onToggleMatches,
+  workspaceLabel,
 }: {
   session: SessionInfo;
   isSelected: boolean;
   isRunning?: boolean;
+  isAwaitingInput?: boolean;
   isUnread?: boolean;
   exited?: ExitedRpcSession;
+  isRecentlyCompleted?: boolean;
   onClick: () => void;
   onRenamed?: () => void;
   onDeleted?: (id: string) => void;
@@ -871,6 +728,12 @@ const SessionItem = memo(function SessionItem({
   relativeTimeNow: number;
   collapsed?: boolean;
   onToggleCollapse?: () => void;
+  /** Present while a search is active: shows the session's hits below the row. */
+  matchesExpanded?: boolean;
+  onToggleMatches?: () => void;
+  /** Workspace name shown beside the title; set by the flat Current/Pinned
+   *  list, where rows are not nested under a workspace row. */
+  workspaceLabel?: string;
 }) {
   const { t, locale } = useI18n();
   const exitTitle = exited ? formatExitedSessionNotice(exited) : "";
@@ -880,16 +743,42 @@ const SessionItem = memo(function SessionItem({
   const renameCancelRef = useRef(false);
  const [confirmDelete, setConfirmDelete] = useState(false);
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
+  const [menuPoint, setMenuPoint] = useState<{ x: number; y: number } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const contentButtonRef = useRef<HTMLButtonElement>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const title = session.name || session.firstMessage.slice(0, 50) || session.id.slice(0, 12);
+  // A session's composer draft is keyed by its id (ChatWindow's `draftKey`).
+  const hasUnsentDraft = useSyncExternalStore(subscribeDrafts, () => hasDraft(session.id), () => false);
   const relativeTime = formatRelativeTime(session.modified, locale, relativeTimeNow);
   const rowBackground = isSelected
     ? "color-mix(in srgb, var(--bg-selected) 70%, transparent)"
     : hovered ? "var(--bg-hover)" : "transparent";
 
+  // The pin is server state reached through the session list, so the row
+  // carries its own answer until a refreshed list confirms it: `from` is the
+  // value the list showed when the user clicked, and the moment the list says
+  // something else the override is stale and the list wins again.
+  const serverPinned = session.pinned === true;
+  const [pinOverride, setPinOverride] = useState<{ from: boolean; to: boolean } | null>(null);
+  const pinned = pinOverride?.from === serverPinned ? pinOverride.to : serverPinned;
+  const togglePinned = useCallback(async () => {
+    const next = !pinned;
+    setPinOverride({ from: serverPinned, to: next });
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/pin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pinned: next }),
+      });
+      if (!response.ok) throw new Error("Session pin failed");
+      onRenamed?.();
+    } catch {
+      setPinOverride(null);
+      toast.error(next ? t("sessionSidebar.pinFailed") : t("sessionSidebar.unpinFailed"));
+    }
+  }, [pinned, serverPinned, session.id, onRenamed, t]);
   const startRename = useCallback((event: React.MouseEvent) => {
     event.stopPropagation();
     setRenameValue(session.name ?? "");
@@ -929,6 +818,8 @@ const SessionItem = memo(function SessionItem({
  toast.error(t("sessionSidebar.archiveFailed"));
  }
  }, [session.id, onDeleted, t]);
+  const archiveBlocked = hasChildren;
+  const archiveTitle = hasChildren ? t("sessionSidebar.archiveLeafOnly") : t("sessionSidebar.archive");
 
   const handleDelete = useCallback(async () => {
     if (deleting) return;
@@ -971,10 +862,24 @@ const SessionItem = memo(function SessionItem({
     <>
     <div
       className="session-item-row"
+      onContextMenu={(event) => {
+        if (renaming || confirmDelete || deleting) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setMenuPoint({ x: event.clientX, y: event.clientY });
+        setActionMenuOpen(true);
+      }}
  onClick={confirmDelete || renaming ? undefined : onClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onKeyDown={(event) => {
+        if (!renaming && !confirmDelete && !deleting
+          && (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))) {
+          event.preventDefault();
+          event.stopPropagation();
+          setMenuPoint(null);
+          setActionMenuOpen(true);
+        }
         if ((confirmDelete || actionMenuOpen) && event.key === "Escape") {
           event.stopPropagation();
           closeConfirmation();
@@ -1011,26 +916,53 @@ const SessionItem = memo(function SessionItem({
           }}
         />
       )}
+      {onToggleMatches && !renaming && (
+        <button
+          type="button"
+          className="session-item-icon-button"
+          onClick={(event) => { event.stopPropagation(); onToggleMatches(); }}
+          title={matchesExpanded ? t("sessionSidebar.hideMatches") : t("sessionSidebar.showMatches")}
+          aria-label={matchesExpanded ? t("sessionSidebar.hideMatches") : t("sessionSidebar.showMatches")}
+          aria-expanded={matchesExpanded}
+          style={{ position: "absolute", left: depth * 14, top: 3, display: "flex", alignItems: "center", justifyContent: "center", width: 20, height: 24, padding: 0, border: "none", background: "none", color: "var(--text-dim)", cursor: "pointer" }}
+        >
+          <ChevronRight size={12} strokeWidth={1.8} aria-hidden="true" style={{ transform: matchesExpanded ? "rotate(90deg)" : "none", transition: "transform var(--dur-fast) var(--ease-out-warm)" }} />
+        </button>
+      )}
       {renaming ? (
         <input ref={inputRef} autoFocus aria-label={t("sessionSidebar.rename")} value={renameValue} onChange={(event) => setRenameValue(event.target.value)} onBlur={commitRename} onKeyDown={(event) => { if (event.key === "Enter") void commitRename(); if (event.key === "Escape") { event.preventDefault(); renameCancelRef.current = true; setRenaming(false); } }} style={{ flex: 1, height: 25, padding: "3px 7px", border: "1px solid var(--accent)", borderRadius: "var(--radius-control)", outline: "none", background: "var(--bg)", color: "var(--text)", fontSize: 12 }} />
       ) : (
         <>
           {depth > 0 && <GitBranch size={11} strokeWidth={2} style={{ flexShrink: 0, color: "var(--text-dim)" }} aria-hidden="true" />}
-          <button ref={contentButtonRef} type="button" className="session-item-button" aria-current={isSelected ? "true" : undefined} onKeyDown={(event) => { if (event.key === "Delete" && !deleting) { event.preventDefault(); setConfirmDelete(true); } }} style={{ display: "flex", alignItems: "center", flex: 1, minWidth: 0 }}>
+          <button ref={contentButtonRef} type="button" className="session-item-button" aria-current={isSelected ? "true" : undefined} onKeyDown={(event) => { if (event.key === "Delete" && !deleting) { event.preventDefault(); setConfirmDelete(true); } }} style={{ display: "flex", alignItems: "center", gap: 5, flex: 1, minWidth: 0 }}>
+            {pinned && <Star size={10} strokeWidth={2} fill="currentColor" aria-label={t("sessionSidebar.pinned")} style={{ flexShrink: 0, color: "var(--text-dim)" }} />}
             <span title={title} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 12.5, fontWeight: isSelected ? 600 : 500, lineHeight: 1.35, letterSpacing: "-0.005em" }}>
               {title}
             </span>
+            {isAwaitingInput && (
+              <span role="img" title={t("sessionSidebar.awaitingInput")} aria-label={t("sessionSidebar.awaitingInput")} style={{ display: "inline-flex", flexShrink: 0, marginLeft: 5, color: "var(--accent)" }}>
+                <MessageCircleQuestion size={11} strokeWidth={2.2} aria-hidden="true" />
+              </span>
+            )}
+            {hasUnsentDraft && (
+              <span role="img" title={t("sessionSidebar.unsentDraft")} aria-label={t("sessionSidebar.unsentDraft")} style={{ display: "inline-flex", flexShrink: 0, marginLeft: 5, color: "var(--accent)" }}>
+                <Pencil size={11} strokeWidth={2.2} aria-hidden="true" />
+              </span>
+            )}
           </button>
+          {workspaceLabel && <span title={workspaceLabel} style={{ maxWidth: 72, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 10, flexShrink: 1 }}>{workspaceLabel}</span>}
           {session.worktreeBranch && <span title={t("sessionSidebar.worktreeTitle", { path: session.cwd })} style={{ display: "flex", alignItems: "center", gap: 3, maxWidth: 56, minWidth: 0, overflow: "hidden", color: "var(--text-dim)", fontSize: 10, flexShrink: 1 }}><GitBranch size={10} strokeWidth={2.4} aria-hidden="true" /><span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.worktreeBranch}</span></span>}
           {hasChildren && <button className="session-item-icon-button" onClick={(event) => { event.stopPropagation(); onToggleCollapse?.(); }} title={collapsed ? t("sessionSidebar.expandForks") : t("sessionSidebar.collapseForks")} aria-label={collapsed ? t("sessionSidebar.expandForks") : t("sessionSidebar.collapseForks")} aria-expanded={!collapsed} style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, flexShrink: 0, border: "none", background: "none", color: "var(--text-dim)", cursor: "pointer", transform: collapsed ? "rotate(-90deg)" : "none", transition: "transform var(--dur-fast) var(--ease-out-warm)" }}><ChevronDown size={12} strokeWidth={1.8} aria-hidden="true" /></button>}
           <div style={{ display: "flex", alignItems: "center", gap: SIDEBAR_STATUS_GAP, flexShrink: 0 }}>
-            {(isRunning || exited || isUnread) && (
+            {(isRunning || exited || isRecentlyCompleted || isUnread) && (
               <span style={{ display: "flex", alignItems: "center", justifyContent: "center", width: SIDEBAR_STATUS_SLOT, height: SIDEBAR_STATUS_SLOT, flexShrink: 0 }}>
                 {isRunning
                   ? <RunningSessionIndicator size={12} />
                   : exited
                     ? <ExitedSessionIndicator title={exitTitle} size={12} />
-                    : <UnreadSessionIndicator size={11} />}
+                    : isRecentlyCompleted
+                      ? <RecentlyCompletedIndicator size={12} />
+                      : <UnreadSessionIndicator size={11} />}
               </span>
             )}
             <div className="session-item-trailing" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", flexShrink: 0 }}>
@@ -1038,14 +970,15 @@ const SessionItem = memo(function SessionItem({
                 {relativeTime && <span className="session-item-time" title={new Date(session.modified).toLocaleString(locale)} style={{ flexShrink: 0, whiteSpace: "nowrap", textAlign: "right", color: isSelected ? "var(--accent)" : "var(--text-dim)", fontSize: 10, fontVariantNumeric: "tabular-nums" }}>{relativeTime}</span>}
               </div>
               <div className="session-item-actions" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
-                <button type="button" ref={menuButtonRef} className="session-item-icon-button session-item-menu-button" onClick={(event) => { event.stopPropagation(); setActionMenuOpen((open) => !open); }} title={t("projects.actions")} aria-label={t("projects.actions")} aria-expanded={actionMenuOpen} style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 0, lineHeight: 0, border: "none", borderRadius: "var(--radius-control)", background: actionMenuOpen ? "var(--bg-selected)" : "transparent", color: actionMenuOpen ? "var(--text)" : "var(--text-dim)", cursor: "pointer" }}>
+                <button type="button" ref={menuButtonRef} className="session-item-icon-button session-item-menu-button" onClick={(event) => { event.stopPropagation(); setMenuPoint(null); setActionMenuOpen((open) => !open); }} title={t("projects.actions")} aria-label={t("projects.actions")} aria-expanded={actionMenuOpen} style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 0, lineHeight: 0, border: "none", borderRadius: "var(--radius-control)", background: actionMenuOpen ? "var(--bg-selected)" : "transparent", color: actionMenuOpen ? "var(--text)" : "var(--text-dim)", cursor: "pointer" }}>
                   <MoreHorizontal size={14} strokeWidth={2} aria-hidden="true" />
                 </button>
-                <SidebarPortalMenu anchor={menuButtonRef} open={actionMenuOpen} onClose={() => setActionMenuOpen(false)} placement="below" minWidth={128}>
- <button type="button" role="menuitem" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleArchive(); }} disabled={hasChildren} title={hasChildren ? t("sessionSidebar.archiveLeafOnly") : t("sessionSidebar.archive")} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: hasChildren ? "var(--text-dim)" : "var(--text-muted)", cursor: hasChildren ? "not-allowed" : "pointer", textAlign: "left", fontSize: 11, opacity: hasChildren ? 0.55 : 1 }}>{t("sessionSidebar.archive")}</button>
-                  <button type="button" role="menuitem" className="sidebar-menu-item" onClick={(event) => { startRename(event); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>{t("sessionSidebar.rename")}</button>
-                  <button type="button" role="menuitem" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleCopyTranscript(); }} disabled={copyingTranscript} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: copyingTranscript ? "default" : "pointer", textAlign: "left", fontSize: 11, opacity: copyingTranscript ? 0.55 : 1 }}>{t("sessionSidebar.copyTranscript")}</button>
-                  <button type="button" role="menuitem" className="sidebar-menu-item" disabled={deleting} onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); setConfirmDelete(true); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>{t("sessionSidebar.delete")}</button>
+                <SidebarPortalMenu anchor={menuButtonRef} open={actionMenuOpen} onClose={() => setActionMenuOpen(false)} placement="below" point={menuPoint} minWidth={150}>
+                  <button type="button" role="menuitem" data-menu-shortcut="p" aria-keyshortcuts="P" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void togglePinned(); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontSize: 11 }}><span>{pinned ? t("sessionSidebar.unpin") : t("sessionSidebar.pin")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>P</kbd></button>
+ <button type="button" role="menuitem" data-menu-shortcut="a" aria-keyshortcuts="A" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleArchive(); }} disabled={archiveBlocked} title={archiveTitle} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: archiveBlocked ? "var(--text-dim)" : "var(--text-muted)", cursor: archiveBlocked ? "not-allowed" : "pointer", textAlign: "left", fontSize: 11, opacity: archiveBlocked ? 0.55 : 1 }}><span>{t("sessionSidebar.archive")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>A</kbd></button>
+                  <button type="button" role="menuitem" data-menu-shortcut="r" aria-keyshortcuts="R" className="sidebar-menu-item" onClick={(event) => { startRename(event); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontSize: 11 }}><span>{t("sessionSidebar.rename")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>R</kbd></button>
+                  <button type="button" role="menuitem" data-menu-shortcut="c" aria-keyshortcuts="C" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleCopyTranscript(); }} disabled={copyingTranscript} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: copyingTranscript ? "default" : "pointer", textAlign: "left", fontSize: 11, opacity: copyingTranscript ? 0.55 : 1 }}><span>{t("sessionSidebar.copyTranscript")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>C</kbd></button>
+                  <button type="button" role="menuitem" data-menu-shortcut="d" aria-keyshortcuts="D" className="sidebar-menu-item" disabled={deleting} onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); setConfirmDelete(true); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: "pointer", textAlign: "left", fontSize: 11 }}><span>{t("sessionSidebar.delete")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>D</kbd></button>
                 </SidebarPortalMenu>
               </div>
             </div>
@@ -1068,10 +1001,9 @@ const SessionItem = memo(function SessionItem({
   );
 });
 export {
+  HostGroup,
   ProjectRow,
-  ProjectWorktreeSwitcher,
   SessionItem,
   SessionTreeItem,
   type ProjectRowProps,
-  type ProjectWorktreeSwitcherProps,
 };

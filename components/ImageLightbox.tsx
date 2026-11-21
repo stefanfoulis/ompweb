@@ -1,16 +1,34 @@
 "use client";
 
-import { useEffect, useRef, useState, type ImgHTMLAttributes } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ImgHTMLAttributes } from "react";
 import { createPortal } from "react-dom";
+import { Maximize } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 
-const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 8;
-const ZOOM_STEP = 0.25;
+/** Lowest zoom when the fitted size is larger; big images can go below it down to their fit. */
+const ZOOM_FLOOR = 0.1;
+const ZOOM_FACTOR = 1.25;
+
+interface Size { width: number; height: number }
+
+/** Scale that fits `image` inside `box`; never above 1, so small images keep their real size. */
+export function fitZoom(image: Size, box: Size): number {
+  if (image.width <= 0 || image.height <= 0 || box.width <= 0 || box.height <= 0) return 1;
+  return Math.min(1, box.width / image.width, box.height / image.height);
+}
+
+/** One zoom step in or out, clamped to [min(fit, 10%), 800%]. */
+export function stepZoom(zoom: number, direction: 1 | -1, fit: number): number {
+  const next = direction > 0 ? zoom * ZOOM_FACTOR : zoom / ZOOM_FACTOR;
+  return Math.min(ZOOM_MAX, Math.max(Math.min(fit, ZOOM_FLOOR), next));
+}
 
 interface ClickableImageProps extends Omit<ImgHTMLAttributes<HTMLImageElement>, "src"> {
   /** Image source: string URL (data:, http(s):, blob:, /api/files/...) or Blob. */
   src: ImgHTMLAttributes<HTMLImageElement>["src"];
+  /** Larger image for the lightbox when `src` is only a preview. */
+  fullSrc?: string;
 }
 
 /**
@@ -22,7 +40,7 @@ interface ClickableImageProps extends Omit<ImgHTMLAttributes<HTMLImageElement>, 
  * object URL that is revoked when the source changes or the component unmounts
  * — the same mechanism React's experimental `enableSrcObject` will use natively.
  */
-export function ClickableImage({ src, alt, ...imgProps }: ClickableImageProps) {
+export function ClickableImage({ src, fullSrc, alt, ...imgProps }: ClickableImageProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
@@ -57,7 +75,6 @@ export function ClickableImage({ src, alt, ...imgProps }: ClickableImageProps) {
         aria-label={alt ? t("imagePreview.openWithAlt", { alt }) : t("imagePreview.open")}
         title={alt ? t("imagePreview.openWithAlt", { alt }) : t("imagePreview.open")}
       >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={resolvedSrc} alt={alt ?? ""} loading="lazy" {...imgProps} />
       </button>
       {/*
@@ -67,15 +84,64 @@ export function ClickableImage({ src, alt, ...imgProps }: ClickableImageProps) {
         renders when `open`, which is strictly client-side — the short-circuit
         keeps `document.body` off the SSR path.
       */}
-      {open && createPortal(<ImageLightbox src={resolvedSrc} alt={alt ?? ""} onClose={() => setOpen(false)} />, document.body)}
+      {open && createPortal(<ImageLightbox src={fullSrc ?? resolvedSrc} alt={alt ?? ""} onClose={() => setOpen(false)} />, document.body)}
     </>
   );
 }
 
 function ImageLightbox({ src, alt, onClose }: { src: ClickableImageProps["src"]; alt: string; onClose: () => void }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
-  const [zoom, setZoom] = useState(1);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  // "fit" follows the window as it resizes; a number is a zoom the user chose.
+  const [zoom, setZoom] = useState<number | "fit">("fit");
+  const [natural, setNatural] = useState<Size | null>(null);
+  // Load finished either way: a broken image is shown as the browser renders it.
+  const [settled, setSettled] = useState(false);
+  const [box, setBox] = useState<Size | null>(null);
+  // Centre of the view as a fraction of the content, kept across a zoom change.
+  const anchorRef = useRef<{ x: number; y: number } | null>(null);
+  const [uiScale, setUiScale] = useState(1);
   const { t } = useI18n();
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    // Interface Scale zooms the root, so layout pixels are uiScale screen
+    // pixels. Measure in screen pixels so 100% is one image pixel per pixel.
+    const uiScale = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--ui-scale")) || 1;
+    setUiScale(uiScale);
+    // contentRect excludes the viewport padding, so "fit" leaves the margin visible.
+    const observer = new ResizeObserver(([entry]) => {
+      setBox({ width: entry.contentRect.width * uiScale, height: entry.contentRect.height * uiScale });
+    });
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, []);
+
+  const ready = natural !== null && box !== null;
+  const fit = ready ? fitZoom(natural, box) : 1;
+  const scale = zoom === "fit" ? fit : zoom;
+  const minZoom = Math.min(fit, ZOOM_FLOOR);
+
+  const zoomTo = (next: number | "fit") => {
+    const viewport = viewportRef.current;
+    if (viewport) {
+      anchorRef.current = {
+        x: (viewport.scrollLeft + viewport.clientWidth / 2) / viewport.scrollWidth,
+        y: (viewport.scrollTop + viewport.clientHeight / 2) / viewport.scrollHeight,
+      };
+    }
+    setZoom(next);
+  };
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    const anchor = anchorRef.current;
+    if (!viewport || !anchor) return;
+    anchorRef.current = null;
+    viewport.scrollLeft = anchor.x * viewport.scrollWidth - viewport.clientWidth / 2;
+    viewport.scrollTop = anchor.y * viewport.scrollHeight - viewport.clientHeight / 2;
+  }, [scale]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -123,8 +189,8 @@ function ImageLightbox({ src, alt, onClose }: { src: ClickableImageProps["src"];
             <div className="image-lightbox-stepper">
               <button
                 type="button"
-                onClick={() => setZoom((value) => Math.max(ZOOM_MIN, value - ZOOM_STEP))}
-                disabled={zoom <= ZOOM_MIN}
+                onClick={() => zoomTo(stepZoom(scale, -1, fit))}
+                disabled={!ready || scale <= minZoom}
                 title={t("imagePreview.zoomOut")}
                 aria-label={t("imagePreview.zoomOut")}
               >
@@ -132,11 +198,11 @@ function ImageLightbox({ src, alt, onClose }: { src: ClickableImageProps["src"];
                   <path d="M5 12h14" />
                 </svg>
               </button>
-              <span className="image-lightbox-zoom-value">{Math.round(zoom * 100)}%</span>
+              <span className="image-lightbox-zoom-value" aria-hidden={!ready}>{ready ? `${Math.round(scale * 100)}%` : "…"}</span>
               <button
                 type="button"
-                onClick={() => setZoom((value) => Math.min(ZOOM_MAX, value + ZOOM_STEP))}
-                disabled={zoom >= ZOOM_MAX}
+                onClick={() => zoomTo(stepZoom(scale, 1, fit))}
+                disabled={!ready || scale >= ZOOM_MAX}
                 title={t("imagePreview.zoomIn")}
                 aria-label={t("imagePreview.zoomIn")}
               >
@@ -148,13 +214,22 @@ function ImageLightbox({ src, alt, onClose }: { src: ClickableImageProps["src"];
             <button
               type="button"
               className="image-lightbox-icon-button"
-              onClick={() => setZoom(1)}
-              title={t("imagePreview.resetZoom")}
-              aria-label={t("imagePreview.resetZoom")}
+              onClick={() => zoomTo("fit")}
+              aria-pressed={zoom === "fit"}
+              title={t("imagePreview.fitToScreen")}
+              aria-label={t("imagePreview.fitToScreen")}
             >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
-              </svg>
+              <Maximize size={13} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="image-lightbox-icon-button image-lightbox-actual-size"
+              onClick={() => zoomTo(1)}
+              aria-pressed={zoom === 1}
+              title={t("imagePreview.actualSize")}
+              aria-label={t("imagePreview.actualSize")}
+            >
+              1:1
             </button>
             <button
               type="button"
@@ -170,19 +245,28 @@ function ImageLightbox({ src, alt, onClose }: { src: ClickableImageProps["src"];
           </div>
         </div>
         <div
+          ref={viewportRef}
           className="image-lightbox-viewport"
           onClick={(event) => {
             if (event.target === event.currentTarget) onClose();
           }}
         >
-          {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={src}
             alt={alt}
             className="image-lightbox-img"
-            // `zoom` is non-standard (a no-op in Firefox < 126); transform
-            // scale is composited and supported everywhere.
-            style={{ transform: `scale(${zoom})` }}
+            onLoad={(event) => {
+              const { naturalWidth: width, naturalHeight: height } = event.currentTarget;
+              // Some engines report 0×0 for SVGs without an intrinsic size: show those unsized.
+              if (width > 0 && height > 0) setNatural({ width, height });
+              setSettled(true);
+            }}
+            onError={() => setSettled(true)}
+            // Real layout size, not transform: scale, so a zoomed-in image
+            // scrolls to every edge. Hidden until it can be sized to fit.
+            style={ready
+              ? { width: natural.width * scale / uiScale, height: natural.height * scale / uiScale }
+              : settled ? undefined : { visibility: "hidden" }}
           />
         </div>
       </div>

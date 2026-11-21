@@ -1,0 +1,502 @@
+import { randomUUID } from "node:crypto";
+import type { HostToolDefinition } from "./pi-types";
+import { formatSessionOriginHeader, type MessageOrigin, type SessionOriginRef } from "./message-origin";
+import type { AgentConfirmPayload } from "./types";
+import { isRecord } from "./type-guards";
+import { startsUnasked, type AgentToolHost } from "./agent-tool-hosts";
+import { GITHUB_TOOL_DEFINITIONS, GITHUB_TOOL_NAMES, executeGithubTool, type GithubToolOps } from "./github/tools";
+
+/**
+ * Server-side agent tools for issue #275: tools an agent running inside
+ * omp-web can call to reach *other* top-level omp-web sessions. omp's own
+ * `task` tool and `write agent://<id>` only work inside one omp process,
+ * so cross-session work has to be answered by the omp-web server itself —
+ * never by an attached browser tab (the issue's key requirement: these
+ * tools keep working with no tab open).
+ *
+ * This module is deliberately pure: it knows nothing about RpcProcess,
+ * the session registry, or the session files. The caller (lib/rpc-manager)
+ * supplies those through AgentToolSessionOps, which keeps the validation,
+ * gating, attribution and loop-guard logic unit-testable without a live
+ * omp child. The only omp-web surface this module touches is the
+ * HostToolDefinition shape omp already understands for set_host_tools.
+ */
+
+/** Tools the server answers itself. Browser-routed tools are unaffected. */
+export const AGENT_TOOL_NAMES = new Set(["list_sessions", "new_session", "send_to_session", ...GITHUB_TOOL_NAMES]);
+
+export const AGENT_TOOL_DEFINITIONS: HostToolDefinition[] = [
+  {
+    name: "list_sessions",
+    description:
+      "List omp-web sessions on every host (ID, name, working directory, host, running or idle) so send_to_session can address one without the user copying IDs.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "new_session",
+    description:
+      "Start an independent omp-web session. Registered pooled projects receive an isolated worktree on an eligible worker. Set shareWorkspace to keep unpublished parent workspace dependencies on the calling session's owner. Returns its session ID.",
+    parameters: {
+      type: "object",
+      properties: {
+        cwd: { type: "string", description: "Project directory. Defaults to the calling session's directory." },
+        prompt: { type: "string", description: "First message for the new session. If omitted, the session is created idle." },
+        model: { type: "string", description: "Model as \"provider/modelId\", e.g. \"anthropic/claude-sonnet-4-5\"." },
+        provider: { type: "string", description: "Model provider, used with modelId instead of model." },
+        modelId: { type: "string", description: "Model ID, used with provider instead of model." },
+        name: { type: "string", description: "Display name for the new session." },
+        host: { type: "string", description: "Explicit host id or label from list_sessions. Omit to place independent pooled work automatically; standalone projects stay on the calling session's host." },
+        shareWorkspace: { type: "boolean", description: "Keep the new session on the calling session's host and exact directory when it depends on unpublished parent work. Defaults to false." },
+      },
+    },
+  },
+  {
+    name: "send_to_session",
+    description:
+      "Send a message to another omp-web session by ID. If the target is not running it is resumed first, as when a user opens it. Delivered messages carry trusted source metadata and explicitly tell the receiving agent they were not typed by the user.",
+    parameters: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string", description: "Target session ID (see list_sessions)." },
+        message: { type: "string", description: "Message to deliver to the target session." },
+        delivery: {
+          type: "string",
+          description:
+            "How to deliver while the target is running: \"prompt\" starts a new turn (only when the target is idle), \"steer\" steers the running turn, \"followUp\" queues after it. Defaults to \"prompt\".",
+          enum: ["prompt", "steer", "followUp"],
+        },
+        wait: {
+          type: "boolean",
+          description:
+            "When true, wait for the target turn to finish (up to waitTimeoutMs) and return its final assistant text. When false, return as soon as the target accepts the message.",
+        },
+        waitTimeoutMs: { type: "number", description: "Maximum wait for a waited delivery, in milliseconds. Defaults to 120000, capped at 300000." },
+      },
+      required: ["sessionId", "message"],
+    },
+  },
+  ...GITHUB_TOOL_DEFINITIONS,
+];
+
+/** A message that would also be rejected by the HTTP body limit is too big to relay. */
+export const MAX_AGENT_TOOL_MESSAGE_CHARS = 100_000;
+/** Per-source rate cap: a runaway agent cannot spam sessions faster than this. */
+export const MAX_AGENT_TOOL_CALLS_PER_MINUTE = 20;
+/**
+ * Chain-depth cap: a delivery from session A to session B makes B's depth
+ * A's depth + 1. A ping-pong (A→B→A→B…) therefore stops at the cap instead
+ * of looping forever. A session never touched by an agent tool has depth 0.
+ */
+export const MAX_AGENT_TOOL_CHAIN_DEPTH = 5;
+export const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
+export const MAX_WAIT_TIMEOUT_MS = 300_000;
+
+export interface AgentToolSessionSummary {
+  id: string;
+  name?: string;
+  cwd?: string;
+  running: boolean;
+  /** The host's label. */
+  host: string;
+}
+
+/** A session as the ops layer lists it; executeAgentTool names its host. */
+export type AgentToolSessionRow = Omit<AgentToolSessionSummary, "host"> & { hostId: string };
+
+export interface AgentToolCreateSessionInput {
+  cwd: string;
+  hostId: string;
+  explicitHost: boolean;
+  shareWorkspace: boolean;
+  /** Already sender-attributed by executeAgentTool, or null for an idle session. */
+  prompt: string | null;
+  clientMessageId?: string;
+  origin?: MessageOrigin;
+  provider?: string;
+  modelId?: string;
+  name?: string;
+}
+
+export interface AgentToolDeliverInput {
+  sessionId: string;
+  /** Already sender-attributed by executeAgentTool. */
+  message: string;
+  clientMessageId: string;
+  origin: MessageOrigin;
+  delivery: "prompt" | "steer" | "followUp";
+  wait: boolean;
+  waitTimeoutMs: number;
+}
+
+export interface AgentToolDeliverResult {
+  accepted: boolean;
+  targetSessionId: string;
+  delivery: "prompt" | "steer" | "followUp";
+  targetSessionName?: string | null;
+  targetSession?: SessionOriginRef | null;
+  /** True only when wait was requested and the turn actually finished. */
+  waited: boolean;
+  /** Final assistant text of the waited turn, or null when wait was false. */
+  responseText: string | null;
+}
+
+export interface AgentToolCreateSessionResult {
+  sessionId: string;
+  sessionName: string | null;
+  session: SessionOriginRef;
+}
+
+/** Session operations supplied by lib/rpc-manager; fakes replace them in tests. */
+export interface AgentToolSessionOps {
+  listSessions(): Promise<AgentToolSessionRow[]>;
+  listHosts(): AgentToolHost[];
+  /** Authorize the actual physical owner before any preparation or spawn. */
+  createSession(input: AgentToolCreateSessionInput, authorize: (host: AgentToolHost) => Promise<boolean>): Promise<AgentToolCreateSessionResult>;
+  deliver(input: AgentToolDeliverInput): Promise<AgentToolDeliverResult>;
+  /** The host a session lives on; null when no host has it. */
+  sessionHostId(sessionId: string): Promise<string | null>;
+  /** The GitHub tools' `gh` runner, host list and write setting. */
+  github: GithubToolOps;
+}
+
+export interface AgentToolContext {
+  sourceSessionId: string;
+  sourceSessionName: string | null;
+  /** Native host_tool_call identity, retained unchanged across replay. */
+  sourceRequestId: string;
+  sourceCwd: string;
+  /** The host the calling session runs on; "local" is this machine. */
+  sourceHostId: string;
+  sourceHostLabel: string;
+  /** The off-by-default Settings gate (lib/web-settings agentToolsEnabled). */
+  enabled: boolean;
+  guard: AgentToolGuard;
+  /** Ask the calling session's user; resolves false when declined or the dialog is dropped. */
+  confirm(title: string, payload?: AgentConfirmPayload): Promise<boolean>;
+  /** Aborted by omp's host_tool_cancel for this call; a GitHub write checks it last, before posting. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Loop + spam guard. Two independent mechanisms, because neither alone
+ * stops every loop: the rate cap stops a fast ping-pong, and the chain
+ * depth stops a slow one that would otherwise run for hours.
+ */
+export class AgentToolGuard {
+  private callsBySource = new Map<string, number[]>();
+  private depthBySession = new Map<string, number>();
+  private readonly now: () => number;
+
+  constructor(now: () => number = Date.now) {
+    this.now = now;
+  }
+
+  /** Throws when the source already used its per-minute budget. */
+  checkRate(sourceSessionId: string): void {
+    const now = this.now();
+    const recent = (this.callsBySource.get(sourceSessionId) ?? []).filter((t) => now - t < 60_000);
+    if (recent.length >= MAX_AGENT_TOOL_CALLS_PER_MINUTE) {
+      throw new Error(
+        `Agent tool rate limit exceeded for this session (${MAX_AGENT_TOOL_CALLS_PER_MINUTE} calls per minute).`,
+      );
+    }
+    recent.push(now);
+    this.callsBySource.set(sourceSessionId, recent);
+  }
+
+  depthFor(sessionId: string): number {
+    return this.depthBySession.get(sessionId) ?? 0;
+  }
+
+  /**
+   * Depth a delivery from `source` to `target` would give `target`.
+   * Throws when that depth would exceed the cap. The depth is only
+   * recorded (setDepth) after a successful delivery, so a rejected or
+   * failed call never advances the chain.
+   */
+  checkChainDepth(sourceSessionId: string): number {
+    const depth = this.depthFor(sourceSessionId) + 1;
+    if (depth > MAX_AGENT_TOOL_CHAIN_DEPTH) {
+      throw new Error(
+        `Agent tool chain depth limit exceeded (${MAX_AGENT_TOOL_CHAIN_DEPTH}): sessions messaging each other in a loop are stopped here.`,
+      );
+    }
+    return depth;
+  }
+
+  setDepth(sessionId: string, depth: number): void {
+    this.depthBySession.set(sessionId, depth);
+  }
+
+  reset(): void {
+    this.callsBySource.clear();
+    this.depthBySession.clear();
+  }
+}
+
+function sourceRef(ctx: AgentToolContext): SessionOriginRef {
+  return {
+    id: ctx.sourceSessionId,
+    name: ctx.sourceSessionName,
+    hostId: ctx.sourceHostId,
+    hostLabel: ctx.sourceHostLabel,
+    ...(ctx.sourceCwd ? { cwd: ctx.sourceCwd } : {}),
+  };
+}
+
+function sessionOrigin(
+  ctx: AgentToolContext,
+  tool: "send_to_session" | "new_session",
+  delivery: "prompt" | "steer" | "followUp",
+): MessageOrigin {
+  return {
+    v: 1,
+    kind: "session",
+    sentAt: new Date().toISOString(),
+    session: { ...sourceRef(ctx), tool, delivery },
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error("Agent tool arguments must be an object.");
+  return value;
+}
+
+function requiredString(args: Record<string, unknown>, field: string): string {
+  const value = args[field];
+  if (typeof value !== "string" || !value.trim()) throw new Error(`Agent tool argument "${field}" is required and must be a non-empty string.`);
+  return value.trim();
+}
+
+function optionalString(args: Record<string, unknown>, field: string): string | undefined {
+  const value = args[field];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || !value.trim()) throw new Error(`Agent tool argument "${field}" must be a non-empty string when provided.`);
+  return value.trim();
+}
+
+function parseSessionId(value: string): string {
+  if (value.length > 200 || /[\s/\\]/.test(value)) {
+    throw new Error("Agent tool argument \"sessionId\" is not a valid session ID.");
+  }
+  return value;
+}
+
+function parseModel(args: Record<string, unknown>): { provider?: string; modelId?: string } {
+  const model = optionalString(args, "model");
+  const provider = optionalString(args, "provider");
+  const modelId = optionalString(args, "modelId");
+  if (model) {
+    const slash = model.indexOf("/");
+    if (slash <= 0 || slash === model.length - 1) {
+      throw new Error("Agent tool argument \"model\" must be \"provider/modelId\".");
+    }
+    if (provider && provider !== model.slice(0, slash)) {
+      throw new Error("Agent tool arguments \"model\" and \"provider\" disagree.");
+    }
+    if (modelId && modelId !== model.slice(slash + 1)) {
+      throw new Error("Agent tool arguments \"model\" and \"modelId\" disagree.");
+    }
+    return { provider: model.slice(0, slash), modelId: model.slice(slash + 1) };
+  }
+  if ((provider && !modelId) || (!provider && modelId)) {
+    throw new Error("Agent tool arguments \"provider\" and \"modelId\" must be provided together.");
+  }
+  return { provider, modelId };
+}
+
+function parseDelivery(args: Record<string, unknown>): "prompt" | "steer" | "followUp" {
+  const delivery = args.delivery;
+  if (delivery === undefined || delivery === null) return "prompt";
+  if (delivery === "prompt" || delivery === "steer" || delivery === "followUp") return delivery;
+  throw new Error("Agent tool argument \"delivery\" must be \"prompt\", \"steer\", or \"followUp\".");
+}
+
+function parseWait(args: Record<string, unknown>): { wait: boolean; waitTimeoutMs: number } {
+  const wait = args.wait;
+  if (wait !== undefined && typeof wait !== "boolean") {
+    throw new Error("Agent tool argument \"wait\" must be a boolean.");
+  }
+  const timeout = args.waitTimeoutMs;
+  if (timeout !== undefined && (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0)) {
+    throw new Error("Agent tool argument \"waitTimeoutMs\" must be a positive number.");
+  }
+  return {
+    wait: wait === true,
+    waitTimeoutMs: Math.min(MAX_WAIT_TIMEOUT_MS, Math.floor(timeout ?? DEFAULT_WAIT_TIMEOUT_MS)),
+  };
+}
+
+function checkMessageLength(message: string, field: string): void {
+  if (message.length > MAX_AGENT_TOOL_MESSAGE_CHARS) {
+    throw new Error(`Agent tool argument "${field}" exceeds ${MAX_AGENT_TOOL_MESSAGE_CHARS} characters.`);
+  }
+}
+
+/** `host` matched case-insensitively against ids, then labels; a label several hosts share is refused, not guessed. */
+function resolveHost(hosts: AgentToolHost[], host: string): AgentToolHost {
+  const wanted = host.toLowerCase();
+  // "This machine" keeps working after the user renames it.
+  const byId = hosts.find((h) => h.id.toLowerCase() === (wanted === "this machine" ? "local" : wanted));
+  const labelled = byId ? [] : hosts.filter((h) => h.label.toLowerCase() === wanted);
+  if (labelled.length > 1) {
+    throw new Error(`"${host}" matches more than one host (ids: ${labelled.map((h) => h.id).join(", ")}). Pass one of those ids as host.`);
+  }
+  const match = byId ?? labelled[0];
+  if (!match) throw new Error(`Unknown host "${host}". Known hosts: ${hosts.map((h) => h.label).join(", ")}.`);
+  if (!match.online) throw new Error(`${match.label} is offline.`);
+  return match;
+}
+
+/**
+ * Execute one server-side agent tool. Returns a plain JSON-able result the
+ * caller renders as the host_tool_result text payload. Throws on every
+ * rejection (disabled gate, validation, rate/chain limits, unknown tool,
+ * or an ops failure) so the agent gets an explicit error, never a hang.
+ */
+export async function executeAgentTool(
+  toolName: string,
+  args: unknown,
+  ops: AgentToolSessionOps,
+  ctx: AgentToolContext,
+): Promise<unknown> {
+  if (!ctx.enabled) {
+    throw new Error("Agent tools are disabled. Enable \"Agent tools\" in omp-web Settings (System) first.");
+  }
+  if (!AGENT_TOOL_NAMES.has(toolName)) throw new Error(`Unknown agent tool: ${toolName}.`);
+  const record = asRecord(args);
+
+  if (GITHUB_TOOL_NAMES.has(toolName)) {
+    ctx.guard.checkRate(ctx.sourceSessionId);
+    return executeGithubTool(toolName, record, ops.github, ctx);
+  }
+
+  if (toolName === "list_sessions") {
+    ctx.guard.checkRate(ctx.sourceSessionId);
+    const labels = new Map(ops.listHosts().map((h) => [h.id, h.label]));
+    const sessions = await ops.listSessions();
+    return {
+      sessions: sessions.map(({ hostId, ...session }) => ({ ...session, host: labels.get(hostId) ?? hostId })),
+    };
+  }
+
+  if (toolName === "new_session") {
+    ctx.guard.checkRate(ctx.sourceSessionId);
+    const depth = ctx.guard.checkChainDepth(ctx.sourceSessionId);
+    if (record.shareWorkspace !== undefined && typeof record.shareWorkspace !== "boolean") {
+      throw new Error('Agent tool argument "shareWorkspace" must be a boolean.');
+    }
+    const shareWorkspace = record.shareWorkspace === true;
+    const cwd = optionalString(record, "cwd") ?? ctx.sourceCwd;
+    if (shareWorkspace && cwd !== ctx.sourceCwd) throw new Error("shareWorkspace requires the calling session's directory.");
+    if (!cwd) throw new Error("Agent tool argument \"cwd\" is required when the calling session has no directory.");
+    const prompt = optionalString(record, "prompt");
+    if (prompt) checkMessageLength(prompt, "prompt");
+    const { provider, modelId } = parseModel(record);
+    const name = optionalString(record, "name");
+    if (name && name.length > 200) throw new Error("Agent tool argument \"name\" exceeds 200 characters.");
+    const requestedHost = optionalString(record, "host");
+    const host = resolveHost(ops.listHosts(), requestedHost ?? ctx.sourceHostId);
+    if (shareWorkspace && host.id !== ctx.sourceHostId) throw new Error("shareWorkspace requires the calling session's host.");
+    const origin = prompt ? sessionOrigin(ctx, "new_session", "prompt") : undefined;
+    let declined = false;
+    let declinedHost: AgentToolHost | undefined;
+    let created: AgentToolCreateSessionResult;
+    try {
+      created = await ops.createSession({
+        cwd,
+        hostId: host.id,
+        explicitHost: requestedHost !== undefined,
+        shareWorkspace,
+        prompt: prompt && origin ? `${formatSessionOriginHeader(origin)}\n\n${prompt}` : null,
+        ...(prompt && origin ? { clientMessageId: randomUUID(), origin } : {}),
+        provider,
+        modelId,
+        name,
+      }, async (target) => {
+        if (startsUnasked(target, ctx.sourceHostId)) return true;
+        const allowed = await ctx.confirm(`Start a session on ${target.label} in ${cwd}?`, {
+          kind: "new_session",
+          from: sourceRef(ctx),
+          host: { id: target.id, label: target.label },
+          cwd,
+          name: name ?? null,
+          message: prompt ?? null,
+        });
+        if (!allowed) {
+          declined = true;
+          declinedHost = target;
+        }
+        return allowed;
+      });
+    } catch (error) {
+      if (!declined) throw error;
+      const target = declinedHost ?? host;
+      return {
+        accepted: false, declined: true, sessionId: null, sessionName: null,
+        hostId: target.id, hostLabel: target.label, cwd,
+      };
+    }
+    ctx.guard.setDepth(created.sessionId, depth);
+    return created;
+  }
+
+  // send_to_session
+  ctx.guard.checkRate(ctx.sourceSessionId);
+  const sessionId = parseSessionId(requiredString(record, "sessionId"));
+  if (sessionId === ctx.sourceSessionId) {
+    throw new Error("Agent tool \"send_to_session\" cannot target the calling session itself.");
+  }
+  const message = requiredString(record, "message");
+  checkMessageLength(message, "message");
+  const delivery = parseDelivery(record);
+  const { wait, waitTimeoutMs } = parseWait(record);
+  const depth = ctx.guard.checkChainDepth(ctx.sourceSessionId);
+  const sessions = await ops.listSessions();
+  const targetSession = sessions.find((session) => session.id === sessionId);
+  const hosts = ops.listHosts();
+  const targetHostId = ctx.sourceHostId === "local" ? targetSession?.hostId : await ops.sessionHostId(sessionId);
+  if (ctx.sourceHostId !== "local" && !targetHostId) throw new Error(`Session not found: ${sessionId}`);
+  const targetHost = targetHostId ? hosts.find((host) => host.id === targetHostId) : undefined;
+  const targetRef = targetSession && targetHostId ? {
+    id: targetSession.id,
+    name: targetSession.name ?? null,
+    hostId: targetHostId,
+    hostLabel: targetHost?.label ?? targetHostId,
+    ...(targetSession.cwd ? { cwd: targetSession.cwd } : {}),
+  } : null;
+  // A remote agent reaching a session on another machine asks first, as new_session does.
+  if (ctx.sourceHostId !== "local" && targetHostId !== ctx.sourceHostId
+    && !(targetHost && startsUnasked(targetHost, ctx.sourceHostId))) {
+    const sourceLabel = hosts.find((host) => host.id === ctx.sourceHostId)?.label ?? ctx.sourceHostLabel;
+    const allowed = await ctx.confirm(
+      `Send a message from a session on ${sourceLabel} to session ${sessionId} on ${targetHost?.label ?? targetHostId}?`,
+      {
+        kind: "send_to_session",
+        from: sourceRef(ctx),
+        to: targetRef,
+        delivery,
+        message,
+      },
+    );
+    if (!allowed) {
+      return {
+        accepted: false, declined: true, targetSessionId: sessionId,
+        targetSessionName: targetSession?.name ?? null, targetSession: targetRef,
+        delivery, waited: false, responseText: null,
+      };
+    }
+  }
+  const origin = sessionOrigin(ctx, "send_to_session", delivery);
+  const result = await ops.deliver({
+    sessionId,
+    message: `${formatSessionOriginHeader(origin)}\n\n${message}`,
+    clientMessageId: randomUUID(),
+    origin,
+    delivery,
+    wait,
+    waitTimeoutMs,
+  });
+  ctx.guard.setDepth(sessionId, depth);
+  return { ...result, targetSessionName: targetSession?.name ?? null, targetSession: targetRef };
+}

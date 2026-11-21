@@ -5,12 +5,13 @@ import type { SyntaxHighlighterProps } from "react-syntax-highlighter";
 import {
   createSyntaxElement as renderSyntaxNode,
   ensureLanguageRegistered,
+  HIGHLIGHT_LANGUAGES,
   isLanguageRegistered,
   SyntaxHighlighter,
   vs,
   vscDarkPlus,
 } from "@/lib/syntax-highlight";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import { AtSign, Download, WrapText } from "lucide-react";
 import { useTheme } from "@/hooks/useTheme";
 import {
@@ -20,12 +21,13 @@ import {
   isDocumentPreviewPath,
   isImagePath,
 } from "@/lib/file-types";
-import { encodeFilePathForApi, getFileDirectory, getFileName, getRelativeFilePath } from "@/lib/file-paths";
+import { getFileApiUrl, getFileDirectory, getFileName, getRelativeFilePath } from "@/lib/file-paths";
+import { openEventStream } from "@/lib/event-stream";
 import { translate, useI18n } from "@/lib/i18n";
 import { resolveLocalFileHref } from "@/lib/file-links";
 import { normalizeDisplayMath, useMarkdownPlugins } from "@/lib/markdown";
 import { markdownCodeRenderer } from "./MarkdownCode";
-import { Tooltip } from "./ui/primitives";
+import { ThemedSelect, Tooltip } from "./ui/primitives";
 import { parseUnifiedPatch } from "@/lib/patch";
 import type { GitFileDiffResponse } from "@/lib/git-types";
 import { parseFrontmatter } from "@/lib/frontmatter";
@@ -33,6 +35,7 @@ import { FrontmatterCard } from "./FrontmatterCard";
 
 interface Props {
   filePath: string;
+  hostId: string;
   cwd?: string;
   sourceSessionId?: string | null;
   onOpenFile?: (filePath: string) => void;
@@ -48,6 +51,9 @@ interface FileData {
 }
 
 type DisplayMode = "source" | "preview" | "diff";
+
+/** A web or other scheme URL (`https:`, `mailto:`, protocol-relative `//host`), as opposed to a local path. */
+const EXTERNAL_URL_RE = /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i;
 
 const DISPLAY_MODE_LABEL_KEYS: Record<DisplayMode, string> = {
   source: "fileViewer.modeSource",
@@ -189,28 +195,38 @@ function SourceCodeRenderer({ rows, stylesheet, useInlineStyles, wrapLines }: So
   });
 }
 
-function getFileApiUrl(
-  filePath: string,
-  type: "read" | "download" | "meta" | "preview" | "watch",
-  sourceSessionId?: string | null,
-  params: Record<string, string | number | undefined> = {},
-): string {
-  const encoded = encodeFilePathForApi(filePath);
-  const searchParams = new URLSearchParams({ type });
-  if (sourceSessionId) searchParams.set("sessionId", sourceSessionId);
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined) searchParams.set(key, String(value));
-  }
-  return `/api/files/${encoded}?${searchParams.toString()}`;
+
+interface FileWatchHandlers {
+  onConnected(): void;
+  onChange(change: { size?: number }): void;
+  onDisconnected(): void;
 }
 
-function DownloadLink({ filePath, sourceSessionId }: { filePath: string; sourceSessionId?: string | null }) {
+/** Watch one file on the shared live-event stream; returns the teardown. */
+function watchFile(filePath: string, hostId: string, sourceSessionId: string | null | undefined, handlers: FileWatchHandlers): () => void {
+  const stream = openEventStream({ kind: "file", path: filePath, hostId, sessionId: sourceSessionId ?? null });
+  stream.onmessage = (e) => {
+    let frame: { type?: string; size?: number };
+    try {
+      frame = JSON.parse(e.data) as { type?: string; size?: number };
+    } catch {
+      return;
+    }
+    if (frame.type === "connected") handlers.onConnected();
+    else if (frame.type === "change") handlers.onChange(frame);
+    else if (frame.type === "error") handlers.onDisconnected();
+  };
+  stream.onerror = handlers.onDisconnected;
+  return () => stream.close();
+}
+
+function DownloadLink({ filePath, hostId, sourceSessionId }: { filePath: string; hostId: string; sourceSessionId?: string | null }) {
   const { t } = useI18n();
   const label = t("fileViewer.downloadFile");
   return (
     <Tooltip content={label}>
       <a
-        href={getFileApiUrl(filePath, "download", sourceSessionId)}
+        href={getFileApiUrl(filePath, "download", hostId, sourceSessionId)}
         download={getFileName(filePath)}
         aria-label={label}
         className="file-viewer-icon-button"
@@ -409,14 +425,13 @@ export function DiffView({ patch }: { patch: string }) {
   );
 }
 
-function ImageViewer({ filePath, cwd, sourceSessionId, active = true }: Props) {
+function ImageViewer({ filePath, hostId, cwd, sourceSessionId, active = true }: Props) {
   const { t } = useI18n();
   const [watching, setWatching] = useState(false);
   const [bust, setBust] = useState(0);
   const [size, setSize] = useState<number | null>(null);
   const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
 
   const ext = getFileName(filePath).toLowerCase().split(".").pop() ?? "";
   const retry = useCallback(() => {
@@ -435,32 +450,17 @@ function ImageViewer({ filePath, cwd, sourceSessionId, active = true }: Props) {
     setError(null);
     setWatching(false);
 
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
-    esRef.current = es;
-
-    es.addEventListener("connected", () => setWatching(true));
-    es.addEventListener("change", (e) => {
-      try {
-        const d = JSON.parse((e as MessageEvent).data) as { size?: number };
-        if (typeof d.size === "number") setSize(d.size);
-      } catch { /* ignore */ }
-      setBust((b) => b + 1);
+    return watchFile(filePath, hostId, sourceSessionId, {
+      onConnected: () => setWatching(true),
+      onChange: (change) => {
+        if (typeof change.size === "number") setSize(change.size);
+        setBust((b) => b + 1);
+      },
+      onDisconnected: () => setWatching(false),
     });
-    es.addEventListener("error", () => setWatching(false));
-    es.onerror = () => setWatching(false);
+  }, [active, filePath, hostId, sourceSessionId]);
 
-    return () => {
-      es.close();
-      esRef.current = null;
-    };
-  }, [active, filePath, sourceSessionId]);
-
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
+  const src = getFileApiUrl(filePath, "read", hostId, sourceSessionId, bust ? { v: bust } : undefined);
 
   const formatSizeStr = size != null ? formatSize(size) : null;
 
@@ -501,7 +501,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, active = true }: Props) {
           />
           {watching ? t("fileViewer.live") : t("fileViewer.static")}
         </span>
-        <DownloadLink filePath={filePath} sourceSessionId={sourceSessionId} />
+        <DownloadLink hostId={hostId} filePath={filePath} sourceSessionId={sourceSessionId} />
       </div>
       <div
         style={{
@@ -524,7 +524,6 @@ function ImageViewer({ filePath, cwd, sourceSessionId, active = true }: Props) {
             <button type="button" className="load-retry-button" onClick={retry} style={{ minHeight: 32, padding: "5px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", color: "var(--text)", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>{t("chatWindow.retry")}</button>
           </div>
         ) : (
-          // eslint-disable-next-line @next/next/no-img-element
           <img
             src={src}
             alt={filePath}
@@ -554,14 +553,13 @@ function formatDuration(seconds: number): string {
   return `${mins}:${String(secs).padStart(2, "0")}`;
 }
 
-function AudioViewer({ filePath, cwd, sourceSessionId, active = true }: Props) {
+function AudioViewer({ filePath, hostId, cwd, sourceSessionId, active = true }: Props) {
   const { t } = useI18n();
   const [watching, setWatching] = useState(false);
   const [bust, setBust] = useState(0);
   const [size, setSize] = useState<number | null>(null);
   const [duration, setDuration] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
 
   const ext = getFileName(filePath).toLowerCase().split(".").pop() ?? "";
   const retry = useCallback(() => {
@@ -580,34 +578,19 @@ function AudioViewer({ filePath, cwd, sourceSessionId, active = true }: Props) {
     setError(null);
     setWatching(false);
 
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
-    esRef.current = es;
-
-    es.addEventListener("connected", () => setWatching(true));
-    es.addEventListener("change", (e) => {
-      try {
-        const d = JSON.parse((e as MessageEvent).data) as { size?: number };
-        if (typeof d.size === "number") setSize(d.size);
-      } catch { /* ignore */ }
-      setDuration(null);
-      setError(null);
-      setBust((b) => b + 1);
+    return watchFile(filePath, hostId, sourceSessionId, {
+      onConnected: () => setWatching(true),
+      onChange: (change) => {
+        if (typeof change.size === "number") setSize(change.size);
+        setDuration(null);
+        setError(null);
+        setBust((b) => b + 1);
+      },
+      onDisconnected: () => setWatching(false),
     });
-    es.addEventListener("error", () => setWatching(false));
-    es.onerror = () => setWatching(false);
+  }, [active, filePath, hostId, sourceSessionId]);
 
-    return () => {
-      es.close();
-      esRef.current = null;
-    };
-  }, [active, filePath, sourceSessionId]);
-
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
+  const src = getFileApiUrl(filePath, "read", hostId, sourceSessionId, bust ? { v: bust } : undefined);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -646,7 +629,7 @@ function AudioViewer({ filePath, cwd, sourceSessionId, active = true }: Props) {
           />
           {watching ? t("fileViewer.live") : t("fileViewer.static")}
         </span>
-        <DownloadLink filePath={filePath} sourceSessionId={sourceSessionId} />
+        <DownloadLink hostId={hostId} filePath={filePath} sourceSessionId={sourceSessionId} />
       </div>
       <div
         style={{
@@ -680,13 +663,12 @@ function AudioViewer({ filePath, cwd, sourceSessionId, active = true }: Props) {
   );
 }
 
-function DocumentViewer({ filePath, cwd, sourceSessionId, active = true }: Props) {
+function DocumentViewer({ filePath, hostId, sourceSessionId, active = true }: Props) {
   const { t } = useI18n();
   const [watching, setWatching] = useState(false);
   const [bust, setBust] = useState(0);
   const [size, setSize] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
 
   const ext = getFileExt(filePath);
   const retry = useCallback(() => {
@@ -695,8 +677,8 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, active = true }: Props
   }, []);
   const isPdf = ext === "pdf";
   const previewUrl = isPdf
-    ? getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined)
-    : getFileApiUrl(filePath, "preview", sourceSessionId, bust ? { v: bust } : undefined);
+    ? getFileApiUrl(filePath, "read", hostId, sourceSessionId, bust ? { v: bust } : undefined)
+    : getFileApiUrl(filePath, "preview", hostId, sourceSessionId, bust ? { v: bust } : undefined);
 
   useEffect(() => {
     if (!active) {
@@ -708,15 +690,10 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, active = true }: Props
     setError(null);
     setWatching(false);
 
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-
     // Guard against stale metadata responses: a fetch started for a previous
     // filePath must not overwrite the current file's size/error.
     let cancelled = false;
-    fetch(getFileApiUrl(filePath, "meta", sourceSessionId))
+    fetch(getFileApiUrl(filePath, "meta", hostId, sourceSessionId))
       .then((r) => r.json())
       .then((d: { size?: number; error?: string }) => {
         if (cancelled) return;
@@ -732,33 +709,27 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, active = true }: Props
         if (!cancelled) setError(String(e));
       });
 
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
-    esRef.current = es;
-
-    es.addEventListener("connected", () => setWatching(true));
-    es.addEventListener("change", (e) => {
-      try {
-        const d = JSON.parse((e as MessageEvent).data) as { size?: number };
-        if (typeof d.size === "number") {
-          setSize(d.size);
-          if (!isPdf && d.size > DOCX_PREVIEW_MAX_BYTES) {
+    const stopWatching = watchFile(filePath, hostId, sourceSessionId, {
+      onConnected: () => setWatching(true),
+      onChange: (change) => {
+        if (typeof change.size === "number") {
+          setSize(change.size);
+          if (!isPdf && change.size > DOCX_PREVIEW_MAX_BYTES) {
             setError(translate("fileViewer.docxTooLarge"));
             return;
           }
         }
-      } catch { /* ignore */ }
-      setError(null);
-      setBust((b) => b + 1);
+        setError(null);
+        setBust((b) => b + 1);
+      },
+      onDisconnected: () => setWatching(false),
     });
-    es.addEventListener("error", () => setWatching(false));
-    es.onerror = () => setWatching(false);
 
     return () => {
       cancelled = true;
-      es.close();
-      esRef.current = null;
+      stopWatching();
     };
-  }, [active, filePath, isPdf, sourceSessionId]);
+  }, [active, filePath, hostId, isPdf, sourceSessionId]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -779,7 +750,7 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, active = true }: Props
         </span>
         <span style={{ marginLeft: "auto" }}>{ext === "docx" ? t("fileViewer.docxPreview") : t("fileViewer.pdfType")}</span>
         {size != null && <span>{formatSize(size)}</span>}
-        <DownloadLink filePath={filePath} sourceSessionId={sourceSessionId} />
+        <DownloadLink hostId={hostId} filePath={filePath} sourceSessionId={sourceSessionId} />
         <span
           title={watching ? t("fileViewer.liveSyncActive") : t("fileViewer.notWatching")}
           style={{ display: "flex", alignItems: "center", gap: 4, color: watching ? "var(--status-success)" : "var(--text-dim)", flexShrink: 0 }}
@@ -817,20 +788,20 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, active = true }: Props
   );
 }
 
-export function FileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionLines, gitRefreshKey, active = true }: Props) {
+export function FileViewer({ filePath, hostId, cwd, sourceSessionId, onOpenFile, onMentionLines, gitRefreshKey, active = true }: Props) {
   if (isImagePath(filePath)) {
-    return <ImageViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
+    return <ImageViewer hostId={hostId} filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
   }
   if (isAudioPath(filePath)) {
-    return <AudioViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
+    return <AudioViewer hostId={hostId} filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
   }
   if (isDocumentPreviewPath(filePath)) {
-    return <DocumentViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
+    return <DocumentViewer hostId={hostId} filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
   }
-  return <TextFileViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} onOpenFile={onOpenFile} onMentionLines={onMentionLines} gitRefreshKey={gitRefreshKey} active={active} />;
+  return <TextFileViewer hostId={hostId} filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} onOpenFile={onOpenFile} onMentionLines={onMentionLines} gitRefreshKey={gitRefreshKey} active={active} />;
 }
 
-function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionLines, gitRefreshKey, active = true }: Props) {
+function TextFileViewer({ filePath, hostId, cwd, sourceSessionId, onOpenFile, onMentionLines, gitRefreshKey, active = true }: Props) {
   const { t } = useI18n();
   const { isDark } = useTheme();
   const [data, setData] = useState<FileData | null>(null);
@@ -853,8 +824,9 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
   }, [data]);
   const [displayMode, setDisplayMode] = useState<DisplayMode>("source");
   const [wrapLines, setWrapLines] = useState(false);
+  // Picked by the user when the extension maps to the wrong grammar or none; null = detected.
+  const [languageOverride, setLanguageOverride] = useState<string | null>(null);
   const [watching, setWatching] = useState(false);
-  const esRef = useRef<EventSource | null>(null);
   const gitDiffRequestRef = useRef(0);
   const contentRequestRef = useRef(0);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -865,7 +837,7 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
     // resolve that is no longer the latest fetch for this component, so a
     // slower older request cannot overwrite newer content/error state.
     const requestId = ++contentRequestRef.current;
-    return fetch(getFileApiUrl(filePath, "read", sourceSessionId))
+    return fetch(getFileApiUrl(filePath, "read", hostId, sourceSessionId))
       .then((r) => r.json())
       .then((d: FileData & { error?: string }) => {
         if (requestId !== contentRequestRef.current) return null;
@@ -882,7 +854,7 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
         setError(String(e));
         return null;
       });
-  }, [sourceSessionId]);
+  }, [hostId, sourceSessionId]);
   const retryContent = useCallback(() => {
     setLoading(true);
     setError(null);
@@ -897,7 +869,8 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
     }
 
     try {
-      const params = new URLSearchParams({ cwd, path: targetPath });
+      const params = new URLSearchParams({ cwd, path: targetPath, hostId });
+      if (sourceSessionId) params.set("sessionId", sourceSessionId);
       const response = await fetch(`/api/git/diff?${params.toString()}`);
       const next = await response.json() as GitFileDiffResponse & { error?: string };
       if (requestId !== gitDiffRequestRef.current) return;
@@ -905,7 +878,17 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
     } catch {
       if (requestId === gitDiffRequestRef.current) setGitDiff(null);
     }
-  }, [cwd]);
+  }, [cwd, hostId, sourceSessionId]);
+
+  // Reset per file, not per activation: switching tabs back keeps the user's pick.
+  useEffect(() => {
+    setLanguageOverride(null);
+  }, [filePath]);
+
+  // Reset per file, not per activation: switching tabs back keeps the user's pick.
+  useEffect(() => {
+    setLanguageOverride(null);
+  }, [filePath]);
 
   // Initial load + SSE watch setup
   useEffect(() => {
@@ -921,11 +904,6 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
     setWrapLines(false);
     setWatching(false);
 
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-
     // Cancel effect-local work on filePath change so a stale in-flight load
     // cannot revert display mode or flip loading off for the new file.
     let cancelled = false;
@@ -936,33 +914,22 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
       if (!cancelled) setLoading(false);
     });
 
-    // Set up SSE watch
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
-    esRef.current = es;
-
-    es.addEventListener("connected", () => {
-      setWatching(true);
+    const stopWatching = watchFile(filePath, hostId, sourceSessionId, {
+      onConnected: () => setWatching(true),
+      onChange: () => {
+        void fetchContent(filePath);
+        void fetchGitDiff(filePath);
+      },
+      onDisconnected: () => setWatching(false),
     });
-
-    es.addEventListener("change", () => {
-      void fetchContent(filePath);
-      void fetchGitDiff(filePath);
-    });
-
-    es.addEventListener("error", () => {
-      setWatching(false);
-    });
-
-    es.onerror = () => {
-      setWatching(false);
-    };
 
     return () => {
       cancelled = true;
-      es.close();
-      esRef.current = null;
+      contentRequestRef.current += 1;
+      gitDiffRequestRef.current += 1;
+      stopWatching();
     };
-  }, [active, filePath, fetchContent, fetchGitDiff, sourceSessionId]);
+  }, [active, filePath, hostId, fetchContent, fetchGitDiff, sourceSessionId]);
 
   useEffect(() => {
     if (!active) return;
@@ -1168,6 +1135,19 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
           <div className="file-viewer-actions">
             {displayMode === "source" && (
               <>
+                <Tooltip content={t("fileViewer.highlightLanguage")}>
+                  <ThemedSelect
+                    value={languageOverride ?? ""}
+                    onChange={(nextValue) => setLanguageOverride(nextValue || null)}
+                    aria-label={t("fileViewer.highlightLanguage")}
+                    className="file-viewer-language-select"
+                    options={[
+                      { value: "", label: t("fileViewer.languageAuto", { language: data.language }) },
+                      { value: "plaintext", label: t("fileViewer.plainText") },
+                      ...HIGHLIGHT_LANGUAGES.map((language) => ({ value: language, label: language })),
+                    ]}
+                  />
+                </Tooltip>
                 <Tooltip content={t("fileViewer.mentionSelectedLines")}>
                   <button
                     type="button"
@@ -1205,7 +1185,7 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
             )}
           </div>
 
-          <DownloadLink filePath={filePath} sourceSessionId={sourceSessionId} />
+          <DownloadLink hostId={hostId} filePath={filePath} sourceSessionId={sourceSessionId} />
         </div>
       </div>
 
@@ -1229,6 +1209,9 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
             <ReactMarkdown
               remarkPlugins={markdownPlugins.remarkPlugins}
               rehypePlugins={markdownPlugins.rehypePlugins}
+              // The shared sanitizer admits `agent:` for chat links; previews
+              // have no subagent to open, so drop such hrefs as before.
+              urlTransform={(url) => defaultUrlTransform(url) || undefined}
               components={{
                 code: markdownCodeRenderer({ defaultPreview: true }),
                 pre({ children }) {
@@ -1242,7 +1225,14 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
                     ? resolveLocalFileHref(href, markdownDirectory, cwd ?? markdownDirectory)
                     : null;
                   if (!linkedFile || !onOpenFile) {
-                    return <a href={href} {...props}>{children}</a>;
+                    // Never let a preview link replace omp-web itself: in-page anchors stay,
+                    // web links open a new tab, and a path the panel cannot open (such as a
+                    // relative link in a Markdown file outside the workspace) is plain text.
+                    if (href?.startsWith("#")) return <a href={href} {...props}>{children}</a>;
+                    if (href && EXTERNAL_URL_RE.test(href)) {
+                      return <a href={href} {...props} target="_blank" rel="noopener noreferrer">{children}</a>;
+                    }
+                    return <span title={href}>{children}</span>;
                   }
 
                   const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
@@ -1259,11 +1249,15 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
                   const imagePath = typeof src === "string"
                     ? resolveLocalFileHref(src, markdownDirectory, cwd ?? markdownDirectory)
                     : null;
+                  // A local path the file API cannot serve here would only request the app
+                  // origin and 404; show the alt text instead of a broken image.
+                  if (!imagePath && !(typeof src === "string" && EXTERNAL_URL_RE.test(src))) {
+                    return alt ? <span title={typeof src === "string" ? src : undefined}>{alt}</span> : null;
+                  }
                   const imageSrc = imagePath
-                    ? getFileApiUrl(imagePath, "read", sourceSessionId)
+                    ? getFileApiUrl(imagePath, "read", hostId, sourceSessionId)
                     : src;
                   // Dynamic local paths are served directly by the file API.
-                  // eslint-disable-next-line @next/next/no-img-element
                   return <img src={imageSrc} alt={alt ?? ""} loading="lazy" {...props} />;
                 },
               }}
@@ -1274,7 +1268,7 @@ function TextFileViewer({ filePath, cwd, sourceSessionId, onOpenFile, onMentionL
         ) : highlightReady ? (
           <SyntaxHighlighter
             className={wrapLines ? "file-source-view is-wrapped" : "file-source-view"}
-            language={data.language === "text" ? "plaintext" : data.language}
+            language={languageOverride ?? (data.language === "text" ? "plaintext" : data.language)}
             style={isDark ? vscDarkPlus : vs}
             showLineNumbers
             lineNumberStyle={{

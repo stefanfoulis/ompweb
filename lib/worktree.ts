@@ -1,9 +1,9 @@
 import { execFile } from "child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { basename, dirname, join, resolve } from "path";
 import { promisify } from "util";
-import { allowFileRoot } from "./file-access";
 import { normalizeForComparison, samePath, toNativePath } from "./paths";
+import { createGitEnvironment } from "./project-command-env";
 import { loadProjectRegistry } from "./project-registry";
 
 const execFileAsync = promisify(execFile);
@@ -66,7 +66,7 @@ async function git(cwd: string, args: string[]): Promise<string> {
     maxBuffer: 1024 * 1024,
     // Pin the message locale so error-text matching (e.g. the dirty-worktree
     // detection in the DELETE route) works regardless of system language.
-    env: { ...process.env, LC_ALL: "C" },
+    env: createGitEnvironment({ LC_ALL: "C" }),
   });
   return stdout.trim();
 }
@@ -299,6 +299,7 @@ export async function addWorktree(cwd: string, branch: string): Promise<{ path: 
     throw new Error(`Directory already exists: ${worktreePath}`);
   }
   mkdirSync(baseDir, { recursive: true });
+  if (lstatSync(baseDir).isSymbolicLink() || !samePath(realPathOrSelf(baseDir), baseDir)) throw new Error("Worktree directory must not be a symbolic link");
 
   // Reuse the branch if it already exists, otherwise create it at HEAD.
   let branchExists = false;
@@ -321,7 +322,6 @@ export async function addWorktree(cwd: string, branch: string): Promise<{ path: 
   }
 
   repairWorktreeGitdirs(repoRoot);
-  allowFileRoot(worktreePath);
   invalidateProjectCache();
   return { path: worktreePath, branch: trimmed };
 }
@@ -345,13 +345,6 @@ export async function removeWorktree(cwd: string, worktreePath: string, force = 
     throw new Error(extractGitError(error));
   }
 
-  if (existsSync(target.path)) {
-    try {
-      rmSync(target.path, { recursive: true, force: true });
-    } catch {
-      // Ignore if files are locked
-    }
-  }
 
   try {
     await git(repoRoot, ["worktree", "prune"]);

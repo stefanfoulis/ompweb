@@ -2,17 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { createJiti } from "jiti";
 
-const jiti = createJiti(import.meta.url, {
-  jsx: { runtime: "automatic" },
-  tsconfigPaths: true,
-});
-const { ExtensionDialog } = await jiti.import("./ExtensionDialog.tsx");
+const { ExtensionDialog } = await import("./ExtensionDialog.tsx");
 
-function renderEditorTextarea(extra) {
+function renderEditorTextarea(editorOptions) {
   const html = renderToStaticMarkup(React.createElement(ExtensionDialog, {
-    request: { type: "extension_ui_request", id: "r1", method: "editor", title: "Answer", ...extra },
+    request: { type: "ui_request", id: 1, method: "editor", args: ["Answer", null, null, editorOptions] },
     onRespond: () => {},
     attached: true,
   }));
@@ -28,7 +23,15 @@ test("promptStyle editor (ask 'Other' answer) uses the chat font, not monospace"
 });
 
 test("plain editor requests keep the monospace code font", () => {
-  const textarea = renderEditorTextarea({});
+  const textarea = renderEditorTextarea(undefined);
   assert.match(textarea, /font-family:var\(--font-mono\)/);
   assert.match(textarea, /font-size:13px/);
+});
+
+test("multi-line titles keep their line breaks", () => {
+  const html = renderToStaticMarkup(React.createElement(ExtensionDialog, {
+    request: { type: "ui_request", id: 2, method: "input", args: ["Question\n\nDetails"] },
+    onRespond: () => {},
+  }));
+  assert.match(html, /<div style="[^"]*white-space:pre-wrap[^"]*">Question\n\nDetails<\/div>/);
 });

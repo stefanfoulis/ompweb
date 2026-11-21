@@ -4,37 +4,42 @@ Thanks for your interest in contributing!
 
 ## Setup
 
-- Node.js 22.19.0 or newer
-- The [omp](https://github.com/can1357/oh-my-pi) binary on your `PATH` (or set `OMP_WEB_OMP_BIN`)
+- Node.js 24 or newer (the server runs on [Bun](https://bun.sh), which `npm install` provides)
 
 ```bash
 npm install
-npm run dev   # http://127.0.0.1:30178
+npm run fetch-omp   # ompweb's omp runner, from the oh-my-pi fork release omp-runner.json pins (SHA-256-checked)
+npm run dev   # http://127.0.0.1:30178, Bun hot reload
 ```
+
+For live sessions the dev server and `ompweb host` need that runner: `npm run fetch-omp` puts it where they find it by
+themselves (`OMP_WEB_OMP_BIN` overrides it, e.g. with a runner built from the fork). A stock `omp` does not
+speak ompweb's channel. The runner's source is in the fork (`packages/ompweb-runner` of `ompweb-dev/oh-my-pi`), not here.
 
 ## Checks (must pass before submitting)
 
 ```bash
-npx tsc --noEmit                                   # type check
+npm run typecheck                                  # type check
 npm run lint                                       # ESLint, zero warnings
-npm test                                           # unit tests
+npm test                                           # unit tests (bun test --parallel)
 ```
 
-Avoid `npm run build` during local development — it writes to `.next/` and
-interferes with the dev server. Builds are for release work.
+`npm run build` bundles the browser app into `dist/` and `npm run smoke`
+starts the built server and checks it; the dev server never reads `dist/`.
 
 ### React tests
 
-Tests use `node:test` and `jiti`; no Jest or Vitest configuration is required.
+Tests use `bun test` with `node:test`-style `test()` calls; no Jest or Vitest configuration is required.
+Mock a Node builtin with `mockBuiltin` (`tests/mock-builtin.mjs`, built on `mock.module`) and import the module under test afterwards with a fresh `?fresh=N` query.
 For interactive components and hooks, import `tests/setup-dom.mjs` before
-`@testing-library/react/pure.js`, and register `cleanup` with `afterEach`.
+`@testing-library/react/pure.js` (both imported dynamically, in that order), and register `cleanup` with `afterEach`.
 Use DOM queries and `@testing-library/user-event` for component interactions,
 and `renderHook` for hook state and lifecycle tests. Keep the real jsdom
 `window` and `document`; mock only the browser or network APIs a scenario needs.
 
 Static HTML tests can continue using `react-dom/server`. Layout, scrolling,
 and native browser navigation still require real-browser verification.
-The jsdom dependency stays on 29.x to support the Node 22.19.0 baseline.
+The jsdom dependency stays on 29.x for now; moving to a newer major is a separate change.
 
 ## Conventions
 
@@ -42,11 +47,11 @@ The jsdom dependency stays on 29.x to support the Node 22.19.0 baseline.
   shadow, motion) — no hardcoded colors. Shared primitives live in
   `components/ui/` (Dialog/Tooltip/Collapsible/field/toast, built on Base UI);
   icons come from `lucide-react`.
-- **i18n**: every user-facing string needs entries in all three dictionaries:
-  `lib/i18n/locales/{en,zh-CN,ja}.json`.
-- **Architecture**: omp-web never imports `@oh-my-pi/*` or `@earendil-works/*`
-  packages (Bun-only). Live agent features go through the `omp` child process
-  via RPC; see `DESIGN.md` and `AGENTS.md` for the full contract.
+- **i18n**: every user-facing string needs entries in all four dictionaries:
+  `lib/i18n/locales/{en,zh-CN,zh-TW,ja}.json`.
+- **Architecture**: the ompweb server and daemon never import `@oh-my-pi/*` or `@earendil-works/*`
+  packages (Bun-only). Live agent features go through the `ompweb-omp` child process
+  (built and released by the oh-my-pi fork) over ompweb's channel; see `DESIGN.md` and `AGENTS.md` for the full contract.
 
 ## Pull requests
 

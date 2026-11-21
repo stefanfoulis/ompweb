@@ -13,6 +13,16 @@ param(
 
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
 $PkgJsonPath = Join-Path $RepoRoot "package.json"
+
+# The updater replaces this installation in place, and Windows refuses to rename a
+# directory that is a live process's working directory (ERROR_SHARING_VIOLATION).
+# Every path below is absolute, so the server starts outside the installation.
+$LaunchWorkingDirectory = $env:USERPROFILE
+# An empty value would make the child inherit the process's own directory, which is the
+# installation; refuse instead of silently reintroducing the lock.
+if ([string]::IsNullOrWhiteSpace($LaunchWorkingDirectory)) {
+    throw "USERPROFILE is empty: refusing to start omp-web from inside its installation directory."
+}
 $PkgVersion = "0.0.0"
 if (Test-Path $PkgJsonPath) {
     try { $pkg = Get-Content $PkgJsonPath -Raw | ConvertFrom-Json; if ($pkg.version) { $PkgVersion = $pkg.version } } catch { }
@@ -30,8 +40,8 @@ $EffectiveHostname = if (![string]::IsNullOrWhiteSpace($Hostname)) { $Hostname }
 $EffectiveMode = if (![string]::IsNullOrWhiteSpace($Mode)) { $Mode } elseif ($Config -and $Config.mode) { [string]$Config.mode } else { $DefaultMode }
 $EffectiveAutoRestart = if ($Config -and ($null -ne $Config.autoRestart)) { [bool]$Config.autoRestart } else { $DefaultAutoRestart }
 
-$NextDir = Join-Path $RepoRoot ".next"
-if ($EffectiveMode -eq "start" -and !(Test-Path $NextDir)) {
+$BuildIndex = Join-Path $RepoRoot "dist\index.html"
+if ($EffectiveMode -eq "start" -and !(Test-Path $BuildIndex)) {
     $EffectiveMode = "dev"
     if ($EffectivePort -eq 30177) { $EffectivePort = 30178 }
 }
@@ -96,6 +106,17 @@ function Test-ServerHealth {
     } catch { return $false }
 }
 
+# Copy an omp-web credential from the user (then system) environment into the
+# child, or remove it there. This launcher's own environment was captured at
+# logon, so a value changed or removed with `setx` since then must not survive
+# a server restart: the old password would keep working after rotation.
+function Set-ChildCredential($psi, [string]$name) {
+    $value = [Environment]::GetEnvironmentVariable($name, "User")
+    if ([string]::IsNullOrEmpty($value)) { $value = [Environment]::GetEnvironmentVariable($name, "Machine") }
+    if ([string]::IsNullOrEmpty($value)) { $psi.EnvironmentVariables.Remove($name) } else { $psi.EnvironmentVariables[$name] = $value }
+    return $value
+}
+
 function Start-WebServer {
     if ($script:ChildProcess -and !$script:ChildProcess.HasExited) { return }
     Write-ServiceLog "Starting web server in $EffectiveMode mode on ${EffectiveHostname}:$EffectivePort..."
@@ -108,7 +129,7 @@ function Start-WebServer {
     }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $NodeExe
-    $psi.WorkingDirectory = $RepoRoot
+    $psi.WorkingDirectory = $LaunchWorkingDirectory
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $false
@@ -117,25 +138,26 @@ function Start-WebServer {
         $launcherJs = Join-Path $RepoRoot "bin\omp-web.js"
         $inner = "`"$NodeExe`" `"$launcherJs`" -p $EffectivePort -H $EffectiveHostname --no-open"
     } else {
-        $nextBin = Join-Path $RepoRoot "node_modules\next\dist\bin\next"
-        $inner = "`"$NodeExe`" `"$nextBin`" dev -H $EffectiveHostname -p $EffectivePort"
+        # The working directory is outside the installation, so both the dev entry and the config
+        # (Bun reads bunfig.toml from the working directory) are passed as absolute paths.
+        $inner = "`"$NodeExe`" `"$(Join-Path $RepoRoot 'bin\bun-runtime.js')`" `"--config=$(Join-Path $RepoRoot 'bunfig.toml')`" --hot `"$(Join-Path $RepoRoot 'server\dev.ts')`" -H $EffectiveHostname -p $EffectivePort"
     }
     $psi.FileName = $env:ComSpec
     $psi.Arguments = "/d /s /c `"$inner >> `"$childOutLog`" 2>&1`""
     $psi.EnvironmentVariables["OMP_WEB_PORT"] = [string]$EffectivePort
+    # The child runs outside the installation, so name it explicitly (dev mode derives its root from this).
+    $psi.EnvironmentVariables["OMP_WEB_PACKAGE_DIR"] = $RepoRoot
     $psi.EnvironmentVariables["OMP_WEB_HOSTNAME"] = [string]$EffectiveHostname
     $psi.EnvironmentVariables["OMP_WEB_SERVICE"] = "1"
     $psi.EnvironmentVariables["PORT"] = [string]$EffectivePort
-    # Pass the password explicitly: bin/omp-web.js refuses a non-loopback bind
-    # without it, and an inherited environment block can be stale.
-    $childPassword = [Environment]::GetEnvironmentVariable("OMP_WEB_PASSWORD", "Process")
-    if ([string]::IsNullOrEmpty($childPassword)) {
-        $childPassword = [Environment]::GetEnvironmentVariable("OMP_WEB_PASSWORD", "User")
-    }
-    if (![string]::IsNullOrEmpty($childPassword)) {
-        $psi.EnvironmentVariables["OMP_WEB_PASSWORD"] = $childPassword
-    } else {
-        Write-ServiceLog "WARN: OMP_WEB_PASSWORD not found in the process or user environment; a non-loopback bind will be refused by bin/omp-web.js"
+    # bin/omp-web.js refuses a non-loopback bind without a password hash. A
+    # plaintext OMP_WEB_PASSWORD is passed through only so the server can refuse
+    # it with instructions; generate a hash with `ompweb hash-password`.
+    $childHash = Set-ChildCredential $psi "OMP_WEB_PASSWORD_HASH"
+    $null = Set-ChildCredential $psi "OMP_WEB_PASSWORD"
+    $null = Set-ChildCredential $psi "OMP_WEB_TRUSTED_HEADER_SHA256"
+    if ([string]::IsNullOrEmpty($childHash)) {
+        Write-ServiceLog "WARN: OMP_WEB_PASSWORD_HASH not found in the user or system environment; a non-loopback bind will be refused by bin/omp-web.js (generate one with: ompweb hash-password)"
     }
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi

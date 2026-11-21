@@ -61,10 +61,12 @@ function shortVersion(version: string | undefined, t: (key: string) => string): 
 function Toggle({
   enabled,
   loading,
+  readOnly = false,
   onToggle,
 }: {
   enabled: boolean;
   loading: boolean;
+  readOnly?: boolean;
   onToggle: () => void;
 }) {
   const { t } = useI18n();
@@ -72,12 +74,14 @@ function Toggle({
     <button
       type="button"
       onClick={onToggle}
-      disabled={loading}
+      disabled={loading || readOnly}
       aria-pressed={enabled}
       title={
-        enabled
-          ? t("skillsConfig.visibleInPrompt")
-          : t("skillsConfig.hiddenFromPrompt")
+        readOnly
+          ? t("skillsConfig.toggleReadOnly")
+          : enabled
+            ? t("skillsConfig.visibleInPrompt")
+            : t("skillsConfig.hiddenFromPrompt")
       }
       style={{
         flexShrink: 0,
@@ -86,7 +90,8 @@ function Toggle({
         borderRadius: 11,
         border: "none",
         padding: 0,
-        cursor: loading ? "wait" : "pointer",
+        cursor: readOnly ? "not-allowed" : loading ? "wait" : "pointer",
+        opacity: readOnly ? 0.5 : 1,
         background: enabled ? "var(--accent-strong)" : "var(--border)",
         position: "relative",
         transition: "background var(--dur-med) var(--ease-out-warm)",
@@ -124,7 +129,7 @@ function SkillDetail({
   onUpdate,
 }: {
   skill: Skill;
-  cwd: string;
+  cwd: string | null;
   onToggle: (skill: Skill) => void;
   toggling: boolean;
   saveError: string | null;
@@ -140,7 +145,7 @@ function SkillDetail({
   const enabled = !skill.disableModelInvocation;
 
   function displayPath(p: string): string {
-    if (label === "project" && p.startsWith(cwd)) {
+    if (label === "project" && cwd && p.startsWith(cwd)) {
       const rel = p.slice(cwd.length).replace(/^[/\\]/, "");
       return `./${rel}`;
     }
@@ -183,6 +188,7 @@ function SkillDetail({
         <Toggle
           enabled={enabled}
           loading={toggling}
+          readOnly={skill.togglable === false}
           onToggle={() => onToggle(skill)}
         />
         {saveError && (
@@ -191,6 +197,12 @@ function SkillDetail({
           </span>
         )}
       </div>
+      {skill.togglable === false && (
+        // Visible too: a disabled button's title is unreachable by keyboard and touch.
+        <p style={{ margin: 0, fontSize: 12, color: "var(--text-muted)" }}>
+          {t("skillsConfig.toggleReadOnly")}
+        </p>
+      )}
 
       {skill.install?.skillsShUrl && (
         <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
@@ -369,7 +381,8 @@ function AddSkillPanel({
   installedPackages,
   onInstalled,
 }: {
-  cwd: string;
+  /** null: the user level only (no project scope). */
+  cwd: string | null;
   installedPackages: Record<SkillInstallScope, ReadonlySet<string>>;
   onInstalled: () => void;
 }) {
@@ -448,9 +461,9 @@ function AddSkillPanel({
   );
 
   const installPath =
-    scope === "global"
-      ? "~/.agents/skills/"
-      : `${shortenPath(cwd)}/.agents/skills/`;
+    scope === "project" && cwd
+      ? `${shortenPath(cwd)}/.agents/skills/`
+      : "~/.agents/skills/";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -520,7 +533,7 @@ function AddSkillPanel({
               flexShrink: 0,
             }}
           >
-            {(["global", "project"] as const).map((s) => (
+            {(cwd ? ["global", "project"] as const : ["global"] as const).map((s) => (
               <button
                 key={s}
                 onClick={() => setScope(s)}
@@ -532,7 +545,7 @@ function AddSkillPanel({
                   color: scope === s ? "var(--text)" : "var(--text-dim)",
                   fontWeight: scope === s ? 600 : 400,
                   borderRight:
-                    s === "global" ? "1px solid var(--border)" : "none",
+                    s === "global" && cwd ? "1px solid var(--border)" : "none",
                 }}
               >
                 {t(SOURCE_LABEL_KEYS[s])}
@@ -717,7 +730,8 @@ export function SkillsConfig({
   onSelectTab,
   embedded = false,
 }: {
-  cwd: string;
+  /** null: the user level only, as a request without a cwd lists and changes it. */
+  cwd: string | null;
   onClose: () => void;
   onSelectTab?: (tab: SettingsTab) => void;
   embedded?: boolean;
@@ -741,7 +755,7 @@ export function SkillsConfig({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`);
+      const res = await fetch(cwd ? `/api/skills?cwd=${encodeURIComponent(cwd)}` : "/api/skills");
       const d = (await res.json()) as { skills?: Skill[]; error?: string; code?: string };
       if (!res.ok || d.error) throw new Error(formatApiError(d.error ? d : `HTTP ${res.status}`));
       const list = d.skills ?? [];
@@ -861,6 +875,7 @@ export function SkillsConfig({
         body: JSON.stringify({
           filePath: skill.filePath,
           disableModelInvocation: next,
+          cwd,
         }),
       });
       const d = (await res.json()) as { success?: boolean; error?: string };
@@ -889,7 +904,7 @@ export function SkillsConfig({
         return n;
       });
     }
-  }, [t]);
+  }, [cwd, t]);
 
   const selectedSkill = skills.find((s) => s.filePath === selected) ?? null;
 
@@ -924,7 +939,7 @@ export function SkillsConfig({
                 whiteSpace: "nowrap",
               }}
             >
-              {shortenPath(cwd)}
+              {cwd && shortenPath(cwd)}
             </code>
           </div>
           <button

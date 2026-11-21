@@ -2,13 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { createJiti } from "jiti";
 
-const jiti = createJiti(import.meta.url, {
-  jsx: { runtime: "automatic" },
-  tsconfigPaths: true,
-});
-const { ComposerPanels } = await jiti.import("./ComposerPanels.tsx");
+const { ComposerPanels } = await import("./ComposerPanels.tsx");
 
 const noop = () => {};
 
@@ -24,7 +19,7 @@ test("attaches todo plan and subagent roster with live states", () => {
   const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
     todoPhases: [{ name: "Implementation", tasks: [{ content: "Wire panels", status: "in_progress" }] }],
     subagents: [
-      { id: "s1", agent: "scout", status: "started", task: "Map the surface", index: 0 },
+      { id: "SurfaceMap", agent: "scout", status: "started", task: "Map the surface", index: 0 },
       { id: "s2", agent: "worker", status: "completed", task: "Write the code", index: 1 },
     ],
     onSelectSubagent: noop,
@@ -35,6 +30,7 @@ test("attaches todo plan and subagent roster with live states", () => {
   assert.match(html, /Wire panels/);
   assert.match(html, /Subagents/);
   assert.match(html, /scout/);
+  assert.match(html, />SurfaceMap</);
   assert.match(html, /Map the surface/);
   assert.match(html, /worker/);
   assert.match(html, /aria-label="1 running · 2 total"/);
@@ -205,3 +201,79 @@ test("zero context tokens never print a null gauge", () => {
   assert.match(html, /read/);
 });
 
+test("completed subagents nest under a collapsed Completed group", () => {
+  // Roster expanded from storage, as after a user opened it; the completed
+  // group itself must still start collapsed.
+  globalThis.window = { localStorage: { getItem: () => "false", setItem: () => {} } };
+  try {
+    const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
+      todoPhases: [],
+      subagents: [
+        { id: "s1", agent: "scout", status: "started", task: "Map the surface", index: 0 },
+        { id: "s2", agent: "worker", status: "completed", task: "Write the code", index: 1 },
+        { id: "s3", agent: "worker", status: "failed", task: "Break the build", index: 2 },
+        { id: "s4", agent: "scout", status: "started", task: "Old snapshot", index: 3, source: "history" },
+      ],
+      onSelectSubagent: noop,
+    }));
+    assert.match(html, /Map the surface/);
+    assert.match(html, /Completed \(3\)/);
+    assert.match(html, /aria-expanded="false"/);
+    assert.doesNotMatch(html, /Write the code/);
+    assert.doesNotMatch(html, /Break the build/);
+    assert.doesNotMatch(html, /Old snapshot/);
+  } finally {
+    delete globalThis.window;
+  }
+});
+
+test("a side question keeps Copy for the earlier answer when its follow-up ended without text", () => {
+  const record = {
+    id: "b1", leafId: null, question: "what is 2+2", answer: "It is 4.", status: "complete", createdAt: 1, updatedAt: 2,
+    followUps: [{ question: "and 3+3?", answer: "", status: "cancelled", createdAt: 3, updatedAt: 4 }],
+  };
+  const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
+    todoPhases: [],
+    subagents: [],
+    onSelectSubagent: noop,
+    btw: { record, onCancel: noop, onFollowUp: async () => true, onClose: noop },
+  }));
+  assert.match(html, /It is 4\./);
+  assert.match(html, /Cancelled/);
+  assert.match(html, />Copy answer</);
+});
+
+test("merges live status into the todo header row when tasks exist (#245)", () => {
+  const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
+    todoPhases: [{ name: "Implementation", tasks: [{ content: "Wire panels", status: "in_progress" }] }],
+    subagents: [{ id: "s1", agent: "scout", status: "started", task: "Map the surface", index: 0 }],
+    onSelectSubagent: noop,
+    liveStatus: "Waiting for model...",
+  }));
+  // Hosted exactly once: by the todo row, not duplicated in the subagent row.
+  // (The string itself appears twice in markup — text plus title — so count
+  // the role="status" host elements instead.)
+  assert.equal((html.match(/role="status"/g) || []).length, 1);
+  assert.match(html, /Tasks/);
+});
+
+test("merges live status into the subagent header row when no tasks exist (#245)", () => {
+  const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
+    todoPhases: [],
+    subagents: [{ id: "s1", agent: "scout", status: "started", task: "Map the surface", index: 0 }],
+    onSelectSubagent: noop,
+    liveStatus: "Waiting for model...",
+  }));
+  assert.match(html, /Waiting for model\.\.\./);
+  assert.match(html, /Subagents/);
+});
+
+test("keeps panels unchanged when no live status is present (#245)", () => {
+  const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
+    todoPhases: [{ name: "Implementation", tasks: [{ content: "Wire panels", status: "in_progress" }] }],
+    subagents: [],
+    onSelectSubagent: noop,
+  }));
+  assert.match(html, /Tasks/);
+  assert.doesNotMatch(html, /Waiting for model/);
+});

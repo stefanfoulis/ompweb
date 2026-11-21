@@ -1,19 +1,28 @@
 "use client";
 
-import { memo, useState, useId, useRef, useEffect, useLayoutEffect, useMemo, useCallback, type ComponentProps } from "react";
-import { Copy, Check, GitFork, CornerUpLeft, ChevronRight, ChevronDown, Brain, EyeOff, CircleAlert, CircleSlash, LoaderCircle, FileText, Search, FileEdit, Terminal, CheckSquare, Bot, Code2, Globe, MessagesSquare, Wrench, Volume2, Square } from "lucide-react";
+import { memo, useState, useId, useRef, useEffect, useLayoutEffect, useMemo, useCallback, useContext, type ComponentProps } from "react";
+import { Copy, Check, GitFork, CornerUpLeft, CornerDownLeft, ChevronRight, ChevronDown, Brain, EyeOff, CircleAlert, CircleSlash, Clock, LoaderCircle, FileText, Search, FileEdit, Terminal, CheckSquare, Bot, Code2, Globe, MessagesSquare, Wrench, Volume2, Square, Trash2, Paperclip, RotateCcw } from "lucide-react";
 import { MarkdownBody } from "./MarkdownBody";
+import { WorkspaceFileContext } from "@/lib/workspace-file-context";
+import { AgentLinkContext, agentLinkIds } from "../lib/agent-links";
 import { MessageCopyActions } from "./MessageCopyActions";
 import { useSpeechContext } from "@/hooks/useSpeechSynthesis";
 import { ClickableImage } from "./ImageLightbox";
 import { translate, useI18n, type Locale } from "@/lib/i18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
-import { isEmptyThinkingBlock } from "@/lib/message-display";
+import { DEVELOPER_MARKER_CUSTOM_TYPE, isEmptyThinkingBlock, isReplyBlock } from "@/lib/message-display";
+import { isInterruptedMessage, isPassiveToolContext } from "@/lib/chat-transcript-plan";
 import { Tooltip, Collapsible, CollapsibleTrigger } from "./ui/primitives";
+import { ConfirmDialog } from "./ui/field";
 import { useCopyFeedback } from "@/hooks/useCopyFeedback";
 import { formatCompactNumber } from "@/lib/format";
 import { TaskResultPanel } from "./MessageView-task-panel";
 import { HubResultPanel } from "./MessageView-hub-panel";
+import { OriginMessageView } from "./OriginMessageView";
+import { SessionLink } from "./SessionLink";
+import { resolveSessionRef } from "@/lib/session-names";
+import type { SessionOriginRef } from "@/lib/message-origin";
+import { SvgWritePreviewPanel } from "./MessageView-svg-panel";
 import { isMessageOverflowing } from "@/lib/message-overflow";
 import { getResultDiff, PairedDiffResult, PairedResult } from "./MessageView-diff-view";
 import {
@@ -26,7 +35,6 @@ import {
   getHubJobs,
   getHubJobsHeader,
   getHubSendSummary,
-  summarizeToolCallGroup,
   getSemanticToolLabel,
   type ToolCategory,
 } from "./MessageView-tool-format";
@@ -44,6 +52,7 @@ import type {
   ToolCallContent,
   ThinkingContent,
 } from "@/lib/types";
+import type { HeldMessage } from "@/hooks/useAgentSession-queue";
 
 function ToolCategoryIcon({
   category,
@@ -80,42 +89,6 @@ function ToolCategoryIcon({
   }
 }
 
-type GroupedBlockItem =
-  | { type: "single"; item: { block: AssistantContentBlock; originalIndex: number } }
-  | { type: "toolGroup"; items: Array<{ block: ToolCallContent; originalIndex: number }> };
-
-function groupAdjacentBlocks(items: Array<{ block: AssistantContentBlock; originalIndex: number }>): GroupedBlockItem[] {
-  const result: GroupedBlockItem[] = [];
-  let currentGroup: Array<{ block: ToolCallContent; originalIndex: number }> | null = null;
-
-  for (const item of items) {
-    if (item.block.type === "toolCall") {
-      if (!currentGroup) currentGroup = [];
-      currentGroup.push({ block: item.block as ToolCallContent, originalIndex: item.originalIndex });
-    } else {
-      if (currentGroup) {
-        if (currentGroup.length === 1) {
-          result.push({ type: "single", item: currentGroup[0] });
-        } else {
-          result.push({ type: "toolGroup", items: currentGroup });
-        }
-        currentGroup = null;
-      }
-      result.push({ type: "single", item });
-    }
-  }
-
-  if (currentGroup) {
-    if (currentGroup.length === 1) {
-      result.push({ type: "single", item: currentGroup[0] });
-    } else {
-      result.push({ type: "toolGroup", items: currentGroup });
-    }
-  }
-
-  return result;
-}
-
 const MAX_THINKING_CACHE_ENTRIES = 100;
 const thinkingContentCache = new Map<string, Promise<string>>();
 const MAX_MARKDOWN_CHARS = 100_000;
@@ -128,7 +101,7 @@ function formatMessageSize(chars: number): string {
   return chars >= 1_000_000 ? `${(chars / 1_000_000).toFixed(1)} MB` : `${Math.round(chars / 1_000)} KB`;
 }
 
-export function SafeMarkdownBody({ children, className, ...props }: ComponentProps<typeof MarkdownBody>) {
+export const SafeMarkdownBody = memo(function SafeMarkdownBody({ children, className, ...props }: ComponentProps<typeof MarkdownBody>) {
   const { t } = useI18n();
   const [showRaw, setShowRaw] = useState(false);
 
@@ -155,7 +128,7 @@ export function SafeMarkdownBody({ children, className, ...props }: ComponentPro
       </pre>
     </div>
   );
-}
+});
 
 function loadThinkingContent(sessionId: string, entryId: string, blockIndex: number): Promise<string> {
   const key = `${sessionId}:${entryId}:${blockIndex}`;
@@ -194,19 +167,44 @@ interface Props {
   cwd?: string;
   onOpenFile?: (filePath: string) => void;
   entryId?: string;
-  /** Entry omp's `branch` command accepts for this message (a user entry, #103). */
+  /** Entry the fork of this row cuts at, inclusive (see lib/chat-fork.ts). */
   forkEntryId?: string;
-  onFork?: (entryId: string) => void;
+  /** Prompt text the fork puts back into the composer (edit-and-resend). */
+  forkPrefill?: string;
+  onFork?: (entryId: string, prefill?: string) => void;
   forking?: boolean;
-  onNavigate?: (entryId: string) => boolean | Promise<boolean>;
-  prevAssistantEntryId?: string;
-  onEditContent?: (content: string) => void;
+  forkDisabled?: boolean;
+  onEdit?: (entryId: string, content: string) => Promise<boolean>;
+  editing?: boolean;
+  editDisabled?: boolean;
   showTimestamp?: boolean;
   prevTimestamp?: number;
   sessionId?: string;
   toolCallsDefaultCollapsed?: boolean;
+  /** Open thinking blocks on mount ("Expand thinking blocks by default" in Settings). */
+  expandThinkingByDefault?: boolean;
+  /** omp `hideThinkingBlock`: omit thinking blocks. */
+  hideThinking?: boolean;
+  /** Source `content` index of each block when `message` carries a subset of an entry's blocks, so deferred thinking loads the right block. */
+  sourceBlockIndices?: number[];
   /** omp-reported output throughput (get_state.tokensPerSecond), live while streaming. */
   liveTokensPerSecond?: number | null;
+  /** True only for the one advisor card this should render the "Have the
+   *  agent address this" button on — ChatWindow computes the predicate
+   *  (lib/chat-transcript-plan.ts's lastUnaddressedAdvisorIndex) plus the
+   *  session-idle gate and passes it down per row, same pattern as onFork. */
+  canAddressAdvisor?: boolean;
+  onAddressAdvisor?: () => void;
+  /** True while a `continue` RPC triggered by this button is in flight. */
+  addressingAdvisor?: boolean;
+  /** True only for the one failed assistant message omp's `/retry` would
+   *  re-run — ChatWindow computes the predicate (lastRetryableErrorIndex)
+   *  plus the session-idle gate and passes it down per row, as for the
+   *  advisor button. */
+  canRetryRun?: boolean;
+  onRetryRun?: () => void;
+  /** True while the `/retry` prompt triggered by this button is in flight. */
+  retryingRun?: boolean;
 }
 
 function formatTime(ts: number | undefined, locale: Locale): string | null {
@@ -222,26 +220,66 @@ function formatTime(ts: number | undefined, locale: Locale): string | null {
   return `${date} ${time}`;
 }
 
-function haveSameRelevantToolResults(
+export function haveSameRelevantToolResults(
   message: AgentMessage,
   previous: Map<string, ToolResultMessage> | undefined,
   next: Map<string, ToolResultMessage> | undefined,
 ): boolean {
-  if (previous === next || message.role !== "assistant") return true;
-  for (const block of (message as AssistantMessage).content ?? []) {
-    if (block.type === "toolCall" && previous?.get(block.toolCallId) !== next?.get(block.toolCallId)) {
-      return false;
+  if (previous === next) return true;
+  if (message.role !== "assistant") return true;
+  const content = (message as AssistantMessage).content;
+  if (!Array.isArray(content)) return true;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "toolCall") {
+      if (previous?.get(block.toolCallId) !== next?.get(block.toolCallId)) {
+        return false;
+      }
     }
   }
   return true;
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, liveTokensPerSecond }: Props) {
+export function areMessageViewPropsEqual(prev: Props, next: Props): boolean {
+  return Object.is(prev.message, next.message)
+    && Object.is(prev.isStreaming, next.isStreaming)
+    && haveSameRelevantToolResults(prev.message, prev.toolResults, next.toolResults)
+    && Object.is(prev.modelNames, next.modelNames)
+    && Object.is(prev.cwd, next.cwd)
+    && Object.is(prev.onOpenFile, next.onOpenFile)
+    && Object.is(prev.entryId, next.entryId)
+    && Object.is(prev.forkEntryId, next.forkEntryId)
+    && Object.is(prev.forkPrefill, next.forkPrefill)
+    && Object.is(prev.onFork, next.onFork)
+    && Object.is(prev.forking, next.forking)
+    && Object.is(prev.forkDisabled, next.forkDisabled)
+    && Object.is(prev.onEdit, next.onEdit)
+    && Object.is(prev.editing, next.editing)
+    && Object.is(prev.editDisabled, next.editDisabled)
+    && Object.is(prev.showTimestamp, next.showTimestamp)
+    && Object.is(prev.prevTimestamp, next.prevTimestamp)
+    && Object.is(prev.sessionId, next.sessionId)
+    && Object.is(prev.toolCallsDefaultCollapsed, next.toolCallsDefaultCollapsed)
+    && Object.is(prev.expandThinkingByDefault, next.expandThinkingByDefault)
+    && Object.is(prev.hideThinking, next.hideThinking)
+    && prev.sourceBlockIndices?.join() === next.sourceBlockIndices?.join()
+    && Object.is(prev.canAddressAdvisor, next.canAddressAdvisor)
+    && Object.is(prev.onAddressAdvisor, next.onAddressAdvisor)
+    && Object.is(prev.addressingAdvisor, next.addressingAdvisor)
+    && Object.is(prev.canRetryRun, next.canRetryRun)
+    && Object.is(prev.onRetryRun, next.onRetryRun)
+    && Object.is(prev.retryingRun, next.retryingRun)
+    && (!prev.isStreaming || Object.is(prev.liveTokensPerSecond, next.liveTokensPerSecond));
+}
+
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkPrefill, onFork, forking, forkDisabled, onEdit, editing, editDisabled, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond, canAddressAdvisor, onAddressAdvisor, addressingAdvisor, canRetryRun, onRetryRun, retryingRun }: Props) {
   if (message.role === "user") {
-    return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onNavigate={onNavigate} prevAssistantEntryId={prevAssistantEntryId} onEditContent={onEditContent} />;
+    const user = message as UserMessage;
+    if (user.origin) return <OriginMessageView message={user} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} forkPrefill={forkPrefill} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
+    return <UserMessageView message={user} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} forkPrefill={forkPrefill} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
   }
   if (message.role === "assistant") {
-    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} onFork={onFork} forking={forking} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} liveTokensPerSecond={liveTokensPerSecond} />;
+    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} forkPrefill={forkPrefill} onFork={onFork} forking={forking} forkDisabled={forkDisabled} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} expandThinkingByDefault={expandThinkingByDefault} hideThinking={hideThinking} sourceBlockIndices={sourceBlockIndices} liveTokensPerSecond={liveTokensPerSecond} canRetryRun={canRetryRun} onRetryRun={onRetryRun} retryingRun={retryingRun} />;
   }
   if (message.role === "toolResult") {
     // Rendered inline under its toolCall — skip standalone rendering if paired
@@ -249,41 +287,32 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
   }
   if (message.role === "custom") {
     const custom = message as CustomMessage;
-    if (custom.customType === "xdev-mount-notice") {
+    if (custom.customType === "xdev-mount-notice" || isPassiveToolContext(custom)) {
       return null;
     }
     if (custom.customType === "compaction") {
-      return <CompactionMessageView message={custom} />;
+      return <CompactionMessageView message={custom} sessionId={sessionId} />;
     }
     if (custom.display === false) {
-      return <HiddenExtensionView message={custom} cwd={cwd} onOpenFile={onOpenFile} />;
+      return <HiddenExtensionView message={custom} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} />;
     }
-    return <CustomMessageView message={custom} cwd={cwd} onOpenFile={onOpenFile} />;
+    return (
+      <CustomMessageView
+        message={custom}
+        cwd={cwd}
+        onOpenFile={onOpenFile}
+        sessionId={sessionId}
+        canAddressAdvisor={canAddressAdvisor}
+        onAddressAdvisor={onAddressAdvisor}
+        addressingAdvisor={addressingAdvisor}
+      />
+    );
   }
   if (message.role === "bashExecution") {
-    return <BashExecutionView message={message as BashExecutionMessage} sessionId={sessionId} />;
+    return <BashExecutionView message={message as BashExecutionMessage} sessionId={sessionId} entryId={entryId} />;
   }
   return null;
-}, (prev, next) => {
-  return prev.message === next.message
-    && prev.isStreaming === next.isStreaming
-    && haveSameRelevantToolResults(prev.message, prev.toolResults, next.toolResults)
-    && prev.modelNames === next.modelNames
-    && prev.cwd === next.cwd
-    && prev.onOpenFile === next.onOpenFile
-    && prev.entryId === next.entryId
-    && prev.forkEntryId === next.forkEntryId
-    && prev.onFork === next.onFork
-    && prev.forking === next.forking
-    && prev.onNavigate === next.onNavigate
-    && prev.prevAssistantEntryId === next.prevAssistantEntryId
-    && prev.onEditContent === next.onEditContent
-    && prev.showTimestamp === next.showTimestamp
-    && prev.prevTimestamp === next.prevTimestamp
-    && prev.sessionId === next.sessionId
-    && prev.toolCallsDefaultCollapsed === next.toolCallsDefaultCollapsed
-    && (!prev.isStreaming || prev.liveTokensPerSecond === next.liveTokensPerSecond);
-});
+}, areMessageViewPropsEqual);
 
 // lib/types.ts ImageContent uses the Anthropic-style {source:{type,data,media_type,url}}
 // shape; pi-ai on-disk format uses flat {data, mimeType} — handle both.
@@ -301,22 +330,40 @@ function imageBlockSrc(img: ImageContent): string {
 /**
  * "New session" (fork) action, shared by user and assistant messages.
  *
- * omp's `branch` command accepts a user-message entry only (an assistant entry
- * answers "Invalid entry ID for branching"), so `entryId` is the branch point
- * resolved by `resolveForkEntryIds` — for an assistant reply, the user prompt
- * that started its turn (#103).
+ * Forking starts a second omp on a copy of the history up to `entryId`
+ * (inclusive), so it works while the session is running. The row's cut point
+ * comes from `resolveForkTargets` — its own entry for an assistant reply, the
+ * preceding entry for a prompt, whose text comes back as `prefill`.
  */
-function ForkSessionButton({ entryId, onFork, forking }: {
+function ForkSessionButton({ entryId, prefill, onFork, forking, forkDisabled }: {
   entryId: string;
-  onFork: (entryId: string) => void;
+  prefill?: string;
+  onFork: (entryId: string, prefill?: string) => void;
   forking?: boolean;
+  forkDisabled?: boolean;
 }) {
   const { t } = useI18n();
+  // Rows are keyed by index, so bind the dialog to the entry it was opened for.
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  if (confirmingId !== null && confirmingId !== entryId) setConfirmingId(null);
+  const confirming = confirmingId === entryId;
+  const blocked = forkDisabled || forking;
   return (
+    <>
+    <ConfirmDialog
+      open={confirming}
+      onOpenChange={(open) => { setConfirmingId(open ? entryId : null); }}
+      title={t("messageView.forkConfirmTitle")}
+      // A prefill is a prompt row's text, so only then does the fork edit-and-resend.
+      description={t(prefill === undefined ? "messageView.forkConfirmBody" : "messageView.forkConfirmEditBody")}
+      confirmLabel={t("messageView.newSession")}
+      cancelLabel={t("chatInput.cancel")}
+      onConfirm={() => { setConfirmingId(null); if (!blocked) onFork(entryId, prefill); }}
+    />
     <Tooltip content={forking ? t("messageView.creatingSession") : t("messageView.newSessionTitle")}>
       <button
-        onClick={() => { onFork(entryId); }}
-        disabled={forking}
+        onClick={() => { setConfirmingId(entryId); }}
+        disabled={blocked}
         aria-label={forking ? t("messageView.creatingSession") : t("messageView.newSessionTitle")}
         style={{
           display: "flex", alignItems: "center", gap: 4,
@@ -324,34 +371,122 @@ function ForkSessionButton({ entryId, onFork, forking }: {
           background: "none", border: "none",
           borderRadius: 5,
           color: forking ? "var(--accent)" : "var(--text-dim)",
-          cursor: forking ? "not-allowed" : "pointer",
+          cursor: blocked ? "not-allowed" : "pointer",
           fontSize: 11, fontWeight: 400,
           whiteSpace: "nowrap",
           transition: "color var(--dur-fast) var(--ease-out-warm)",
         }}
-        onMouseEnter={(e) => { if (!forking) e.currentTarget.style.color = "var(--accent)"; }}
-        onMouseLeave={(e) => { if (!forking) e.currentTarget.style.color = "var(--text-dim)"; }}
+        onMouseEnter={(e) => { if (!blocked) e.currentTarget.style.color = "var(--accent)"; }}
+        onMouseLeave={(e) => { if (!blocked) e.currentTarget.style.color = "var(--text-dim)"; }}
       >
         <GitFork size={11} strokeWidth={1.8} />
         {forking ? t("messageView.creating") : t("messageView.newSession")}
       </button>
     </Tooltip>
+    </>
   );
 }
-function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent }: {  message: UserMessage;
+
+/**
+ * Resumes the agent on the hidden `continue` RPC directive so it acts on the
+ * advisor notes above. ChatWindow only passes a truthy `onAddressAdvisor` to
+ * the one advisor card this should render on (lastUnaddressedAdvisorIndex +
+ * session-idle), so the card itself just renders when asked.
+ */
+function AddressAdvisorButton({ onAddressAdvisor, addressing }: {
+  onAddressAdvisor: () => void;
+  addressing?: boolean;
+}) {
+  const { t } = useI18n();
+  const label = addressing ? t("messageView.advisorAddressing") : t("messageView.advisorAddressButton");
+  return (
+    <Tooltip content={t("messageView.advisorAddressTooltip")}>
+      <button
+        onClick={onAddressAdvisor}
+        disabled={addressing}
+        aria-label={label}
+        style={{
+          display: "flex", alignItems: "center", gap: 4,
+          padding: "3px 8px", height: 24, minHeight: 24,
+          background: "none", border: "none",
+          borderRadius: 5,
+          color: addressing ? "var(--accent)" : "var(--text-dim)",
+          cursor: addressing ? "not-allowed" : "pointer",
+          fontSize: 11, fontWeight: 400,
+          whiteSpace: "nowrap",
+          transition: "color var(--dur-fast) var(--ease-out-warm)",
+        }}
+        onMouseEnter={(e) => { if (!addressing) e.currentTarget.style.color = "var(--accent)"; }}
+        onMouseLeave={(e) => { if (!addressing) e.currentTarget.style.color = "var(--text-dim)"; }}
+      >
+        <CornerDownLeft size={11} strokeWidth={1.8} />
+        {label}
+      </button>
+    </Tooltip>
+  );
+}
+
+/**
+ * Runs omp's builtin `/retry` on the failed turn this banner belongs to, so a
+ * prompt stopped by an expired key or a dropped connection does not have to be
+ * typed again. ChatWindow passes a truthy `onRetryRun` only to the one row
+ * `/retry` would re-run (lastRetryableErrorIndex + session-idle), so the
+ * banner just renders when asked.
+ */
+function RetryRunButton({ onRetryRun, retrying }: {
+  onRetryRun: () => void;
+  retrying?: boolean;
+}) {
+  const { t } = useI18n();
+  const label = retrying ? t("messageView.retrying") : t("messageView.retryTurn");
+  return (
+    <Tooltip content={t("messageView.retryTurnTooltip")}>
+      <button
+        type="button"
+        onClick={onRetryRun}
+        disabled={retrying}
+        aria-label={label}
+        style={{
+          display: "flex", alignItems: "center", gap: 4,
+          flexShrink: 0,
+          padding: "2px 8px", height: 22, minHeight: 22,
+          background: "none",
+          border: "1px solid color-mix(in srgb, var(--status-error) 35%, var(--border))",
+          borderRadius: 5,
+          color: "inherit",
+          cursor: retrying ? "not-allowed" : "pointer",
+          opacity: retrying ? 0.6 : 1,
+          fontSize: 11, fontWeight: 400,
+          whiteSpace: "nowrap",
+        }}
+      >
+        <RotateCcw size={11} strokeWidth={1.8} aria-hidden="true" />
+        {label}
+      </button>
+    </Tooltip>
+  );
+}
+function UserMessageView({ message, cwd, onOpenFile, sessionId, entryId, forkEntryId, forkPrefill, onFork, forking, forkDisabled, onEdit, editing, editDisabled }: {
+  message: UserMessage;
   cwd?: string;
   onOpenFile?: (filePath: string) => void;
+  sessionId?: string;
   entryId?: string;
-  onFork?: (entryId: string) => void;
+  forkEntryId?: string;
+  forkPrefill?: string;
+  onFork?: (entryId: string, prefill?: string) => void;
   forking?: boolean;
-  onNavigate?: (entryId: string) => boolean | Promise<boolean>;
-  prevAssistantEntryId?: string;
-  onEditContent?: (content: string) => void;
+  forkDisabled?: boolean;
+  onEdit?: (entryId: string, content: string) => Promise<boolean>;
+  editing?: boolean;
+  editDisabled?: boolean;
 }) {
   const { t, locale } = useI18n();
   const bodyRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [hasOverflow, setHasOverflow] = useState(false);
+  // Rows are keyed by index, so bind the dialog to the entry it was opened for.
+  const [confirmingEditId, setConfirmingEditId] = useState<string | null>(null);
 
   const content =
     typeof message.content === "string"
@@ -381,8 +516,11 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
   }, [content, imageBlocks.length]);
 
   const time = formatTime(message.timestamp, locale);
-  const canFork = !!entryId && !!onFork;
-  const canNavigate = !!prevAssistantEntryId && !!onNavigate;
+  const canFork = !!forkEntryId && !!onFork;
+  const canEdit = !!entryId && !!onEdit && !message.branchSummary;
+  if (confirmingEditId !== null && (!canEdit || confirmingEditId !== entryId)) setConfirmingEditId(null);
+  const confirmingEdit = canEdit && confirmingEditId === entryId;
+  const editBlocked = editing || editDisabled || forking || forkDisabled;
 
   return (
     <div
@@ -429,15 +567,20 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
               })}
             </div>
           )}
-          {content && <div data-message-text><SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{content}</SafeMarkdownBody></div>}
+          {content && <div data-message-text data-entry-id={entryId}><SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile} sourceSessionId={sessionId}>{content}</SafeMarkdownBody></div>}
         </div>
-        {hasOverflow && (
+        {/* Expanding removes the cap, so the bubble stops overflowing; keep the toggle to collapse it again.
+            Collapsing restores the cap: assume overflow until the next measurement so the focused toggle stays mounted. */}
+        {(hasOverflow || expanded) && (
           <button
             type="button"
             className="message-overflow-toggle ui-focus-ring"
             aria-expanded={expanded}
             aria-label={expanded ? t("messageView.collapseInput") : t("messageView.showFullInput")}
-            onClick={() => setExpanded((value) => !value)}
+            onClick={() => {
+              if (expanded) setHasOverflow(true);
+              setExpanded(!expanded);
+            }}
           >
             <span>{expanded ? t("messageView.collapseInput") : t("messageView.showFullInput")}</span>
             <ChevronDown size={12} strokeWidth={1.8} aria-hidden="true" style={{ transform: expanded ? "rotate(180deg)" : "none" }} />
@@ -446,44 +589,54 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
 
         {/* Bottom row: action buttons + timestamp — inside the bubble's column,
             spanning its width, so the timestamp aligns with its right edge. */}
-          <div style={{
+          <div className="message-user-footer" style={{
             display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end",
             gap: 6, marginTop: 3, width: "100%",
           }}>
           <MessageCopyActions texts={[content]} bodyRef={bodyRef} />
-          {(canFork || canNavigate) && (
+          {(canEdit || canFork) && (
             <div
               style={{
                 display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 3,
               }}
             >
-              {canNavigate && (
-                <Tooltip content={t("messageView.editFromHereTitle")}>
-                  <button
-                    onClick={async () => { if (!(await onNavigate!(prevAssistantEntryId!))) return; onEditContent?.(content); }}
-                    aria-label={t("messageView.editFromHereTitle")}
-                    style={{
-                      display: "flex", alignItems: "center", gap: 4,
-                      padding: "3px 8px", height: 24, minHeight: 24,
-                      background: "none", border: "none",
-                      borderRadius: 5,
-                      color: "var(--text-dim)",
-                      cursor: "pointer",
-                      fontSize: 11, fontWeight: 400,
-                      whiteSpace: "nowrap",
-                      transition: "color var(--dur-fast) var(--ease-out-warm)",
-                    }}
-                    onMouseEnter={(e) => { e.currentTarget.style.color = "var(--accent)"; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-dim)"; }}
-                  >
-                    <CornerUpLeft size={11} strokeWidth={1.8} />
-                    {t("messageView.editFromHere")}
-                  </button>
-                </Tooltip>
-              )}
-              {canFork && (
-                <ForkSessionButton entryId={entryId!} onFork={onFork!} forking={forking} />
-              )}
+              {canEdit && <>
+              <ConfirmDialog
+                open={confirmingEdit}
+                onOpenChange={(open) => { setConfirmingEditId(open ? entryId! : null); }}
+                title={t("messageView.editConfirmTitle")}
+                description={t("messageView.editConfirmBody")}
+                confirmLabel={t("messageView.editFromHere")}
+                cancelLabel={t("chatInput.cancel")}
+                onConfirm={() => { setConfirmingEditId(null); if (!editBlocked) void onEdit!(entryId!, content); }}
+              />
+              <Tooltip content={t("messageView.editFromHereTitle")}>
+                <button
+                  onClick={() => { setConfirmingEditId(entryId!); }}
+                  disabled={editBlocked}
+                  aria-busy={editing || undefined}
+                  aria-label={t("messageView.editFromHereTitle")}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 4,
+                    padding: "3px 8px", height: 24, minHeight: 24,
+                    background: "none", border: "none",
+                    borderRadius: 5,
+                    color: "var(--text-dim)",
+                    cursor: editBlocked ? "not-allowed" : "pointer",
+                    opacity: editBlocked ? 0.4 : 1,
+                    fontSize: 11, fontWeight: 400,
+                    whiteSpace: "nowrap",
+                    transition: "color var(--dur-fast) var(--ease-out-warm)",
+                  }}
+                  onMouseEnter={(e) => { if (!editBlocked) e.currentTarget.style.color = "var(--accent)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-dim)"; }}
+                >
+                  <CornerUpLeft size={11} strokeWidth={1.8} />
+                  {t("messageView.editFromHere")}
+                </button>
+              </Tooltip>
+              </>}
+              {canFork && <ForkSessionButton entryId={forkEntryId!} prefill={forkPrefill} onFork={onFork!} forking={forking} forkDisabled={forkDisabled || editing || editDisabled} />}
             </div>
           )}
           {time && <span style={{ fontSize: 10, color: "var(--text-dim)" }}>{time}</span>}
@@ -492,18 +645,118 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
     </div>
   );
 }
-export function isInterruptedMessage(errorMessage?: string | null, stopReason?: string): boolean {
-  if (stopReason === "aborted") return true;
-  if (!errorMessage) return false;
-  const lower = errorMessage.toLowerCase().trim();
+
+const heldActionStyle = {
+  display: "flex", alignItems: "center", gap: 4, padding: "3px 8px", height: 24, minHeight: 24,
+  background: "none", border: "none", borderRadius: 5, color: "var(--text-dim)", cursor: "pointer",
+  fontSize: 11, whiteSpace: "nowrap",
+} as const;
+
+/** A message omp-web holds until omp has it (docs/specs/2026-11-04-message-outbox-design.md O1): dimmed, after the
+ * live turn, naming the leg it waits on. Delete only while nothing of it can have reached omp; Retry a failed one. */
+export function HeldMessageView({ held, hostLabel, onDelete, onRetry }: {
+  held: HeldMessage;
+  hostLabel?: string;
+  onDelete?: (id: string) => void;
+  onRetry?: (id: string) => void;
+}) {
+  const { t, locale } = useI18n();
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [confirmingRetry, setConfirmingRetry] = useState(false);
+  const failed = held.state === "failed";
+  const status = failed
+    ? held.mayHaveBeenSent ? t("heldMessage.mayHaveBeenSent") : held.error ? t("heldMessage.notSentReason", { reason: held.error }) : t("heldMessage.notSent")
+    : held.state === "waiting_host" ? t("heldMessage.waitingForHost", { host: hostLabel || t("heldMessage.theHost") })
+    : held.state === "held" ? t("heldMessage.waiting")
+    : held.state === "delivering" ? t("heldMessage.delivering")
+    : t("heldMessage.sending");
+  const waits = held.state === "waiting_host" || held.state === "held";
+  const StatusIcon = failed ? CircleAlert : waits ? Clock : LoaderCircle;
+  const canDelete = !!onDelete && (failed || waits);
+  const mode = held.mode === "steer" ? t("heldMessage.modeSteer") : held.mode === "followUp" ? t("heldMessage.modeFollowUp") : t("heldMessage.modePrompt");
+  const time = formatTime(held.createdAt, locale);
   return (
-    lower === "interrupted by user" ||
-    lower === "interrupted" ||
-    lower === "generation stopped by user" ||
-    lower.startsWith("interrupted by user") ||
-    lower.startsWith("interrupted:") ||
-    lower === "aborted" ||
-    lower === "request aborted"
+    <div data-held-message={held.state} style={{ marginBottom: 18, display: "flex", flexDirection: "column", alignItems: "flex-end", paddingRight: 6 }}>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", maxWidth: "85%", minWidth: 0 }}>
+        <div
+          className="chat-message-card"
+          style={{
+            maxWidth: "100%", minWidth: 0, background: "var(--user-bg)", border: "none", borderLeft: "3px solid var(--accent)",
+            borderRadius: "var(--radius-card)", padding: "8px 12px", fontSize: "var(--chat-user-font-size)",
+            lineHeight: "var(--chat-line-height)", color: "var(--text-muted)", opacity: 0.7, wordBreak: "break-word",
+            maxHeight: USER_BUBBLE_MAX_HEIGHT, overflowY: "auto",
+          }}
+        >
+          {held.origin?.kind === "session" && held.origin.session ? (
+            <div style={{ marginBottom: 6, color: "var(--text-dim)", fontSize: 11 }}>
+              From <SessionLink session={held.origin.session} />
+            </div>
+          ) : held.origin?.kind === "github" && held.origin.github ? (
+            <div style={{ marginBottom: 6, color: "var(--text-dim)", fontSize: 11 }}>
+              From <a href={held.origin.github.url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)" }}>{held.origin.github.repo}#{held.origin.github.number}</a>
+            </div>
+          ) : null}
+          {held.images?.length ? (
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: held.message ? 8 : 0 }}>
+              {held.images.map((image, i) => (
+                <img key={i} src={`data:${image.mimeType};base64,${image.data}`} alt="" style={{ maxWidth: 120, maxHeight: 120, borderRadius: 6, objectFit: "contain", display: "block" }} />
+              ))}
+            </div>
+          ) : null}
+          {held.message && <SafeMarkdownBody className="markdown-user-message">{held.message}</SafeMarkdownBody>}
+          {held.uploads?.length ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 4, fontSize: 11 }}>
+              <Paperclip size={11} strokeWidth={1.8} aria-hidden />
+              {t("heldMessage.files", { count: held.uploads.length })}
+            </div>
+          ) : null}
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end", gap: 6, marginTop: 3, width: "100%", fontSize: 11 }}>
+          <span style={{ padding: "1px 6px", border: "1px solid var(--border)", borderRadius: 999, color: "var(--text-dim)" }}>{mode}</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4, color: failed ? "var(--status-error)" : "var(--text-dim)" }}>
+            <StatusIcon size={12} strokeWidth={1.8} className={failed || waits ? undefined : "activity-row-spinner"} aria-hidden />
+            {status}
+          </span>
+          {failed && onRetry && <>
+            <button
+              type="button"
+              className="ui-focus-ring"
+              style={heldActionStyle}
+              onClick={() => held.mayHaveBeenSent ? setConfirmingRetry(true) : onRetry(held.id)}
+              aria-label={t("heldMessage.retryTitle")}
+            >
+              <RotateCcw size={11} strokeWidth={1.8} aria-hidden />
+              {t("heldMessage.retry")}
+            </button>
+            <ConfirmDialog
+              open={confirmingRetry}
+              onOpenChange={setConfirmingRetry}
+              title={t("heldMessage.retryTitle")}
+              description={t("heldMessage.retryConfirmMayHaveBeenSent")}
+              confirmLabel={t("heldMessage.retry")}
+              cancelLabel={t("chatInput.cancel")}
+              onConfirm={() => { setConfirmingRetry(false); onRetry(held.id); }}
+            />
+          </>}
+          {canDelete && <>
+            <button type="button" className="ui-focus-ring" style={heldActionStyle} onClick={() => setConfirmingDelete(true)} aria-label={t("heldMessage.deleteTitle")}>
+              <Trash2 size={11} strokeWidth={1.8} aria-hidden />
+              {t("heldMessage.delete")}
+            </button>
+            <ConfirmDialog
+              open={confirmingDelete}
+              onOpenChange={setConfirmingDelete}
+              title={t("heldMessage.deleteTitle")}
+              description={t(failed && held.mayHaveBeenSent ? "heldMessage.deleteConfirmMayHaveBeenSent" : "heldMessage.deleteConfirmBody")}
+              confirmLabel={t("heldMessage.delete")}
+              cancelLabel={t("chatInput.cancel")}
+              onConfirm={() => { setConfirmingDelete(false); onDelete!(held.id); }}
+            />
+          </>}
+          {time && <span style={{ fontSize: 10, color: "var(--text-dim)" }}>{time}</span>}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -519,10 +772,18 @@ function AssistantMessageView({
   sessionId,
   entryId,
   forkEntryId,
+  forkPrefill,
   onFork,
   forking,
+  forkDisabled,
   toolCallsDefaultCollapsed,
+  expandThinkingByDefault,
+  hideThinking,
+  sourceBlockIndices,
   liveTokensPerSecond,
+  canRetryRun,
+  onRetryRun,
+  retryingRun,
 }: {
   message: AssistantMessage;
   isStreaming?: boolean;
@@ -534,12 +795,25 @@ function AssistantMessageView({
   prevTimestamp?: number;
   sessionId?: string;
   entryId?: string;
-  /** User entry omp's `branch` command accepts for this reply (#103). */
+  /** Entry this reply forks at, inclusive (see lib/chat-fork.ts). */
   forkEntryId?: string;
-  onFork?: (entryId: string) => void;
+  forkPrefill?: string;
+  onFork?: (entryId: string, prefill?: string) => void;
   forking?: boolean;
+  forkDisabled?: boolean;
   toolCallsDefaultCollapsed: boolean;
+  expandThinkingByDefault: boolean;
+  hideThinking: boolean;
+  sourceBlockIndices?: number[];
   liveTokensPerSecond?: number | null;
+  /** True only for the one failed assistant message omp's `/retry` would
+   *  re-run — ChatWindow computes the predicate (lastRetryableErrorIndex)
+   *  plus the session-idle gate and passes it down per row, as for the
+   *  advisor button. */
+  canRetryRun?: boolean;
+  onRetryRun?: () => void;
+  /** True while the `/retry` prompt triggered by this button is in flight. */
+  retryingRun?: boolean;
 }) {
   const { t, locale } = useI18n();
   const { isSupported: ttsSupported, isSpeaking: ttsSpeaking, speakingId: ttsSpeakingId, toggle: ttsToggle } = useSpeechContext();
@@ -556,10 +830,11 @@ function AssistantMessageView({
   const texts = (message.content ?? []).filter((block): block is TextContent => block.type === "text").map((block) => block.text);
   const canFork = !!forkEntryId && !!onFork;
   const blockItems = (message.content ?? [])
-    .map((block, originalIndex) => ({ block, originalIndex }))
-    .filter(({ block }) => !isEmptyThinkingBlock(block, { isStreaming }));
+    .map((block, index) => ({ block, originalIndex: sourceBlockIndices?.[index] ?? index }))
+    .filter(({ block }) => !(hideThinking && block.type === "thinking") && !isEmptyThinkingBlock(block, { isStreaming }));
   const blocks = blockItems.map(({ block }) => block);
-  const hasActivityBlocks = blocks.some((block) => block.type === "thinking" || block.type === "toolCall");
+  // Activity rows stay compact; a row that also carries reply text keeps its model label.
+  const hideHeader = blocks.some((block) => block.type === "thinking" || block.type === "toolCall") && !blocks.some(isReplyBlock);
   const errorMessage = message.errorMessage?.trim() || null;
   const isInterrupted = isInterruptedMessage(errorMessage, message.stopReason);
   const blockItemsRef = useRef(blockItems);
@@ -650,11 +925,12 @@ function AssistantMessageView({
     >
       {/* Model label */}
       <div
+        className="message-model-label"
         style={{
           fontSize: 11,
           color: "var(--text-dim)",
           marginBottom: 4,
-          display: hasActivityBlocks ? "none" : "flex",
+          display: hideHeader ? "none" : "flex",
           alignItems: "center",
           gap: 6,
         }}
@@ -700,38 +976,23 @@ function AssistantMessageView({
       </div>
 
       <div ref={bodyRef} data-selection-scope="message" tabIndex={-1} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-        {groupAdjacentBlocks(blockItems).map((group, groupIdx) => {
-          if (group.type === "single") {
-            const { block, originalIndex } = group.item;
-            return (
-              <BlockView
-                key={`${entryId ?? "stream"}-${originalIndex}`}
-                block={block}
-                toolResults={toolResults}
-                isStreaming={isStreaming}
-                streamingDuration={streamingDurations.get(originalIndex) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)}
-                toolCallDurations={toolCallDurations}
-                cwd={cwd}
-                onOpenFile={onOpenFile}
-                sessionId={sessionId}
-                entryId={entryId}
-                blockIndex={originalIndex}
-                toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
-              />
-            );
-          }
-          return (
-            <ToolCallGroupBlock
-              key={`${entryId ?? "stream"}-group-${groupIdx}`}
-              items={group.items}
-              toolResults={toolResults}
-              isStreaming={isStreaming}
-              toolCallDurations={toolCallDurations}
-              onOpenFile={onOpenFile}
-              toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
-            />
-          );
-        })}
+        {blockItems.map(({ block, originalIndex }) => (
+          <BlockView
+            key={`${entryId ?? "stream"}-${originalIndex}`}
+            block={block}
+            toolResults={toolResults}
+            isStreaming={isStreaming}
+            streamingDuration={streamingDurations.get(originalIndex) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)}
+            toolCallDurations={toolCallDurations}
+            cwd={cwd}
+            onOpenFile={onOpenFile}
+            sessionId={sessionId}
+            entryId={entryId}
+            blockIndex={originalIndex}
+            toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
+            expandThinkingByDefault={expandThinkingByDefault}
+          />
+        ))}
         {errorMessage && (
           isInterrupted ? (
             <div
@@ -771,14 +1032,15 @@ function AssistantMessageView({
               }}
             >
               <CircleAlert size={14} strokeWidth={1.8} aria-hidden="true" style={{ flexShrink: 0, marginTop: 1 }} />
-              <span>{t(errorMessage)}</span>
+              <span style={{ flex: 1, minWidth: 0 }}>{t(errorMessage)}</span>
+              {canRetryRun && onRetryRun && <RetryRunButton onRetryRun={onRetryRun} retrying={retryingRun} />}
             </div>
           )
         )}
       </div>
 
       {!isStreaming && (texts.some((text) => text.trim()) || time || canFork || (ttsSupported && speakableText.trim().length > 0)) && (
-        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 6, marginTop: 3 }}>
+        <div className="message-assistant-footer" style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 6, marginTop: 3 }}>
           <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 3 }}>
             <MessageCopyActions texts={texts} bodyRef={bodyRef} />
             {ttsSupported && speakableText.trim().length > 0 && (
@@ -791,11 +1053,11 @@ function AssistantMessageView({
                   style={isThisSpeaking ? { color: "var(--accent)", background: "var(--bg-hover)" } : undefined}
                 >
                   {isThisSpeaking ? <Square size={13} aria-hidden="true" /> : <Volume2 size={13} aria-hidden="true" />}
-                  <span>{isThisSpeaking ? t("messageView.stopSpeech") : t("messageView.readAloud")}</span>
+                  <span>{isThisSpeaking ? t("messageView.stopSpeech") : t("messageView.read")}</span>
                 </button>
               </Tooltip>
             )}
-            {canFork && <ForkSessionButton entryId={forkEntryId!} onFork={onFork!} forking={forking} />}
+            {canFork && <ForkSessionButton entryId={forkEntryId!} prefill={forkPrefill} onFork={onFork!} forking={forking} forkDisabled={forkDisabled} />}
           </div>
           {time && <span style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: "auto" }}>{time}</span>}
         </div>
@@ -804,18 +1066,18 @@ function AssistantMessageView({
   );
 }
 
-function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCallDurations, cwd, onOpenFile, sessionId, entryId, blockIndex, toolCallsDefaultCollapsed }: { block: AssistantContentBlock; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number>; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string; entryId?: string; blockIndex: number; toolCallsDefaultCollapsed: boolean }) {
+function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCallDurations, cwd, onOpenFile, sessionId, entryId, blockIndex, toolCallsDefaultCollapsed, expandThinkingByDefault }: { block: AssistantContentBlock; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number>; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string; entryId?: string; blockIndex: number; toolCallsDefaultCollapsed: boolean; expandThinkingByDefault: boolean }) {
   if (block.type === "text") {
-    return <TextBlock block={block as TextContent} isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} />;
+    return <TextBlock block={block as TextContent} isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} entryId={entryId} />;
   }
   if (block.type === "thinking") {
-    return <ThinkingBlock block={block as ThinkingContent} duration={streamingDuration} sessionId={sessionId} entryId={entryId} blockIndex={blockIndex} />;
+    return <ThinkingBlock block={block as ThinkingContent} duration={streamingDuration} sessionId={sessionId} entryId={entryId} blockIndex={blockIndex} expandByDefault={expandThinkingByDefault} />;
   }
   if (block.type === "toolCall") {
     const tc = block as ToolCallContent;
     const result = toolResults?.get(tc.toolCallId);
     const duration = toolCallDurations?.get(tc.toolCallId);
-    return <ToolCallBlock block={tc} result={result} duration={duration} isStreaming={isStreaming} defaultCollapsed={toolCallsDefaultCollapsed} onOpenFile={onOpenFile} />;
+    return <ToolCallBlock block={tc} result={result} duration={duration} isStreaming={isStreaming} defaultCollapsed={toolCallsDefaultCollapsed} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} />;
   }
   return null;
 }
@@ -825,43 +1087,69 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
 // instead of object identity: finished blocks of the streaming message then
 // skip their ReactMarkdown re-parse and only the actively growing block
 // re-renders per frame.
-const TextBlock = memo(function TextBlock({ block, isStreaming, cwd, onOpenFile }: { block: TextContent; isStreaming?: boolean; cwd?: string; onOpenFile?: (filePath: string) => void }) {
-  return <div data-message-text><SafeMarkdownBody isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile}>{block.text}</SafeMarkdownBody></div>;
+const TextBlock = memo(function TextBlock({ block, isStreaming, cwd, onOpenFile, sessionId, entryId }: { block: TextContent; isStreaming?: boolean; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string; entryId?: string }) {
+  // data-entry-id: search hits are located per message (useChatSearchHighlights).
+  return <div data-message-text data-entry-id={entryId}><SafeMarkdownBody autoCharts isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} sourceSessionId={sessionId}>{block.text}</SafeMarkdownBody></div>;
 }, (prev, next) => (
   prev.block.text === next.block.text
   && prev.isStreaming === next.isStreaming
   && prev.cwd === next.cwd
   && prev.onOpenFile === next.onOpenFile
+  && prev.sessionId === next.sessionId
+  && prev.entryId === next.entryId
 ));
 
-const ThinkingBlock = memo(function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex }: {
+const ThinkingBlock = memo(function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex, expandByDefault }: {
   block: ThinkingContent;
   duration?: number;
   sessionId?: string;
   entryId?: string;
   blockIndex: number;
+  expandByDefault: boolean;
 }) {
   const { t } = useI18n();
-  const [expanded, setExpanded] = useState(false);
+  // The preference only seeds the state: expanding/collapsing by hand keeps
+  // working per block. It deliberately applies to a streaming block too — the
+  // reasoning the user follows closely is exactly the one being written, a
+  // "completed only" rule would have to flip the state mid-stream (fighting a
+  // manual collapse), and remounts (reload, session switch) start from the
+  // preference again either way, so streaming and completed blocks stay
+  // consistent.
+  const [expanded, setExpanded] = useState(expandByDefault);
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadingRef = useRef(false);
 
-  const handleOpenChange = (nextOpen: boolean) => {
-    setExpanded(nextOpen);
-    if (!nextOpen || !block.deferred || content !== null) return;
+  const loadDeferredContent = useCallback(() => {
+    if (!block.deferred || content !== null || loadingRef.current) return;
     if (!sessionId || !entryId) {
       setError(t("messageView.thinkingUnavailable"));
       return;
     }
 
+    loadingRef.current = true;
     setLoading(true);
     setError(null);
     void loadThinkingContent(sessionId, entryId, blockIndex)
       .then((text) => setContent(text))
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoading(false));
+      .finally(() => {
+        loadingRef.current = false;
+        setLoading(false);
+      });
+  }, [block.deferred, blockIndex, content, entryId, sessionId, t]);
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    setExpanded(nextOpen);
+    if (nextOpen) loadDeferredContent();
   };
+
+  // A deferred block auto-expanded by the preference must fetch its text
+  // without a click; expanding by hand runs the same loader.
+  useEffect(() => {
+    if (expanded) loadDeferredContent();
+  }, [expanded, loadDeferredContent]);
 
   return (
     <div className="activity-row" data-activity-operation="true">
@@ -905,6 +1193,7 @@ const ThinkingBlock = memo(function ThinkingBlock({ block, duration, sessionId, 
   && prev.sessionId === next.sessionId
   && prev.entryId === next.entryId
   && prev.blockIndex === next.blockIndex
+  && prev.expandByDefault === next.expandByDefault
 ));
 
 
@@ -919,13 +1208,25 @@ function inputsShallowEqual(a: unknown, b: unknown): boolean {
   return keysA.every((k) => (a as Record<string, unknown>)[k] === (b as Record<string, unknown>)[k]);
 }
 
+/** The page a `read` of an http(s) URL fetched, without read selectors such as `:raw` or `:10-20`. */
+function readTargetWebUrl(target: string): string | null {
+  try {
+    const url = new URL(target);
+    url.pathname = url.pathname.replace(/(?::(?:raw|-?\d[\d,+-]*))+$/, "");
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
 const ToolCallBlock = memo(function ToolCallBlock({
   block,
   result,
   duration,
   isStreaming,
   defaultCollapsed = true,
-  inGroup = false,
+  cwd,
+  sessionId,
   onOpenFile,
 }: {
   block: ToolCallContent;
@@ -934,10 +1235,11 @@ const ToolCallBlock = memo(function ToolCallBlock({
   isStreaming?: boolean;
   defaultCollapsed?: boolean;
   cwd?: string;
-  inGroup?: boolean;
   onOpenFile?: (filePath: string) => void;
+  sessionId?: string;
 }) {
   const { t } = useI18n();
+  const openAgentLink = useContext(AgentLinkContext);
   // `partial` results are omp's live snapshots for a tool that is still
   // executing (see lib/types.ts); the committed toolResult replaces them.
   const isRunning = result?.partial === true;
@@ -962,6 +1264,47 @@ const ToolCallBlock = memo(function ToolCallBlock({
             .map((b) => b.text)
             .join("\n"))
     : null;
+  const agentToolResult = (block.toolName === "send_to_session" || block.toolName === "new_session") && resultText
+    ? (() => {
+        try {
+          const parsed: unknown = JSON.parse(resultText);
+          return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+        } catch {
+          return null;
+        }
+      })()
+    : null;
+  const resultSession = agentToolResult?.targetSession ?? agentToolResult?.session;
+  const resultTarget: SessionOriginRef | null = resultSession && typeof resultSession === "object"
+    && typeof (resultSession as Record<string, unknown>).id === "string"
+    && typeof (resultSession as Record<string, unknown>).hostId === "string"
+    && typeof (resultSession as Record<string, unknown>).hostLabel === "string"
+    ? resultSession as SessionOriginRef : null;
+  const targetId = block.toolName === "send_to_session" && typeof block.input.sessionId === "string"
+    ? block.input.sessionId : null;
+  const [resolvedTarget, setResolvedTarget] = useState<SessionOriginRef | null>(null);
+  useEffect(() => {
+    if (!targetId || resultTarget || result) return;
+    let current = true;
+    void resolveSessionRef(targetId).then((session) => { if (current) setResolvedTarget(session); }, () => {});
+    return () => { current = false; };
+  }, [targetId, resultTarget, result]);
+  const agentTarget = resultTarget ?? resolvedTarget;
+  const agentState = block.toolName === "send_to_session" || block.toolName === "new_session"
+    ? !result ? "Sending"
+      : result?.isError === true ? "Failed"
+      : agentToolResult?.declined === true ? "Declined"
+      : agentToolResult?.waited === true ? "Response received" : "Accepted"
+    : null;
+  const agentTool = agentState
+    ? `${agentState}${agentTarget ? ` · ${block.toolName === "send_to_session" ? "To" : "Started"} ${agentTarget.name?.trim() || "Untitled session"}` : ""}`
+    : null;
+  const agentPreview = agentTool
+    ? typeof block.input.message === "string" ? block.input.message
+      : typeof block.input.prompt === "string" ? block.input.prompt : ""
+    : null;
+  const passiveWrapper = result?.passiveContext ? parseLeadingWrapper(result.passiveContext) : null;
+  const passiveContextText = result?.passiveContext ? contextLine(result.passiveContext, passiveWrapper, t) : null;
   const resultImages = result && Array.isArray(result.content)
     ? result.content.filter((b): b is ImageContent => b.type === "image")
     : [];
@@ -995,15 +1338,24 @@ const ToolCallBlock = memo(function ToolCallBlock({
     : hubJobs
       ? hubJobs.map((job) => job.label).join(" · ")
       : null;
+  const rowPreview = agentPreview ?? hubPreview ?? preview;
 
-  const cleanFilePath = semantic.isFile && typeof block.input === "object" && block.input && "path" in block.input
-    ? String((block.input as Record<string, unknown>).path).split(":")[0]
+  const rawFilePath = semantic.isFile && typeof block.input === "object" && block.input && "path" in block.input
+    ? String((block.input as Record<string, unknown>).path).trim()
     : null;
+  const agentIds = agentLinkIds(rawFilePath ?? undefined);
+  // `history://`, `proc://`, `local://`, ... are resolved by omp, not files the viewer can open.
+  const hasUrlScheme = rawFilePath !== null && /^[a-z][a-z0-9+.-]*:\/\//i.test(rawFilePath);
+  const webUrl = hasUrlScheme && /^https?:\/\//i.test(rawFilePath) ? readTargetWebUrl(rawFilePath) : null;
+  // Strip only a trailing :<line> suffix. Splitting on the first ":" broke
+  // every Windows absolute path (C:\... -> "C") and POSIX filenames
+  // containing a colon; a drive-letter colon is never a line suffix.
+  const cleanFilePath = rawFilePath && !hasUrlScheme ? rawFilePath.replace(/:\d+$/, "") : null;
 
   return (
-    <div className={inGroup ? "activity-group-item" : "activity-row"} data-activity-operation="true">
+    <div className="activity-row" data-activity-operation="true">
       <Collapsible open={expanded} onOpenChange={setExpanded}>
-        <CollapsibleTrigger className={inGroup ? "activity-group-item-trigger" : "activity-row-trigger"}>
+        <CollapsibleTrigger className="activity-row-trigger">
           <span className={`activity-row-indicator${isError ? " activity-row-indicator-error" : ""}`} aria-hidden>
             {isError ? (
               <CircleAlert size={12} strokeWidth={1.8} />
@@ -1018,9 +1370,28 @@ const ToolCallBlock = memo(function ToolCallBlock({
           <span className="activity-tool-icon" aria-hidden>
             <ToolCategoryIcon category={category} size={12} />
           </span>
-          <span className={`activity-row-tool${isError ? " activity-row-tool-error" : ""}`}>{hubTool ?? block.toolName}</span>
+          <span className={`activity-row-tool${isError ? " activity-row-tool-error" : ""}`}>{agentTool ?? hubTool ?? block.toolName}</span>
           <span className="activity-row-preview">
-            {cleanFilePath && onOpenFile ? (
+            {agentIds.length > 0 && openAgentLink ? (
+              <span
+                role="link"
+                tabIndex={0}
+                className="activity-file-link"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openAgentLink(agentIds);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.stopPropagation();
+                    openAgentLink(agentIds);
+                  }
+                }}
+                title={rowPreview}
+              >
+                {rowPreview}
+              </span>
+            ) : cleanFilePath && onOpenFile ? (
               <span
                 role="button"
                 tabIndex={0}
@@ -1035,12 +1406,31 @@ const ToolCallBlock = memo(function ToolCallBlock({
                     onOpenFile(cleanFilePath);
                   }
                 }}
-                title={hubPreview ?? preview}
+                title={rowPreview}
               >
-                {hubPreview ?? preview}
+                {rowPreview}
+              </span>
+            ) : webUrl ? (
+              <span
+                role="link"
+                tabIndex={0}
+                className="activity-file-link"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.open(webUrl, "_blank", "noopener,noreferrer");
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.stopPropagation();
+                    window.open(webUrl, "_blank", "noopener,noreferrer");
+                  }
+                }}
+                title={webUrl}
+              >
+                {rowPreview}
               </span>
             ) : (
-              hubPreview ?? preview
+              rowPreview
             )}
           </span>
           {duration !== undefined && (
@@ -1057,7 +1447,17 @@ const ToolCallBlock = memo(function ToolCallBlock({
             }}
           />
         </CollapsibleTrigger>
+        {agentTarget && (
+          <div style={{ padding: "2px 10px 4px 36px", color: "var(--text-dim)", fontSize: 11 }}>
+            {block.toolName === "send_to_session" ? "Target " : "Session "}<SessionLink session={agentTarget} />
+          </div>
+        )}
         {resultMeta && <div className="activity-row-secondary">{resultMeta}</div>}
+        {passiveContextText && !expanded && (
+          <div className="activity-row-secondary" title={passiveContextText}>
+            <span aria-hidden>↳ </span>{passiveContextText}
+          </div>
+        )}
         {expanded && (
           <div className={`tool-call-details${isError ? " tool-call-details-error" : ""}`}>
             <div className="tool-call-command">
@@ -1073,6 +1473,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
                 {t(inputExpanded ? "messageView.collapseInput" : "messageView.showFullInput")}
               </button>
             </div>
+            <SvgWritePreviewPanel toolName={block.toolName} input={block.input} />
             <div id={inputId} hidden={!inputExpanded} className="tool-call-input">
               {inputExpanded && (
                 block.input && typeof block.input === "object" && !Array.isArray(block.input) && Object.keys(block.input).length > 0 ? (
@@ -1096,7 +1497,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
               </div>
             )}
             <TaskResultPanel details={result?.details} />
-            <HubResultPanel input={block.input} result={result} />
+            <HubResultPanel input={block.input} result={result} cwd={cwd} onOpenFile={onOpenFile} sourceSessionId={sessionId} />
             {isRunning && (resultText ?? "").trim() === "" ? (
               // No output yet: say so instead of the "(no output)" marker that
               // would claim the tool finished with nothing.
@@ -1113,7 +1514,8 @@ const ToolCallBlock = memo(function ToolCallBlock({
                       {resultImages.map((img, i) => (
                         <ClickableImage
                           key={i}
-                          src={imageBlockSrc(img)}
+                          src={img.url ? `${img.url}?thumb=1` : imageBlockSrc(img)}
+                          fullSrc={img.url}
                           alt=""
                           style={{ maxWidth: 240, maxHeight: 240, borderRadius: 6, objectFit: "contain", display: "block", border: "1px solid color-mix(in srgb, var(--accent) 18%, transparent)" }}
                         />
@@ -1126,6 +1528,19 @@ const ToolCallBlock = memo(function ToolCallBlock({
                 </>
               )
             ) : null}
+            {passiveContextText && (
+              <div className="tool-call-context">
+                {passiveWrapper ? (
+                  // Nested like a developer message: the wrapper as a header, its body below.
+                  <div className="tool-call-context-card">
+                    <div className="tool-call-context-title"><span aria-hidden>↳ </span>{wrapperTitle(passiveWrapper)}</div>
+                    {passiveWrapper.body && <div className="tool-call-context-body">{passiveWrapper.body}</div>}
+                  </div>
+                ) : (
+                  <><span aria-hidden>↳ </span>{passiveContextText}</>
+                )}
+              </div>
+            )}
           </div>
         )}
       </Collapsible>
@@ -1138,124 +1553,12 @@ const ToolCallBlock = memo(function ToolCallBlock({
   && prev.result === next.result
   && prev.duration === next.duration
   && prev.defaultCollapsed === next.defaultCollapsed
-  && prev.inGroup === next.inGroup
   && prev.onOpenFile === next.onOpenFile
+  && prev.cwd === next.cwd
+  && prev.sessionId === next.sessionId
 ));
 
-const ToolCallGroupBlock = memo(function ToolCallGroupBlock({
-  items,
-  toolResults,
-  isStreaming,
-  toolCallDurations,
-  onOpenFile,
-  toolCallsDefaultCollapsed,
-}: {
-  items: Array<{ block: ToolCallContent; originalIndex: number }>;
-  toolResults?: Map<string, ToolResultMessage>;
-  isStreaming?: boolean;
-  toolCallDurations?: Map<string, number>;
-  onOpenFile?: (filePath: string) => void;
-  toolCallsDefaultCollapsed: boolean;
-}) {
-  const { t } = useI18n();
-  const [expanded, setExpanded] = useState(!toolCallsDefaultCollapsed);
-  const blocks = items.map((i) => i.block);
-  const groupSummary = useMemo(() => summarizeToolCallGroup(blocks), [blocks]);
-
-  const hasError = blocks.some((b) => toolResults?.get(b.toolCallId)?.isError);
-  // A partial snapshot is a tool still executing, not a settled result.
-  const isPending = isStreaming && blocks.some((b) => {
-    const result = toolResults?.get(b.toolCallId);
-    return !result || result.partial === true;
-  });
-
-  const totalDuration = useMemo(() => {
-    if (!toolCallDurations) return undefined;
-    let sum = 0;
-    let counted = 0;
-    for (const b of blocks) {
-      const d = toolCallDurations.get(b.toolCallId);
-      if (d !== undefined) {
-        sum += d;
-        counted++;
-      }
-    }
-    return counted > 0 ? sum : undefined;
-  }, [blocks, toolCallDurations]);
-
-  return (
-    <div className="activity-group" data-activity-operation="true">
-      <Collapsible open={expanded} onOpenChange={setExpanded}>
-        <CollapsibleTrigger className="activity-group-header">
-          <span className="activity-group-icon-cluster" aria-hidden>
-            {groupSummary.categories.slice(0, 3).map((cat) => (
-              <ToolCategoryIcon key={cat} category={cat} size={12} />
-            ))}
-          </span>
-          <span className="activity-group-summary">
-            {groupSummary.summaryText}
-          </span>
-          {totalDuration !== undefined && (
-            <span className="activity-row-duration">
-              {t("messageView.durationSeconds", { seconds: totalDuration })}
-            </span>
-          )}
-          <span className={`activity-row-indicator${hasError ? " activity-row-indicator-error" : ""}`} aria-hidden>
-            {hasError ? (
-              <CircleAlert size={12} strokeWidth={1.8} />
-            ) : isPending ? (
-              <LoaderCircle size={12} strokeWidth={1.8} className="activity-row-spinner" />
-            ) : (
-              <Check size={12} strokeWidth={2} />
-            )}
-          </span>
-          <ChevronDown
-            size={12}
-            strokeWidth={1.8}
-            aria-hidden
-            style={{
-              flexShrink: 0,
-              transform: expanded ? "none" : "rotate(-90deg)",
-              transition: "transform var(--dur-fast) var(--ease-out-warm)",
-            }}
-          />
-        </CollapsibleTrigger>
-        {expanded && (
-          <div className="activity-group-body">
-            {items.map(({ block }) => {
-              const result = toolResults?.get(block.toolCallId);
-              const duration = toolCallDurations?.get(block.toolCallId);
-              return (
-                <ToolCallBlock
-                  key={block.toolCallId}
-                  block={block}
-                  result={result}
-                  duration={duration}
-                  isStreaming={isStreaming}
-                  defaultCollapsed={true}
-                  inGroup={true}
-                  onOpenFile={onOpenFile}
-                />
-              );
-            })}
-          </div>
-        )}
-      </Collapsible>
-    </div>
-  );
-}, (prev, next) => (
-  prev.items.length === next.items.length
-  && prev.items.every((item, i) => (
-    item.block.toolCallId === next.items[i]?.block.toolCallId
-    && item.block.toolName === next.items[i]?.block.toolName
-    && inputsShallowEqual(item.block.input, next.items[i]?.block.input)
-  ))
-  && prev.onOpenFile === next.onOpenFile
-  && (!prev.toolResults || !next.toolResults || prev.items.every((item) => prev.toolResults?.get(item.block.toolCallId) === next.toolResults?.get(item.block.toolCallId)))
-));
-
-
-function CompactionMessageView({ message }: { message: CustomMessage }) {
+function CompactionMessageView({ message, sessionId }: { message: CustomMessage; sessionId?: string }) {
   const { t, locale } = useI18n();
   const summary = getMessageText(message.content);
   const parsedSummary = useMemo(() => parseCompactionSummary(summary), [summary]);
@@ -1294,7 +1597,7 @@ function CompactionMessageView({ message }: { message: CustomMessage }) {
             </div>
           )}
           <div style={{ marginTop: 3, marginBottom: 10, color: "var(--text)", fontSize: 14, lineHeight: 1.5 }}>{t("messageView.compactionDescription")}</div>
-          {parsedSummary.body ? <MarkdownBody className="markdown-compaction-message">{parsedSummary.body}</MarkdownBody> : <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{t("messageView.noSummary")}</span>}
+          {parsedSummary.body ? <MarkdownBody className="markdown-compaction-message" sourceSessionId={sessionId}>{parsedSummary.body}</MarkdownBody> : <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{t("messageView.noSummary")}</span>}
           <CompactionFileMetadata readFiles={parsedSummary.readFiles} modifiedFiles={parsedSummary.modifiedFiles} />
         </div>
       </div>
@@ -1335,12 +1638,51 @@ function CompactionFileList({ title, files }: { title: string; files: string[] }
 function stripHiddenWrappers(text: string): string {
   let t = text.trim();
   t = t.replace(/^<!--[\s\S]*?-->\s*/, "").trim();
-  const outer = t.match(/^<([a-zA-Z0-9_-]+)(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/\1>\s*$/);
+  // No `\s*` around the lazy body: that pair backtracks super-quadratically on
+  // whitespace runs. Trim the capture instead.
+  const outer = t.match(/^<([a-zA-Z0-9_-]+)(?:\s(?:[^>"]|"[^"]*")*)?>([\s\S]*)<\/\1>$/);
   if (outer) return outer[2].trim();
   return t;
 }
 
+/**
+ * `<system-reminder reason="…" rule="…">body</system-reminder>` → tag, attributes
+ * and body. The closing tag is optional: the passive-context length cap can cut it.
+ */
+function parseLeadingWrapper(text: string): { tag: string; attrs: [string, string][]; body: string } | null {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^<([\w-]+)((?:\s+[\w-]+="[^"]*")*)\s*>/);
+  if (!match) return null;
+  const closing = `</${match[1]}>`;
+  const body = trimmed.slice(match[0].length);
+  return {
+    tag: match[1],
+    attrs: [...match[2].matchAll(/([\w-]+)="([^"]*)"/g)].map((attr) => [attr[1], attr[2]]),
+    body: (body.endsWith(closing) ? body.slice(0, -closing.length) : body).trim(),
+  };
+}
+
+/** `<system-reminder reason="…" rule="…">` → "system-reminder · reason=… · rule=…"; empty values are skipped. */
+function wrapperTitle(wrapper: { tag: string; attrs: [string, string][] }): string {
+  return [wrapper.tag, ...wrapper.attrs.filter(([, value]) => value).map(([key, value]) => `${key}=${value}`)].join(" · ");
+}
+
+/** "Context (system-reminder · rule=ts-set-map · …): body" for a wrapped passive context, plain otherwise. */
+function contextLine(
+  text: string,
+  wrapper: { tag: string; attrs: [string, string][]; body: string } | null,
+  t: (key: string, params?: Record<string, string>) => string,
+): string {
+  return wrapper
+    ? t("messageView.passiveContextLabeled", { label: wrapperTitle(wrapper), text: wrapper.body })
+    : t("messageView.passiveContext", { text });
+}
+
 function friendlyHiddenLabel(customType: string, t: (key: string) => string): string {
+  // The `continue` RPC's synthetic resume directive is the one hidden custom
+  // type with a localized label (messageView.advisorResumeMarker) rather than
+  // a static English string in the map below.
+  if (customType === DEVELOPER_MARKER_CUSTOM_TYPE) return t("messageView.advisorResumeMarker");
   const map: Record<string, string> = {
     "mid-run-todo-nudge": "Todo reminder",
     "todo-error-reminder": "Todo reminder",
@@ -1362,7 +1704,7 @@ function friendlyHiddenLabel(customType: string, t: (key: string) => string): st
   return customType.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-function HiddenExtensionView({ message, cwd, onOpenFile }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string) => void }) {
+function HiddenExtensionView({ message, cwd, onOpenFile, sessionId }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string }) {
   const { t, locale } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const [detailsExpanded, setDetailsExpanded] = useState(false);
@@ -1451,7 +1793,7 @@ function HiddenExtensionView({ message, cwd, onOpenFile }: { message: CustomMess
                 </div>
               )}
               {cleanText ? (
-                <MarkdownBody className="markdown-custom-message" cwd={cwd} onOpenFile={onOpenFile}>
+                <MarkdownBody className="markdown-custom-message" cwd={cwd} onOpenFile={onOpenFile} sourceSessionId={sessionId}>
                   {cleanText}
                 </MarkdownBody>
               ) : (
@@ -1551,9 +1893,21 @@ function HiddenExtensionView({ message, cwd, onOpenFile }: { message: CustomMess
   );
 }
 
-function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string) => void }) {
+function CustomMessageView({ message, cwd, onOpenFile, sessionId, canAddressAdvisor, onAddressAdvisor, addressingAdvisor }: {
+  message: CustomMessage;
+  cwd?: string;
+  onOpenFile?: (filePath: string) => void;
+  sessionId?: string;
+  canAddressAdvisor?: boolean;
+  onAddressAdvisor?: () => void;
+  addressingAdvisor?: boolean;
+}) {
   const { t, locale } = useI18n();
-  const [contentExpanded, setContentExpanded] = useState(true);
+  // Reminders and job notices are activity, as in the TUI: start collapsed to
+  // their first line; the header toggles them like a tool call.
+  const isDeveloper = message.customType === "developer";
+  const isNotice = isDeveloper || message.customType === "async-result" || message.customType === "lsp-late-diagnostic";
+  const [contentExpanded, setContentExpanded] = useState(!isNotice);
   const [detailsExpanded, setDetailsExpanded] = useState(false);
   const { copied, copy: copyContent } = useCopyFeedback();
   const text = getMessageText(message.content);
@@ -1562,12 +1916,18 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
   const detailsText = hasDetails ? safeJson(message.details) : "";
   const isIrc = IRC_CUSTOM_TYPES.has(message.customType);
   const ircEnvelope = isIrc ? parseIrcEnvelope(text) : null;
-  // Async results are raw job output (bash, task, ...) wrapped in <system-notice>.
-  // As markdown the wrapper turns the body into one raw HTML block (newlines
-  // collapse) and `---` becomes a heading, so strip it and show them verbatim.
-  const isPlainText = message.customType === "async-result";
-  const displayText = ircEnvelope ? ircEnvelope.body : isPlainText ? stripHiddenWrappers(text) : text;
-  const title = isIrc
+  // Async results (raw job output) and late LSP diagnostics are plain text wrapped
+  // in <system-notice>. As markdown the wrapper turns the body into one raw HTML
+  // block (newlines collapse) and `---` becomes a heading, so strip it and show
+  // them verbatim.
+  const isPlainText = message.customType === "async-result" || message.customType === "lsp-late-diagnostic";
+  const displayText = ircEnvelope ? ircEnvelope.body : isPlainText || isDeveloper ? stripHiddenWrappers(text) : text;
+  const wrapper = isDeveloper ? parseLeadingWrapper(text) : null;
+  const firstLine = displayText.split("\n").find((line) => line.trim())?.trim() ?? "";
+  const collapsedPreview = firstLine && firstLine !== displayText.trim() ? `${firstLine} …` : firstLine;
+  const title = wrapper
+    ? wrapperTitle(wrapper)
+    : isIrc
     ? (ircEnvelope?.sender ?? formatCustomType(message.customType))
     : message.customType === "advisor"
       ? t("messageView.advisorLabel")
@@ -1588,6 +1948,11 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
         }}
       >
         <div
+          role={isNotice ? "button" : undefined}
+          tabIndex={isNotice ? 0 : undefined}
+          aria-expanded={isNotice ? contentExpanded : undefined}
+          onClick={isNotice ? () => setContentExpanded((v) => !v) : undefined}
+          onKeyDown={isNotice ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setContentExpanded((v) => !v); } } : undefined}
           style={{
             userSelect: "none",
             display: "flex",
@@ -1598,12 +1963,28 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
             background: "var(--bg-panel)",
             color: "var(--text-muted)",
             fontSize: 12,
+            cursor: isNotice ? "pointer" : undefined,
           }}
         >
-          <span style={{ color: "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: 11, fontWeight: 650 }}>
+          {isNotice && (
+            <ChevronDown size={12} strokeWidth={1.8} aria-hidden="true" style={{ flexShrink: 0, transform: contentExpanded ? "none" : "rotate(-90deg)" }} />
+          )}
+          <span
+            style={{
+              color: "var(--text-muted)",
+              fontFamily: "var(--font-mono)",
+              fontSize: 11,
+              fontWeight: 650,
+              minWidth: 0,
+              // Collapsed notices keep the header to one line, like a tool call's arguments.
+              ...(isNotice && !contentExpanded
+                ? { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }
+                : { overflowWrap: "anywhere" }),
+            }}
+          >
             {isIrc && message.customType === "irc:incoming" ? `← ${title}` : title}
           </span>
-          {time && <span style={{ marginLeft: "auto", color: "var(--text-dim)", fontSize: 10 }}>{time}</span>}
+          {time && <span style={{ marginLeft: "auto", flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>{time}</span>}
         </div>
 
         {contentExpanded ? (
@@ -1631,7 +2012,7 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
                 {displayText}
               </pre>
             ) : (
-              <MarkdownBody className="markdown-custom-message" cwd={cwd} onOpenFile={onOpenFile}>{displayText}</MarkdownBody>
+              <MarkdownBody className="markdown-custom-message" cwd={cwd} onOpenFile={onOpenFile} sourceSessionId={sessionId}>{displayText}</MarkdownBody>
             )}
           </div>
         ) : (
@@ -1647,9 +2028,10 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
               cursor: "pointer",
               fontSize: 12,
               textAlign: "left",
+              ...(isNotice ? { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } : {}),
             }}
           >
-            {displayText ? previewText(displayText) : t("messageView.showExtensionMessage")}
+            {isNotice && collapsedPreview ? collapsedPreview : displayText ? previewText(displayText) : t("messageView.showExtensionMessage")}
           </button>
         )}
 
@@ -1679,6 +2061,9 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
               {copied ? t("messageView.copied") : t("messageView.copy")}
             </button>
           ) : null}
+          {message.customType === "advisor" && canAddressAdvisor && onAddressAdvisor && (
+            <AddressAdvisorButton onAddressAdvisor={onAddressAdvisor} addressing={addressingAdvisor} />
+          )}
           {hasDetails && (
             <button
               onClick={() => {
@@ -1785,8 +2170,10 @@ function previewText(text: string): string {
   return normalized.length > 140 ? `${normalized.slice(0, 140)}...` : normalized;
 }
 
-function BashExecutionView({ message, sessionId }: { message: BashExecutionMessage; sessionId?: string }) {
+function BashExecutionView({ message, sessionId, entryId }: { message: BashExecutionMessage; sessionId?: string; entryId?: string }) {
   const { t } = useI18n();
+  const fileSource = useContext(WorkspaceFileContext);
+  const hostQuery = fileSource ? `&hostId=${encodeURIComponent(fileSource.hostId)}` : "";
   const [fullOutput, setFullOutput] = useState<{ phase: "loading" } | { phase: "error"; message: string } | { phase: "ready"; output: string } | null>(null);
   // Bumped on every message change; an in-flight fetch from the previous
   // message must not write into the reused component instance.
@@ -1797,30 +2184,14 @@ function BashExecutionView({ message, sessionId }: { message: BashExecutionMessa
   useEffect(() => {
     fullOutputGenRef.current += 1;
     setFullOutput(null);
-  }, [message.command, message.fullOutputPath, message.output, message.timestamp]);
+  }, [message.command, message.fullOutputPath, message.output, message.timestamp, sessionId, hostQuery]);
   const isPending = !message.output && message.exitCode === undefined && !message.cancelled;
-  const isError = message.cancelled || (message.exitCode !== undefined && message.exitCode !== 0);
-
-  // Reuse the existing ToolCallBlock so user-run bash looks identical to an
-  // agent-run bash tool call: same header, collapse behavior, result pane.
-  // Synthesize an equivalent ToolCallContent + ToolResultMessage pair.
-  const toolName = message.excludeFromContext ? "bash (local)" : "bash";
-  const block: ToolCallContent = {
-    type: "toolCall",
-    toolCallId: `bash-${message.timestamp ?? ""}`,
-    toolName,
-    input: { command: message.command },
-  };
-  const result: ToolResultMessage | undefined = isPending
-    ? undefined
-    : {
-        role: "toolResult",
-        toolCallId: block.toolCallId,
-        toolName,
-        content: message.output ? [{ type: "text", text: message.output }] : [],
-        isError,
-        timestamp: message.timestamp,
-      };
+  const failed = message.cancelled || (message.exitCode !== undefined && message.exitCode !== 0);
+  // Starts collapsed, as user-run bash always has; the header toggles it.
+  const [expanded, setExpanded] = useState(false);
+  useEffect(() => {
+    setExpanded(false);
+  }, [message.command, message.timestamp, entryId]);
 
   // Large executions record their full output to a temp file (fullOutputPath);
   // fetch it through the guarded bash-output route instead of re-reading the
@@ -1830,7 +2201,7 @@ function BashExecutionView({ message, sessionId }: { message: BashExecutionMessa
     const gen = fullOutputGenRef.current;
     setFullOutput({ phase: "loading" });
     try {
-      const res = await fetch(`/api/agent/${encodeURIComponent(sessionId)}/bash-output?path=${encodeURIComponent(message.fullOutputPath)}`);
+      const res = await fetch(`/api/agent/${encodeURIComponent(sessionId)}/bash-output?path=${encodeURIComponent(message.fullOutputPath)}${hostQuery}`);
       const data = await res.json() as { success?: boolean; data?: { output?: string }; error?: string };
       if (fullOutputGenRef.current !== gen) return;
       if (!res.ok || !data.success) throw new Error(data.error ?? `HTTP ${res.status}`);
@@ -1839,15 +2210,42 @@ function BashExecutionView({ message, sessionId }: { message: BashExecutionMessa
       if (fullOutputGenRef.current !== gen) return;
       setFullOutput({ phase: "error", message: e instanceof Error ? e.message : String(e) });
     }
-  }, [message.fullOutputPath, sessionId, fullOutput?.phase]);
+  }, [message.fullOutputPath, sessionId, fullOutput?.phase, hostQuery]);
 
   const downloadUrl = message.fullOutputPath && sessionId
-    ? `/api/agent/${encodeURIComponent(sessionId)}/bash-output?path=${encodeURIComponent(message.fullOutputPath)}&download=1`
+    ? `/api/agent/${encodeURIComponent(sessionId)}/bash-output?path=${encodeURIComponent(message.fullOutputPath)}&download=1${hostQuery}`
     : null;
 
   return (
-    <div data-selection-scope="message" tabIndex={-1} style={{ margin: "6px 0" }}>
-      <ToolCallBlock block={block} result={result} />
+    <div data-selection-scope="message" tabIndex={-1} className={`shell-run${failed ? " shell-run-failed" : ""}${expanded ? " shell-run-open" : ""}`}>
+      <Collapsible open={expanded} onOpenChange={setExpanded}>
+        <CollapsibleTrigger className="shell-run-header" disabled={isPending}>
+          <span className="shell-run-prompt" aria-hidden>$</span>
+          <code className="shell-run-command">{message.command}</code>
+          {message.excludeFromContext && (
+            <span className="shell-run-tag" title={t("messageView.shellLocalTitle")}>{t("messageView.shellLocal")}</span>
+          )}
+          <span className="shell-run-status">
+            {isPending ? (
+              <LoaderCircle size={13} strokeWidth={1.8} className="activity-row-spinner" aria-hidden />
+            ) : failed ? (
+              <>
+                <CircleAlert size={13} strokeWidth={1.8} aria-hidden />
+                {message.cancelled ? t("messageView.shellCancelled") : t("messageView.shellExit", { code: String(message.exitCode) })}
+              </>
+            ) : (
+              <>
+                <Check size={13} strokeWidth={2} aria-hidden />
+                <span className="sr-only">{t("messageView.shellSucceeded")}</span>
+              </>
+            )}
+          </span>
+          <ChevronDown size={13} strokeWidth={1.8} aria-hidden className="shell-run-chevron" style={{ transform: expanded ? "rotate(180deg)" : undefined }} />
+        </CollapsibleTrigger>
+        {expanded && (
+          <pre className="shell-run-output">{message.output || t("messageView.noOutput")}</pre>
+        )}
+      </Collapsible>
       {downloadUrl && (
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 6 }}>
           {fullOutput?.phase !== "ready" && (

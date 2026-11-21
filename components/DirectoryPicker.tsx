@@ -1,10 +1,13 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { isValidOmpProfile } from "@/lib/omp-profile";
 import { useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
+import { appendProgress, cloneDirectoryName } from "@/lib/git-clone";
+import { randomUUID as newCloneId } from "@/lib/random-uuid";
 
 interface DirectoryEntry {
   name: string;
@@ -20,9 +23,10 @@ interface BrowseResponse {
   code?: string;
 }
 
-async function loadDirectories(directory?: string): Promise<BrowseResponse> {
-  const query = directory ? `?path=${encodeURIComponent(directory)}` : "";
-  const response = await fetch(`/api/cwd/browse${query}`);
+async function loadDirectories(directory: string | undefined, hostId: string, signal: AbortSignal): Promise<BrowseResponse> {
+  const query = new URLSearchParams({ hostId });
+  if (directory) query.set("path", directory);
+  const response = await fetch(`/api/cwd/browse?${query}`, { signal });
   const data = await response.json() as BrowseResponse;
   if (!response.ok || data.error) {
     throw new Error(formatApiError({ ...data, error: data.error ?? `HTTP ${response.status}` }));
@@ -57,9 +61,11 @@ interface Props {
   onSelect: (path: string, launchConfig?: { profile?: string; advisor?: boolean; extraArgs?: string[] }) => void;
   busy?: boolean;
   error?: string | null;
+  host: { id: string; name: string };
+  pool?: { id: string; label: string };
 }
 
-export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Props) {
+export function DirectoryPicker({ onCancel, onSelect, busy = false, error, host, pool }: Props) {
   const { t } = useI18n();
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
   const [currentPath, setCurrentPath] = useState("");
@@ -71,17 +77,32 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
   const [profile, setProfile] = useState("");
   const [advisor, setAdvisor] = useState(false);
   const [extraArgs, setExtraArgs] = useState("");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!pool);
+  const [cloneUrl, setCloneUrl] = useState("");
+  const [cloneId, setCloneId] = useState<string | null>(null);
+  const [cloneLog, setCloneLog] = useState("");
+  const [cloneStatus, setCloneStatus] = useState<string | null>(null);
+  const cloneAbortRef = useRef<AbortController | null>(null);
+  const cloneRequestedRef = useRef(false);
+  const cloneLogRef = useRef<HTMLPreElement>(null);
+  const browseAbortRef = useRef<AbortController | null>(null);
+  const cloning = cloneId !== null;
+  const locked = busy || cloning;
   const dialogRef = useModalDialog<HTMLDivElement>({
-    onClose: () => { if (!busy) onCancel(); },
+    onClose: () => { if (!locked) onCancel(); },
     active: portalTarget !== null,
   });
 
   const navigateTo = useCallback(async (directory?: string) => {
+    if (pool) return;
+    browseAbortRef.current?.abort();
+    const controller = new AbortController();
+    browseAbortRef.current = controller;
     setLoading(true);
     setLoadError(null);
     try {
-      const data = await loadDirectories(directory);
+      const data = await loadDirectories(directory, host.id, controller.signal);
+      if (controller.signal.aborted) return;
       const nextPath = data.path ?? directory ?? "/";
       setCurrentPath(nextPath);
       setParentDirectory(data.parentPath ?? null);
@@ -89,28 +110,129 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
       setDirectories(data.directories ?? []);
       setDrives(data.drives ?? null);
     } catch (cause) {
-      setLoadError(cause instanceof Error ? cause.message : String(cause));
+      if (!controller.signal.aborted) setLoadError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
-  }, []);
+  }, [host.id, pool]);
 
   useEffect(() => {
     setPortalTarget(document.body);
     void navigateTo();
+    return () => browseAbortRef.current?.abort();
   }, [navigateTo]);
+
+  useEffect(() => () => { cloneAbortRef.current?.abort(); cloneAbortRef.current = null; }, []);
+
+  useEffect(() => {
+    const log = cloneLogRef.current;
+    if (log) log.scrollTop = log.scrollHeight;
+  }, [cloneLog]);
 
   const handlePathSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const candidate = pathInput.trim();
-    if (candidate) void navigateTo(candidate);
+    if (pool) { if (candidate && !locked) void submitSelection(); return; }
+    if (candidate && !locked) void navigateTo(candidate);
   };
-  const hasUncommittedPath = pathInput.trim() !== currentPath;
-  const canSelect = Boolean(currentPath) && !hasUncommittedPath && !busy;
-  const canNavigateUp = Boolean(parentDirectory) || isWindowsDriveRoot(currentPath);
-  const submitSelection = () => {
+  const hasUncommittedPath = !pool && pathInput.trim() !== currentPath;
+  const cloneName = cloneUrl.trim() ? cloneDirectoryName(cloneUrl) : null;
+  const cloneTarget = cloneName && currentPath ? `${currentPath.replace(/[\\/]+$/, "")}${currentPath.includes("\\") ? "\\" : "/"}${cloneName}` : null;
+  const profileInvalid = profile.trim() !== "" && !isValidOmpProfile(profile.trim());
+  const canSelect = Boolean(pool ? pathInput.trim() : currentPath) && !loading && !hasUncommittedPath && !locked && (!cloneUrl.trim() || cloneName !== null) && !profileInvalid;
+  const goDisabled = loading || locked || !pathInput.trim();
+  const canNavigateUp = !locked && (Boolean(parentDirectory) || isWindowsDriveRoot(currentPath));
+  const submitSelection = async () => {
+    if (locked || cloneAbortRef.current) return;
     const args = extraArgs.split("\n").map((arg) => arg.trim()).filter(Boolean);
-    onSelect(currentPath, { profile: profile.trim() || undefined, advisor: advisor || undefined, extraArgs: args.length ? args : undefined });
+    const launchConfig = { profile: profile.trim() || undefined, advisor: advisor || undefined, extraArgs: args.length ? args : undefined };
+    if (pool || !cloneUrl.trim()) {
+      onSelect(pool ? pathInput.trim() : currentPath, launchConfig);
+      return;
+    }
+    const id = newCloneId();
+    const abort = new AbortController();
+    cloneAbortRef.current = abort;
+    cloneRequestedRef.current = false;
+    setCloneId(id);
+    setCloneLog("");
+    setCloneStatus(t("directoryPicker.cloning"));
+    let requested = false;
+    try {
+      const validation = await fetch("/api/cwd/validate", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd: currentPath, hostId: host.id }), signal: abort.signal,
+      });
+      const selected = await validation.json() as { cwd?: string; error?: string; code?: string };
+      if (abort.signal.aborted) return;
+      if (!validation.ok || !selected.cwd) throw new Error(formatApiError(selected));
+      requested = true;
+      cloneRequestedRef.current = true;
+      const response = await fetch("/api/projects/clone", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, parent: selected.cwd, url: cloneUrl.trim(), hostId: host.id }),
+        signal: abort.signal,
+      });
+      if (abort.signal.aborted) return;
+      if (!response.ok || !response.body) {
+        const data = await response.json().catch(() => ({})) as { error?: string; code?: string };
+        setCloneStatus(formatApiError({ ...data, error: data.error ?? `HTTP ${response.status}` }));
+        return;
+      }
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buffered = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (abort.signal.aborted) return;
+        buffered += value;
+        const lines = buffered.split("\n");
+        buffered = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line) continue;
+          const frame = JSON.parse(line) as { type: string; text?: string; path?: string; error?: string; code?: string; reset?: boolean };
+          if (frame.type === "output") setCloneLog((log) => appendProgress(frame.reset ? "" : log, frame.text ?? ""));
+          else if (frame.type === "done" && frame.path) {
+            setCloneStatus(t("directoryPicker.cloneSucceeded", { path: frame.path }));
+            // If registering fails, "Select this folder" can retry on the clone.
+            setCloneUrl("");
+            void navigateTo(frame.path);
+            onSelect(frame.path, launchConfig);
+            return;
+          } else if (frame.type === "cancelled") {
+            setCloneStatus(t("directoryPicker.cloneCancelled", { path: frame.path ?? "" }));
+            return;
+          } else if (frame.type === "error") {
+            setCloneStatus(frame.code === "clone_cleanup_failed" ? `${formatApiError(frame)} ${frame.error ?? ""}` : formatApiError(frame));
+            return;
+          }
+        }
+      }
+      setCloneStatus(t("directoryPicker.cloneInterrupted"));
+    } catch (cause) {
+      if (!abort.signal.aborted) setCloneStatus(requested ? t("errors.clone_uncertain") : cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (cloneAbortRef.current === abort) { cloneAbortRef.current = null; setCloneId(null); }
+    }
+  };
+  const cancelClone = () => {
+    if (!cloneId) return;
+    const operation = cloneAbortRef.current;
+    if (!cloneRequestedRef.current) {
+      operation?.abort();
+      cloneAbortRef.current = null;
+      setCloneId(null);
+      setCloneStatus(t("directoryPicker.cloneCancelledBeforeStart"));
+      return;
+    }
+    setCloneStatus(t("directoryPicker.cloneCancelling"));
+    void fetch("/api/projects/clone", {
+      method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: cloneId, hostId: host.id }),
+    }).then(async (response) => {
+      if (response.ok || cloneAbortRef.current !== operation) return;
+      setCloneStatus(t("errors.clone_uncertain"));
+    }, () => { if (cloneAbortRef.current === operation) setCloneStatus(t("errors.clone_uncertain")); });
   };
 
   if (!portalTarget) return null;
@@ -119,23 +241,24 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
     <div
       className="directory-picker-backdrop animate-fade-in"
       onClick={(event) => {
-        if (event.target === event.currentTarget && !busy) onCancel();
+        if (event.target === event.currentTarget && !locked) onCancel();
       }}
       style={{ position: "fixed", inset: 0, zIndex: 1002, display: "flex", alignItems: "center", justifyContent: "center", background: "var(--overlay-backdrop)" }}
     >
-      <div className="directory-picker-panel animate-scale-in" ref={dialogRef} role="dialog" aria-modal="true" aria-label={t("directoryPicker.selectDirectory")} tabIndex={-1} style={{ width: 520, maxWidth: "calc(100vw - 16px)", height: "min(620px, calc(100dvh - 16px))", maxHeight: "calc(100dvh - 16px)", display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-modal)", boxShadow: "var(--shadow-modal)", outline: "none" }}>
+      <div className="directory-picker-panel animate-scale-in" ref={dialogRef} role="dialog" aria-modal="true" aria-label={t(pool ? "directoryPicker.registerPoolProject" : "directoryPicker.selectDirectory")} tabIndex={-1} style={{ width: 520, maxWidth: "calc(100vw - 16px)", height: "min(620px, calc(100dvh - 16px))", maxHeight: "calc(100dvh - 16px)", display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-modal)", boxShadow: "var(--shadow-modal)", outline: "none" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, padding: "12px 18px", borderBottom: "1px solid var(--border)" }}>
           <div style={{ minWidth: 0, flex: 1 }}>
-            <div style={{ color: "var(--text)", fontWeight: 700, fontSize: 15 }}>{t("directoryPicker.selectDirectory")}</div>
+            <div style={{ color: "var(--text)", fontWeight: 700, fontSize: 15 }}>{t(pool ? "directoryPicker.registerPoolProject" : "directoryPicker.selectDirectory")}</div>
+            <div style={{ color: "var(--text-dim)", fontSize: 11 }}>{host.name}</div>
           </div>
           <button
             type="button"
             onClick={onCancel}
-            disabled={busy}
+            disabled={locked}
             title={t("directoryPicker.close")}
             aria-label={t("directoryPicker.close")}
-            style={{ padding: "2px 6px", border: 0, background: "none", color: "var(--text-muted)", fontSize: 20, lineHeight: 1, cursor: busy ? "default" : "pointer", opacity: busy ? 0.5 : 1, transition: "color var(--dur-fast) var(--ease-out-warm), opacity var(--dur-fast) var(--ease-out-warm)" }}
-            onMouseEnter={(e) => { if (!busy) e.currentTarget.style.color = "var(--text)"; }}
+            style={{ padding: "2px 6px", border: 0, background: "none", color: "var(--text-muted)", fontSize: 20, lineHeight: 1, cursor: locked ? "default" : "pointer", opacity: locked ? 0.5 : 1, transition: "color var(--dur-fast) var(--ease-out-warm), opacity var(--dur-fast) var(--ease-out-warm)" }}
+            onMouseEnter={(e) => { if (!locked) e.currentTarget.style.color = "var(--text)"; }}
             onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-muted)"; }}
           >
             ×
@@ -149,16 +272,17 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
             </svg>
           </button>
           <label htmlFor="directory-path" style={{ position: "absolute", width: 1, height: 1, padding: 0, margin: -1, overflow: "hidden", clip: "rect(0, 0, 0, 0)", whiteSpace: "nowrap", border: 0 }}>
-            {t("directoryPicker.directoryPath")}
+            {t(pool ? "directoryPicker.poolOrigin" : "directoryPicker.directoryPath")}
           </label>
           <input
             className="directory-picker-path"
             id="directory-path"
             type="text"
             value={pathInput}
-            aria-label={t("directoryPicker.pathPlaceholder") || "Directory path"}
-            placeholder={t("directoryPicker.pathPlaceholder")}
+            aria-label={t(pool ? "directoryPicker.poolOrigin" : "directoryPicker.pathPlaceholder")}
+            placeholder={t(pool ? "directoryPicker.poolOrigin" : "directoryPicker.pathPlaceholder")}
             autoFocus
+            disabled={locked}
             autoComplete="off"
             spellCheck={false}
             onChange={(event) => {
@@ -170,10 +294,10 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
           <button
             className="directory-picker-action"
             type="submit"
-            disabled={loading || !pathInput.trim()}
+            disabled={goDisabled}
             title={t("directoryPicker.goToDirectory")}
-            style={{ minWidth: 58, height: 36, padding: "0 12px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-hover)", color: "var(--text-muted)", cursor: loading || !pathInput.trim() ? "default" : "pointer", opacity: loading || !pathInput.trim() ? 0.6 : 1, transition: "background-color var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm), opacity var(--dur-fast) var(--ease-out-warm)" }}
-            onMouseEnter={(e) => { if (!loading && pathInput.trim()) { e.currentTarget.style.background = "var(--bg-selected)"; e.currentTarget.style.color = "var(--text)"; } }}
+            style={{ minWidth: 58, height: 36, padding: "0 12px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-hover)", color: "var(--text-muted)", cursor: goDisabled ? "default" : "pointer", opacity: goDisabled ? 0.6 : 1, transition: "background-color var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm), opacity var(--dur-fast) var(--ease-out-warm)" }}
+            onMouseEnter={(e) => { if (!goDisabled) { e.currentTarget.style.background = "var(--bg-selected)"; e.currentTarget.style.color = "var(--text)"; } }}
             onMouseLeave={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text-muted)"; }}
           >
             {t("directoryPicker.go")}
@@ -181,7 +305,11 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
         </form>
 
         <div className="directory-picker-list" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "8px 10px" }}>
-          {loading ? (
+          {pool ? (
+            <div role="status" style={{ padding: 8, color: "var(--text-dim)", fontSize: 11, lineHeight: 1.6 }}>
+              {t("directoryPicker.poolPreparationHint", { pool: pool.label })}
+            </div>
+          ) : loading ? (
             <div style={{ display: "grid", gap: 6, padding: 8 }} aria-busy="true" aria-label={t("directoryPicker.loadingDirectories")}>
               {Array.from({ length: 7 }).map((_, i) => (
                 <div
@@ -193,7 +321,7 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
             </div>
           ) : drives !== null ? (
             drives.length > 0 ? drives.map((entry) => (
-              <button key={entry.path} className="directory-picker-entry" type="button" onClick={() => void navigateTo(entry.path)} title={entry.path} style={{ width: "100%", minHeight: 30, display: "flex", alignItems: "center", gap: 7, padding: "5px 8px", border: 0, borderRadius: 5, background: "none", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontFamily: "var(--font-mono)", fontSize: 11 }}>
+              <button key={entry.path} disabled={locked} className="directory-picker-entry" type="button" onClick={() => void navigateTo(entry.path)} title={entry.path} style={{ width: "100%", minHeight: 30, display: "flex", alignItems: "center", gap: 7, padding: "5px 8px", border: 0, borderRadius: 5, background: "none", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontFamily: "var(--font-mono)", fontSize: 11 }}>
                 <DriveIcon />
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</span>
               </button>
@@ -204,6 +332,7 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
                 key={entry.path}
                 className="directory-picker-entry"
                 type="button"
+                disabled={locked}
                 onClick={() => void navigateTo(entry.path)}
                 title={entry.path}
                 style={{ width: "100%", minHeight: 30, display: "flex", alignItems: "center", gap: 7, padding: "5px 8px", border: 0, borderRadius: 5, background: "none", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontFamily: "var(--font-mono)", fontSize: 11, transition: "background-color var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm)" }}
@@ -220,20 +349,40 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
           {(loadError || error) && (
             <div role="alert" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "8px", color: "var(--status-error)", fontSize: 11 }}>
               <span>{loadError ?? error}</span>
-              <button className="load-retry-button" type="button" onClick={() => void navigateTo(currentPath || undefined)} style={{ minHeight: 32, padding: "4px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>{t("directoryPicker.retry")}</button>
+              <button className="load-retry-button" type="button" disabled={locked} onClick={() => void navigateTo(currentPath || undefined)} style={{ minHeight: 32, padding: "4px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>{t("directoryPicker.retry")}</button>
             </div>
           )}
         </div>
 
-        <div style={{ flexShrink: 0, padding: "10px 18px", borderTop: "1px solid var(--border)" }}>
-          <input className="directory-picker-profile" value={profile} onChange={(event) => setProfile(event.target.value)} placeholder={t("directoryPicker.profilePlaceholder")} aria-label={t("directoryPicker.profileLabel")} style={{ width: "100%", height: 30, boxSizing: "border-box", marginBottom: 7, padding: "0 8px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--font-mono)", fontSize: 11 }} />
+        {/* Shrinks and scrolls on short viewports (phone landscape) so the footer — incl. Cancel clone — stays reachable. */}
+        <div style={{ flexShrink: 1, minHeight: 0, overflowY: "auto", padding: "10px 18px", borderTop: "1px solid var(--border)" }}>
+          {!pool && <input className="directory-picker-clone-url" type="text" value={cloneUrl} disabled={locked} onChange={(event) => { setCloneUrl(event.target.value); setCloneStatus(null); }} placeholder={t("directoryPicker.cloneUrlPlaceholder")} aria-label={t("directoryPicker.cloneUrlLabel")} autoComplete="off" spellCheck={false} style={{ width: "100%", height: 30, boxSizing: "border-box", marginBottom: 7, padding: "0 8px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--font-mono)", fontSize: 11 }} />}
+          {cloneUrl.trim() && !cloning && !cloneStatus && (
+            <div style={{ marginBottom: 7, color: cloneTarget ? "var(--text-muted)" : "var(--status-error)", fontSize: 11, overflowWrap: "anywhere" }}>
+              {cloneTarget ? t("directoryPicker.cloneInto", { path: cloneTarget }) : t("errors.invalid_git_url")}
+            </div>
+          )}
+          {cloneStatus && <div role="status" style={{ marginBottom: 7, color: "var(--text-muted)", fontSize: 11, overflowWrap: "anywhere" }}>{cloneStatus}</div>}
+          {cloneLog && (
+            <pre ref={cloneLogRef} aria-label={t("directoryPicker.cloneOutputLabel")} tabIndex={0} style={{ maxHeight: 140, overflow: "auto", margin: "0 0 7px", padding: "6px 8px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: 11, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+              {cloneLog.replace(/\r/g, "")}
+            </pre>
+          )}
+          <input className="directory-picker-profile" value={profile} onChange={(event) => setProfile(event.target.value)} placeholder={t("directoryPicker.profilePlaceholder")} aria-label={t("directoryPicker.profileLabel")} aria-invalid={profileInvalid || undefined} style={{ width: "100%", height: 30, boxSizing: "border-box", marginBottom: profileInvalid || profile.trim() ? 3 : 7, padding: "0 8px", background: "var(--bg-panel)", border: `1px solid ${profileInvalid ? "var(--status-error)" : "var(--border)"}`, borderRadius: 6, color: "var(--text)", fontFamily: "var(--font-mono)", fontSize: 11 }} />
+          {profileInvalid
+            ? <div role="alert" style={{ marginBottom: 7, color: "var(--status-error)", fontSize: 11, lineHeight: 1.4 }}>{t("projectLaunchConfig.profileInvalid")}</div>
+            : profile.trim() ? <div style={{ marginBottom: 7, color: "var(--text-dim)", fontSize: 11, lineHeight: 1.4 }}>{t("projectLaunchConfig.profileRule")}</div> : null}
           <label className="directory-picker-launch" style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 7, color: "var(--text-muted)", fontSize: 11 }}><input type="checkbox" checked={advisor} onChange={(event) => setAdvisor(event.target.checked)} />{t("projectLaunchConfig.advisorLabel")}</label>
           <textarea className="directory-picker-extra-args" value={extraArgs} onChange={(event) => setExtraArgs(event.target.value)} placeholder={t("directoryPicker.extraArgsPlaceholder")} aria-label={t("directoryPicker.extraArgsLabel")} rows={2} style={{ width: "100%", boxSizing: "border-box", resize: "vertical", padding: "6px 8px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--font-mono)", fontSize: 11 }} />
         </div>
         <div className="directory-picker-footer" style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, flexShrink: 0, padding: "10px 18px", borderTop: "1px solid var(--border)" }}>
-          <button className="directory-picker-action" type="button" onClick={onCancel} disabled={busy} style={{ padding: "6px 14px", border: "1px solid var(--border)", borderRadius: 6, background: "none", color: "var(--text-muted)", cursor: busy ? "default" : "pointer", fontSize: 13 }}>{t("directoryPicker.cancel")}</button>
-          <button className="directory-picker-action" type="button" onClick={submitSelection} disabled={!canSelect} title={hasUncommittedPath ? t("directoryPicker.openPathBeforeSelecting") : t("directoryPicker.selectCurrentDirectory")} style={{ padding: "6px 16px", border: 0, borderRadius: 6, background: "var(--accent-strong)", color: "var(--on-accent)", fontSize: 13, fontWeight: 600, opacity: canSelect ? 1 : 0.6, cursor: canSelect ? "pointer" : "default" }}>
-            {busy ? t("directoryPicker.checking") : t("directoryPicker.selectThisFolder")}
+          {cloning ? (
+            <button className="directory-picker-action" type="button" autoFocus onClick={cancelClone} style={{ padding: "6px 14px", border: "1px solid var(--border)", borderRadius: 6, background: "none", color: "var(--status-error)", cursor: "pointer", fontSize: 13 }}>{t("directoryPicker.cancelClone")}</button>
+          ) : (
+            <button className="directory-picker-action" type="button" onClick={onCancel} disabled={busy} style={{ padding: "6px 14px", border: "1px solid var(--border)", borderRadius: 6, background: "none", color: "var(--text-muted)", cursor: busy ? "default" : "pointer", fontSize: 13 }}>{t("directoryPicker.cancel")}</button>
+          )}
+          <button className="directory-picker-action" type="button" onClick={() => void submitSelection()} disabled={!canSelect} title={pool ? t("directoryPicker.registerPoolProject") : hasUncommittedPath ? t("directoryPicker.openPathBeforeSelecting") : cloneTarget ? t("directoryPicker.cloneInto", { path: cloneTarget }) : t("directoryPicker.selectCurrentDirectory")} style={{ padding: "6px 16px", border: 0, borderRadius: 6, background: "var(--accent-strong)", color: "var(--on-accent)", fontSize: 13, fontWeight: 600, opacity: canSelect ? 1 : 0.6, cursor: canSelect ? "pointer" : "default" }}>
+            {busy ? t("directoryPicker.checking") : pool ? t("directoryPicker.registerPoolProject") : cloning ? t("directoryPicker.cloning") : cloneUrl.trim() ? t("directoryPicker.cloneHere") : t("directoryPicker.selectThisFolder")}
           </button>
         </div>
       </div>

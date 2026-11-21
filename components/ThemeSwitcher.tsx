@@ -3,6 +3,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Check, ChevronDown, Monitor, Moon, Sparkles, Sun } from "lucide-react";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useFixedMenuPosition } from "@/hooks/useFixedMenuPosition";
 import {
   DARK_THEMES,
   LIGHT_THEMES,
@@ -51,10 +52,15 @@ export function ThemeSwitcher() {
     if (!open) setActiveIndex(index);
   }, [index, open]);
 
-  // Focus the active item whenever the menu opens or the highlight moves.
+  // Fixed positioning escapes the compact top-bar overflow strip, whose
+  // horizontal scroller would otherwise clip the menu to its 48px height.
+  const menuPos = useFixedMenuPosition(open, triggerRef, isMobile ? 220 : 350);
+  const menuShown = menuPos !== null;
+
+  // Focus the active item once the positioned menu mounts, or when the highlight moves.
   useEffect(() => {
-    if (open) itemRefs.current[activeIndex]?.focus();
-  }, [open, activeIndex]);
+    if (menuShown) itemRefs.current[activeIndex]?.focus();
+  }, [menuShown, activeIndex]);
 
   // Close on outside click / Escape is handled in onKeyDown below; also close
   // when the trigger loses focus to something outside the component.
@@ -146,8 +152,12 @@ export function ThemeSwitcher() {
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
-        className="shell-toolbar-btn ui-focus-ring"
+        className="shell-toolbar-btn shell-toolbar-picker ui-focus-ring"
         style={{
+          width: "auto",
+          minWidth: isMobile ? 44 : 36,
+          padding: "0 8px",
+          gap: 4,
           background: open ? "var(--bg-selected)" : undefined,
           color: open ? "var(--text)" : undefined,
         }}
@@ -173,18 +183,18 @@ export function ThemeSwitcher() {
         />
       </button>
 
-      {open && (
+      {open && menuPos && (
         <div
           id={menuId}
           role="menu"
           className="dropdown-surface animate-slide-down"
           style={{
-            position: "absolute",
-            top: "calc(100% + 4px)",
-            left: 0,
-            zIndex: 50,
+            position: "fixed",
+            top: menuPos.top,
+            left: menuPos.left,
+            zIndex: 600,
             minWidth: isMobile ? 220 : 350,
-            maxWidth: "92vw",
+            maxWidth: "calc(100vw / var(--ui-scale) - 16px)",
             margin: 0,
             padding: 6,
             background: "var(--bg-panel)",
@@ -199,8 +209,11 @@ export function ThemeSwitcher() {
               flexDirection: isMobile ? "column" : undefined,
               gridTemplateColumns: isMobile ? undefined : "1fr 1fr",
               gap: isMobile ? 4 : 8,
-              maxHeight: isMobile ? 380 : undefined,
-              overflowY: isMobile ? "auto" : undefined,
+              // Desktop previously had no cap, so on short viewports the
+              // fixed-position menu clipped its bottom themes with no way
+              // to scroll to them. Cap against the viewport, as on mobile.
+              maxHeight: isMobile ? 380 : "calc(100vh - 56px)",
+              overflowY: "auto",
             }}
           >
             {/* Light column */}

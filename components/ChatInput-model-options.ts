@@ -4,6 +4,10 @@ export interface ModelOption {
   provider: string;
   modelId: string;
   name: string;
+  /** Vendor lineage/family/revision classification, when the catalog provided one. */
+  identity?: { class: string; family?: string; revision?: string };
+  /** `cost.output` (USD per Mtok) from the catalog; absent for unpriced/unknown models. */
+  costOutput?: number;
 }
 
 export const COMPOSER_MODELS_STORAGE_KEY = "omp-composer-models";

@@ -1,0 +1,2262 @@
+// Main-server end of the host link (spec "Link protocol"): accepts `ompweb
+// host` daemons on /api/hosts/link and exposes each linked machine as a
+// `RemoteHost`. Everything a daemon sends is untrusted input.
+// No `next/*` or `@/` imports.
+import { randomUUID } from "node:crypto";
+import { posix, win32 } from "node:path";
+import { readBodyWithinLimit } from "../bounded-form-data";
+import type { RpcTransport } from "../omp/rpc-transport";
+import type { ProjectRegistryEntry } from "../project-registry";
+import { isValidSessionId } from "../session-file-references-core";
+import { appendTransportSamples, transportMetricsPath } from "../transport-metrics";
+import { isRecord } from "../type-guards";
+import type { HostCapacity } from "./capacity";
+import type { ArchivedSessionInfo, SessionInfo } from "../types";
+import { isLinkUp, type Host, type HostStatus, type SpawnRequest, type SpawnResult } from "./host";
+import {
+  CREATION_ID_RE,
+  decodeConfigState,
+  decodeBlobFrame,
+  decodeUp,
+  encodeLine,
+  encodeQueued,
+  HostOpError,
+  LINK_CLOSE,
+  LINK_LIMITS,
+  LINK_PROTOCOL_VERSION,
+  LinkLimitError,
+  LinkSender,
+  MIN_LINK_PROTOCOL_VERSION,
+  Outbox,
+  PartJoiner,
+  SeqWindow,
+  SESSION_OP_PARAMS,
+  type DownMessage,
+  type HelloChannel,
+  type HostOpName,
+  type UnknownMessage,
+  type OpenChannelRequest,
+  type OpenChannelResult,
+  type HostUriScheme,
+  type Unsequenced,
+  UnknownMessageLog,
+  type UpMessage,
+} from "./link-protocol";
+import { clusterOf, isClusterMember, sharesCredentials } from "./cluster";
+import { ClusterConfigError } from "./cluster-config";
+import { clusterConfigVersion } from "./cluster-config-server";
+import type { ConfigState } from "./daemon-cluster-config";
+import { customLocalLabel, DEFAULT_LOCAL_LABEL, HostRegistryUnreadableError, hostForToken, LOCAL_HOST_ID, loadHosts, readHosts, touchHost, type HostRecord } from "./registry";
+import type { SessionOps } from "./session-ops";
+import { confirmPooledChild, pooledStartForChild } from "./pool-starts";
+import { loadPools, type HostPool } from "./pools";
+import { validateHostTools } from "./shared-requests";
+import type { ApprovedReleasePin, HostOmpUpdate, HostSoftwareUpdate, HostUpdateBlocker, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "./update-types";
+import { isUpdateDisabled } from "../update-policy";
+import { WORKSPACE_OP_PARAMS, type WorkspaceFileEvent, type WorkspaceOps } from "../workspace-types";
+import { validWorkspaceResult } from "./workspace-results";
+import { closeMaintenanceHost, freezeMaintenance, getMaintenanceHost, MaintenanceError, onMaintenanceChange, requestMaintenance } from "./maintenance-hub";
+import type { MaintenanceHello } from "./maintenance-protocol";
+import { observeLegacyUpgrade, rejectLegacyBootstrap, startLegacyUpgrade } from "./legacy-upgrades";
+import { recoveryHelperRelease } from "../recovery-release";
+import { checkHostRecovery, HostRecoveryRefusal, startHostRecovery } from "./recovery";
+import { getHostUpdateOperation } from "./updates";
+import { validateApprovedReleasePin } from "./update-worker";
+
+/** Old daemons keep their updater, never their session protocol. */
+const legacyUpgradeVersion = (version: number | null): boolean => version === 10 || version === 11;
+const upgradeOnly = (link: Link): boolean => legacyUpgradeVersion(link.hostVersion);
+const upgradeOp = (op: string): boolean => op === "checkUpdates" || op === "updateSoftware";
+
+/** Liveness and op timeouts from LINK_LIMITS; tests shorten them. */
+export const linkTimings = {
+  pingMs: LINK_LIMITS.pingMs,
+  offlineMs: LINK_LIMITS.offlineMs,
+  opTimeoutMs: LINK_LIMITS.opTimeoutMs,
+};
+
+/** What the hub keeps on each link socket (Bun's `ws.data`): the host its token named, and whether its hello came. */
+export interface LinkSocketData {
+  hostId: string;
+  hello: boolean;
+}
+
+/** The server end of a link WebSocket: the part of Bun's ServerWebSocket the hub uses, so tests drive it with a plain object. */
+export interface LinkSocket {
+  readonly data: LinkSocketData;
+  send(data: string | Uint8Array): number;
+  close(code?: number, reason?: string): void;
+  terminate(): void;
+}
+
+type Hello = Extract<UpMessage, { type: "hello" }>;
+type Res = Extract<UpMessage, { type: "res" }>;
+/** An `upload_ack` as lib/uploads.ts sees it. */
+export type UploadAck = Omit<Extract<UpMessage, { type: "upload_ack" }>, "type" | "seq">;
+
+/** The current socket's latest resource report, timed by the server's monotonic clock. */
+export interface CapacitySnapshot {
+  sample: HostCapacity;
+  receivedAt: number;
+}
+
+interface PendingOp {
+  op: HostOpName;
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+  sessionId?: string | null;
+  recoveryId?: string;
+  /** Result bytes from the binary frames sent ahead of their `res`, in order (views into those frames). */
+  blob: Uint8Array[];
+  blobBytes: number;
+}
+
+/** A downlink line sent (or to resend) and not acked yet. `key`: the `sender` key it went out under; `bytes`: its
+ * UTF-8 size; `part`: a `part` line; `sample`: on the line that completes a message, its link sample. */
+interface Sent {
+  seq: number;
+  line: string;
+  key: string;
+  bytes: number;
+  part: boolean;
+  sample: DownSample | null;
+}
+
+/** What a downlink message's link sample needs, taken when it is queued: the time (wall and monotonic), its UTF-8 size, the bytes queued
+ * or unacked ahead of it then, and the session it serves. */
+interface DownSample {
+  at: number;
+  /** `at` on the monotonic clock, for ackMs. */
+  t: number;
+  bytes: number;
+  bytesAhead: number;
+  session: string | null;
+}
+
+/** A downlink line queued in the sender. */
+type DownLine = { line: string; size: number; sample: DownSample };
+
+interface Link {
+  readonly id: string;
+  readonly host: RemoteHost;
+  status: HostStatus;
+  /** Link protocol version the daemon last presented (Settings shows it on a 426). */
+  hostVersion: number | null;
+  /** Shared lifecycle (v7) is advertised independently of the v8 pool extensions. */
+  shared: boolean;
+  capacity: CapacitySnapshot | null;
+  /** v10: the daemon's last cluster configuration report (`config_state`, or a `clusterConfig` answer); null until one. */
+  configState: ConfigState | null;
+  /** v10: that report says the configuration the host holds is this server's (a non-member holding it gets `restore`). */
+  configOwned: boolean;
+  /** `clusterConfig` ops sent and not answered: the sync never piles another on. */
+  configOps: number;
+  /** v10: a `config_state` arrived since the link came up: from then on reports, never op answers, set `configState`. */
+  configReported: boolean;
+  ompVersion: string | null;
+  ompwebVersion: string | null;
+  workspaceOps: Set<string>;
+  platform: string | null;
+  lastSeenAt: string | null;
+  recoveryHome?: string;
+  recoveryInventory?: HelloChannel[];
+  recovery?: { id: string; channel?: string; lines: Set<string>; phase?: "prepare" | "commit" | "cancel"; requestId?: string };
+  autoApprove: boolean;
+  notifier: boolean;
+  /** The socket whose hello this link took; null while the daemon has none. */
+  socket: LinkSocket | null;
+  /** Last downlink seq handed out. Lines stay in `outbox` until the daemon acks them. */
+  downSeq: number;
+  /** Downlink messages not numbered yet, per channel or request, sent fair (spec D7); from v6 also upload bytes under
+   * `up:<id>`, which go as binary frames outside the line window (the browser's upload window bounds them). */
+  sender: LinkSender<DownLine | { id: string; blob: Uint8Array }>;
+  outbox: Outbox<Sent>;
+  /** Bytes of the outbox lines, sent or waiting for a resend. */
+  outboxBytes: number;
+  /** Highest outbox seq written to the current socket; `flush` sends what is past it. */
+  sentSeq: number;
+  /** Bytes of the outbox lines written to the current socket: the unacked window (spec D7). */
+  unacked: number;
+  /** Bun queued the last line over the socket's buffered data: the rest waits for its `drain`. */
+  awaitingDrain: boolean;
+  up: SeqWindow;
+  /** The uplink line the daemon is sending in parts. */
+  parts: PartJoiner;
+  /** What this link has already logged about messages it skipped. */
+  unknownLog: UnknownMessageLog;
+  /** This link's `up` samples in the current statsFlushMs window (STATS_BUDGET_FACTOR × statsSamples at most) and those
+   * dropped past it; `start` is a monotonic time. */
+  statsWindow: { start: number; used: number; dropped: number };
+  /** A malformed `stats` sample was logged on this link (once per link). */
+  statsWarned: boolean;
+  pending: Map<string, PendingOp>;
+  channels: Map<string, RemoteRpcTransport>;
+  /** v7: the sessions of every child the host last listed, joined by this server or not. */
+  listedSessions: Set<string>;
+  pingTimer: NodeJS.Timeout | undefined;
+  offlineTimer: NodeJS.Timeout | undefined;
+  statusListeners: Set<(status: HostStatus) => void>;
+}
+
+/** Link samples (metric "link") waiting to be written, and the file they go to, resolved when the batch started so a
+ * later flush never re-resolves the agent dir (a test's may be gone by then). */
+interface LinkSampleBatch {
+  samples: Record<string, unknown>[];
+  file: string;
+  timer: NodeJS.Timeout | undefined;
+}
+
+interface HubState {
+  links: Map<string, Link>;
+  changeListeners: Set<() => void>;
+  helloListeners: Set<(hostId: string, channels: HelloChannel[]) => void>;
+  sessionChangeListeners: Set<(hostId: string) => void>;
+  /** This server is shutting down (freezeHostLinks): links neither send nor apply anything. */
+  frozen: boolean;
+  linkSamples: LinkSampleBatch;
+  /** lib/uploads.ts: each host's `upload_ack`, and null when its socket ended (upload bytes in flight are lost). */
+  uploadListeners: Set<(hostId: string, ack: UploadAck | null) => void>;
+  fileListeners: Map<string, (event: WorkspaceFileEvent) => void>;
+  /** The master's configuration version as last computed (null after a failure), and that failure. */
+  masterConfig: { version: string | null; error: MasterConfigError | null };
+  /** startClusterConfigSync's 30 s timer. */
+  configSync: NodeJS.Timeout | undefined;
+}
+
+declare global {
+  var __ompHostHub: HubState | undefined;
+}
+
+// globalThis, like the rpc-manager registry: survives a `bun --hot` re-evaluation.
+function hub(): HubState {
+  globalThis.__ompHostHub ??= {
+    links: new Map(),
+    changeListeners: new Set(),
+    helloListeners: new Set(),
+    sessionChangeListeners: new Set(),
+    frozen: false,
+    linkSamples: { samples: [], file: "", timer: undefined },
+    uploadListeners: new Set(),
+    fileListeners: new Map(),
+    masterConfig: { version: null, error: null },
+    configSync: undefined,
+  };
+  // A state kept from before a field existed (`bun --hot`) lacks it.
+  globalThis.__ompHostHub.linkSamples ??= { samples: [], file: "", timer: undefined };
+  globalThis.__ompHostHub.uploadListeners ??= new Set();
+  globalThis.__ompHostHub.fileListeners ??= new Map();
+  globalThis.__ompHostHub.sessionChangeListeners ??= new Set();
+  globalThis.__ompHostHub.masterConfig ??= { version: null, error: null };
+  return globalThis.__ompHostHub;
+}
+
+/** The daemon changed its session files, including a restore that completed after its RPC timed out. */
+export function onHostSessionsChanged(listener: (hostId: string) => void): () => void {
+  const listeners = hub().sessionChangeListeners;
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
+/** Only main-created watch identities route daemon events to their owning consumer. */
+export function onWorkspaceFile(hostId: string, id: string, epoch: string, listener: (event: WorkspaceFileEvent) => void): () => void {
+  const key = JSON.stringify([hostId, id, epoch]);
+  hub().fileListeners.set(key, listener);
+  return () => { if (hub().fileListeners.get(key) === listener) hub().fileListeners.delete(key); };
+}
+
+function endWorkspaceWatches(hostId: string): void {
+  const prefix = `${JSON.stringify([hostId]).slice(0, -1)},`;
+  for (const [key, listener] of hub().fileListeners) {
+    if (!key.startsWith(prefix)) continue;
+    hub().fileListeners.delete(key);
+    listener({ type: "error", message: "The file's host link disconnected" });
+  }
+}
+
+function linkFor(id: string): Link {
+  const links = hub().links;
+  let link = links.get(id);
+  if (!link) {
+    link = {
+      id,
+      host: new RemoteHost(id),
+      status: "offline",
+      hostVersion: null,
+      shared: false,
+      capacity: null,
+      configState: null,
+      configOwned: false,
+      configOps: 0,
+      configReported: false,
+      ompVersion: null,
+      ompwebVersion: null,
+      workspaceOps: new Set(),
+      platform: null,
+      lastSeenAt: null,
+      autoApprove: false,
+      notifier: true,
+      socket: null,
+      downSeq: 0,
+      sender: new LinkSender(),
+      outbox: new Outbox(),
+      outboxBytes: 0,
+      sentSeq: 0,
+      unacked: 0,
+      awaitingDrain: false,
+      up: new SeqWindow(),
+      parts: new PartJoiner(),
+      unknownLog: new UnknownMessageLog("daemon"),
+      statsWindow: { start: 0, used: 0, dropped: 0 },
+      statsWarned: false,
+      pending: new Map(),
+      channels: new Map(),
+      listedSessions: new Set(),
+      pingTimer: undefined,
+      offlineTimer: undefined,
+      statusListeners: new Set(),
+    };
+    links.set(id, link);
+  }
+  return link;
+}
+
+function labelOf(id: string): string {
+  if (id === LOCAL_HOST_ID) return customLocalLabel() || DEFAULT_LOCAL_LABEL;
+  return loadHosts().find((h) => h.id === id)?.label ?? id;
+}
+
+function notify<A extends unknown[]>(listeners: Iterable<(...args: A) => void>, ...args: A): void {
+  for (const listener of listeners) {
+    try {
+      listener(...args);
+    } catch {
+      // A listener bug must not break the link.
+    }
+  }
+}
+
+function setStatus(link: Link, status: HostStatus): void {
+  if (link.status !== status) {
+    link.status = status;
+    notify(link.statusListeners, status);
+  }
+  notify(hub().changeListeners);
+}
+
+const isStatus = (status: unknown): status is number => Number.isInteger(status) && (status as number) >= 400 && (status as number) <= 599;
+const json = (body: unknown, status = 200) => Response.json(body, { status, headers: { "cache-control": "no-store" } });
+
+/** Unsequenced lines (welcome, ping, pong, ack): small, sent at once, never resent. */
+function enqueue(link: Link, line: string): void {
+  link.socket?.send(line);
+}
+
+/** Lines that left the outbox (acked or dropped): those written to the current socket leave the unacked window. */
+function released(link: Link, items: Sent[]): void {
+  for (const item of items) {
+    link.outboxBytes -= item.bytes;
+    if (item.seq <= link.sentSeq) link.unacked -= item.bytes;
+  }
+}
+
+/** Send outbox lines past `sentSeq` (a resend after a redial), then the sender's next units, while the unacked window
+ * has room and until Bun queues one under backpressure (-1: the rest goes on `drain`) or drops it (0: the socket is
+ * closing; the next socket starts from its hello's ack). So at most about unackedBytes of sequenced lines sit in
+ * Bun's, the kernel's and the daemon's buffers (spec D7), and a daemon that stops reading is waited for instead of
+ * closed. */
+function flush(link: Link): void {
+  const ws = link.socket;
+  if (!ws || link.awaitingDrain || hub().frozen) return;
+  const limit = LINK_LIMITS.unackedBytes;
+  const write = (item: Sent): boolean => {
+    const sent = ws.send(item.line);
+    if (sent !== 0) {
+      link.sentSeq = item.seq;
+      link.unacked += item.bytes;
+    }
+    if (sent > 0) return true;
+    link.awaitingDrain = true;
+    return false;
+  };
+  for (const item of link.outbox.pending()) {
+    if (item.seq > link.sentSeq && (link.unacked >= limit || !write(item))) return;
+  }
+  while (link.unacked < limit) {
+    const unit = link.sender.next(() => ++link.downSeq);
+    if (!unit) return;
+    if ("frame" in unit) {
+      // Upload bytes (v6): unsequenced and outside the line window; lost with the socket, resumed by the next uploadStart.
+      if (ws.send(unit.frame) > 0) continue;
+      link.awaitingDrain = true;
+      return;
+    }
+    const queued = unit.item as DownLine;
+    // One sample per message: a split one carries it on its last part.
+    const item: Sent = { seq: unit.seq, line: unit.line, key: unit.key, bytes: Buffer.byteLength(unit.line), part: unit.part, sample: unit.done ? { ...queued.sample, bytes: unit.messageBytes } : null };
+    link.outbox.push(item);
+    link.outboxBytes += item.bytes;
+    if (!write(item)) return;
+  }
+}
+
+/** Queue under `key` (its channel or request id), numbered and kept until acked as it goes out. Throws
+ * LinkLimitError before recording anything. Dropped once frozen: a kill, an answer or a command from a stopping
+ * server must not reach the children. */
+function sendDown(link: Link, body: Unsequenced<DownMessage>, key: string): void {
+  if (hub().frozen) return;
+  if (upgradeOnly(link) && !(
+    body.type === "req" && (upgradeOp(body.op) || link.recovery && link.pending.get(body.id)?.recoveryId === link.recovery.id)
+    || body.type === "stdin" && link.recovery && body.ch === link.recovery.channel && link.recovery.lines.has(body.line)
+  )) throw new HostOpError(426, "host_upgrade_required", "Update this host before using its application protocol");
+  const line = encodeQueued(body);
+  const size = Buffer.byteLength(line);
+  // Ahead of it: what is queued or unacked on this link (counters, no scan); fairness may send it before some of that.
+  const sample = { at: Date.now(), t: performance.now(), bytes: size, bytesAhead: link.outboxBytes + link.sender.queuedBytes, session: sessionOf(link, body) };
+  link.sender.push(key, { line, size, sample });
+  flush(link);
+}
+
+/** The session a downlink message serves: a session op's `id`, else its channel's child's; null for host ops. */
+function sessionOf(link: Link, body: Unsequenced<DownMessage>): string | null {
+  if (body.type !== "req") return "ch" in body ? link.channels.get(body.ch)?.session ?? null : null;
+  return isRecord(body.args) && typeof body.args.id === "string" && isValidSessionId(body.args.id) ? body.args.id : null;
+}
+
+/** Batch link samples: written at LINK_LIMITS.statsSamples, after statsFlushMs, or when the hub stops. */
+function recordLinkSamples(samples: Record<string, unknown>[]): void {
+  const batch = hub().linkSamples;
+  for (const sample of samples) {
+    if (batch.samples.length === 0) {
+      batch.file = transportMetricsPath();
+      batch.timer = setTimeout(flushLinkSamples, LINK_LIMITS.statsFlushMs);
+      batch.timer.unref?.();
+    }
+    batch.samples.push(sample);
+    if (batch.samples.length >= LINK_LIMITS.statsSamples) flushLinkSamples();
+  }
+}
+
+/** Write the batch now. Measurement only: a failed write is logged and dropped, never touches a link. */
+export function flushLinkSamples(): void {
+  const batch = hub().linkSamples;
+  clearTimeout(batch.timer);
+  batch.timer = undefined;
+  if (batch.samples.length === 0) return;
+  try {
+    appendTransportSamples(batch.samples.splice(0), null, batch.file);
+  } catch (error) {
+    console.warn(`[omp-web] could not write host link samples: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** The daemon applied the downlink through `ack`: each message it acks now (a split one at its last part) becomes a
+ * `down` sample; the lines leave the outbox and the unacked window. `ackMs` is monotonic: a wall-clock step between
+ * queueing and ack does not show in it. */
+function ackDown(link: Link, ack: number): void {
+  const now = performance.now();
+  const samples: Record<string, unknown>[] = [];
+  const acked = link.outbox.ack(ack);
+  for (const { sample } of acked) {
+    if (sample) samples.push({ metric: "link", dir: "down", host: link.id, session: sample.session, bytes: sample.bytes, bytesAhead: sample.bytesAhead, ackMs: Math.max(0, Math.round(now - sample.t)), at: sample.at });
+  }
+  released(link, acked);
+  recordLinkSamples(samples);
+}
+
+/** `up` samples one link may write per statsFlushMs, in multiples of statsSamples (a daemon reports about one `stats`
+ * per window): a daemon cannot flood the shared metrics file. */
+const STATS_BUDGET_FACTOR = 8;
+
+/** Write the samples dropped past the link's budget as one `{dropped}` sample. */
+function recordDropped(link: Link): void {
+  const window = link.statsWindow;
+  if (window.dropped > 0) recordLinkSamples([{ metric: "link", dir: "up", host: link.id, dropped: window.dropped, at: Date.now() }]);
+  window.dropped = 0;
+}
+
+/** A daemon's `stats`: valid samples within the link's budget become `up` samples; the excess is dropped and written as
+ * one `{dropped}` sample when the next window starts, or when the link ends or the hub freezes. Malformed samples (already dropped by decodeUp) are logged once. */
+function applyStats(link: Link, message: Extract<UpMessage, { type: "stats" }>): void {
+  if (message.invalid && !link.statsWarned) {
+    link.statsWarned = true;
+    console.warn(`[omp-web] ${labelOf(link.id)}: dropped ${message.invalid} malformed link samples (not logged again for this host)`);
+  }
+  const window = link.statsWindow;
+  const now = performance.now();
+  if (now - window.start >= LINK_LIMITS.statsFlushMs) {
+    recordDropped(link);
+    Object.assign(window, { start: now, used: 0 });
+  }
+  const taken = message.samples.slice(0, Math.max(0, STATS_BUDGET_FACTOR * LINK_LIMITS.statsSamples - window.used));
+  window.used += taken.length;
+  window.dropped += message.samples.length - taken.length;
+  recordLinkSamples(taken.map((sample) => ({ ...sample, metric: "link", dir: "up", host: link.id })));
+}
+
+/** Fail an op for good: a `req` not yet acked is never resent, nor the rest of one going in parts (one already
+ * written may still run). */
+function failOp(link: Link, id: string, error: Error): void {
+  const pending = link.pending.get(id);
+  if (!pending) return;
+  link.pending.delete(id);
+  clearTimeout(pending.timer);
+  link.sender.drop(id);
+  released(link, link.outbox.drop((m) => m.key === id));
+  pending.reject(error);
+  flush(link);
+}
+
+function failAllOps(link: Link, error: () => Error): void {
+  for (const id of [...link.pending.keys()]) failOp(link, id, error());
+}
+
+/** The socket is gone: ops in flight fail now rather than at their timeout. */
+function endSocket(link: Link): void {
+  link.socket = null;
+  link.capacity = null;
+  recordDropped(link);
+  // Upload bytes not sent yet go nowhere now: each upload resumes from the host's offset (uploadStart).
+  link.sender.dropBlobs();
+  failAllOps(link, () => new HostOpError(503, "host_offline", `${labelOf(link.id)} is offline`));
+  notify(hub().uploadListeners, link.id, null);
+  endWorkspaceWatches(link.id);
+  notify(hub().changeListeners);
+}
+
+function stopTimers(link: Link): void {
+  clearInterval(link.pingTimer);
+  clearTimeout(link.offlineTimer);
+  link.pingTimer = undefined;
+  link.offlineTimer = undefined;
+}
+
+function persistLastSeen(link: Link): void {
+  if (!link.lastSeenAt) return;
+  try {
+    touchHost(link.id, link.lastSeenAt);
+  } catch {
+    // Last-seen is informational; a failed write must not drop the link.
+  }
+}
+
+/** Any uplink traffic proves the daemon alive; silence for offlineMs means the link is gone. */
+function sawDaemon(link: Link): void {
+  link.lastSeenAt = new Date().toISOString();
+  clearTimeout(link.offlineTimer);
+  link.offlineTimer = setTimeout(() => {
+    stopTimers(link);
+    // No close handshake on a link gone silent; the daemon redials once its own watchdog fires.
+    link.socket?.terminate();
+    endSocket(link);
+    persistLastSeen(link);
+    setStatus(link, "offline");
+  }, linkTimings.offlineMs);
+  link.offlineTimer.unref?.();
+}
+
+/** The host the bearer token names, or the refusal to answer with. */
+function authenticate(req: Request): HostRecord | Response {
+  const header = req.headers.get("authorization");
+  const token = typeof header === "string" && header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
+  try {
+    const record = token ? hostForToken(token) : null;
+    if (!record) return json({ error: "Invalid host token" }, 401);
+    return record;
+  } catch (error) {
+    if (!(error instanceof HostRegistryUnreadableError)) throw error;
+    // Never 401 here: a daemon told its token is unknown stops every omp child.
+    console.error(`[omp-web] host link refused: ${error.message}`);
+    return json({ error: "The host registry cannot be read" }, 503);
+  }
+}
+
+// The daemon retries a 503: what it sends lands on the next server instead.
+const stopping = () => json({ error: "omp-web is shutting down" }, 503);
+
+/**
+ * This server is shutting down. From here on nothing reaches a daemon (sendDown
+ * drops it), and no hello or uplink frame is applied or acked: each daemon keeps
+ * its children's output unacked and sends it to the next server, which adopts the
+ * children. Every link socket closes 1001, so its daemon redials. Without this a
+ * tab closing on the way out would answer omp's open host tool calls with an
+ * error, and output this server took but never showed would be lost to the next one.
+ */
+export function freezeHostLinks(): void {
+  hub().frozen = true;
+  freezeMaintenance();
+  for (const link of hub().links.values()) {
+    link.capacity = null;
+    recordDropped(link);
+    link.socket?.close(LINK_CLOSE.goingAway, "omp-web is restarting");
+  }
+  // The process exits next: keep what was measured.
+  flushLinkSamples();
+}
+
+/** GET /api/hosts/link: the daemon's WebSocket. The token is checked before the upgrade, so no unknown caller gets a
+ * socket; undefined once upgraded. The hello comes as the socket's first frame (hostLinkSocket). */
+export function handleLinkUpgrade(req: Request, upgrade: (data: LinkSocketData) => boolean): Response | undefined {
+  const record = authenticate(req);
+  if (record instanceof Response) return record;
+  if (hub().frozen) return stopping();
+  return upgrade({ hostId: record.id, hello: false }) ? undefined : json({ error: "The host link is a WebSocket" }, 426);
+}
+
+/** POST /api/hosts/link: only a daemon from before the WebSocket (v3) sends one, its hello. It gets the 426 that tells
+ * it to update ompweb on its host. */
+export async function handleOutdatedLinkPost(req: Request): Promise<Response> {
+  const record = authenticate(req);
+  if (record instanceof Response) return record;
+  let raw: unknown = null;
+  try {
+    raw = JSON.parse(new TextDecoder().decode(await readBodyWithinLimit(req, LINK_LIMITS.uplinkBytes)));
+  } catch {
+    // Too large or not JSON: no version to report.
+  }
+  versionMismatch(linkFor(record.id), raw);
+  return json({ error: "Link protocol version mismatch", hostVersion: helloVersion(raw), serverVersion: LINK_PROTOCOL_VERSION }, 426);
+}
+
+/** A hello's `v` when it is an integer, else null. */
+function helloVersion(raw: unknown): number | null {
+  const version = isRecord(raw) ? raw.v : undefined;
+  return typeof version === "number" && Number.isInteger(version) ? version : null;
+}
+
+/** True for a daemon outside MIN_LINK_PROTOCOL_VERSION..LINK_PROTOCOL_VERSION (a newer one too: the web app upgrades first).
+ * Compared before decoding: another version may shape its hello differently. */
+function versionMismatch(link: Link, raw: unknown): boolean {
+  const version = helloVersion(raw);
+  if (version !== null && version >= MIN_LINK_PROTOCOL_VERSION && version <= LINK_PROTOCOL_VERSION) return false;
+  // A stray old daemon with this token must not take down the healthy link.
+  if (!link.socket) {
+    // Kept for Settings: "needs upgrade (host vN, server vM)".
+    link.hostVersion = version;
+    setStatus(link, "needs-upgrade");
+  }
+  return true;
+}
+
+/** Bun's `websocket` handler for host links (server/app.ts). */
+export const hostLinkSocket = {
+  // A result frame is up to blobBytes plus its id header; Bun closes 1009 above it.
+  maxPayloadLength: LINK_LIMITS.blobBytes + 256,
+  // A backstop: flush keeps at most about unackedBytes of sequenced lines unacked (v5) and stops when Bun reports
+  // backpressure. Past the limit the socket closes instead of buffering on, and what the daemon missed is resent after
+  // its redial.
+  backpressureLimit: LINK_LIMITS.uplinkBytes,
+  closeOnBackpressureLimit: true as const,
+  message(ws: LinkSocket, data: string | Uint8Array): void {
+    guarded(ws, () => {
+      // Nothing is applied or answered once this server stops: the daemon keeps it for the next one.
+      if (hub().frozen || failedSockets.has(ws)) return;
+      const link = hub().links.get(ws.data.hostId);
+      if (link?.socket === ws) return onFrame(link, ws, data);
+      // A socket a newer one replaced: what it still sends belongs to no link.
+      if (ws.data.hello) return;
+      onFirstFrame(ws, data);
+    });
+  },
+  /** Bun wrote out what it had queued: send the outbox lines that waited. */
+  drain(ws: LinkSocket): void {
+    guarded(ws, () => {
+      const link = hub().links.get(ws.data.hostId);
+      if (link?.socket !== ws) return;
+      link.awaitingDrain = false;
+      flush(link);
+    });
+  },
+  close(ws: LinkSocket): void {
+    guarded(ws, () => {
+      const link = hub().links.get(ws.data.hostId);
+      if (link?.socket === ws) endSocket(link);
+    });
+  },
+};
+
+/** Sockets whose handler threw: closed, and nothing more they send is applied (it would land past a half-applied frame). */
+const failedSockets = new WeakSet<LinkSocket>();
+
+/** A throw in a websocket handler would reach uncaughtException, which exits the server: it ends that socket instead. */
+function guarded(ws: LinkSocket, handle: () => void): void {
+  try {
+    handle();
+  } catch (error) {
+    failedSockets.add(ws);
+    console.error(`[omp-web] host link of ${ws.data.hostId} failed; closing it: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    ws.close();
+  }
+}
+
+/** A socket's first frame must be its hello. */
+function onFirstFrame(ws: LinkSocket, data: string | Uint8Array): void {
+  const refuse = () => ws.close(LINK_CLOSE.policy, "The first frame must be a hello");
+  if (typeof data !== "string") return refuse();
+  // A hello is one line: nothing longer is worth parsing.
+  if (Buffer.byteLength(data) > LINK_LIMITS.maxLineBytes) return ws.close(LINK_CLOSE.tooBig, "Hello too large");
+  // Revoked or deleted since the upgrade, or the registry cannot say: a plain close sends the daemon's redial through
+  // the token check (401 stops its children, 503 redials).
+  if (ws.data.hostId !== LOCAL_HOST_ID && !loadHosts().some((h) => h.id === ws.data.hostId)) return ws.close();
+  const link = linkFor(ws.data.hostId);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(data);
+  } catch {
+    return refuse();
+  }
+  const version = helloVersion(raw);
+  const legacy = legacyUpgradeVersion(version);
+  if ((!legacy && versionMismatch(link, raw)) || (legacy && link.socket && !upgradeOnly(link))) {
+    return ws.close(LINK_CLOSE.versionMismatch, JSON.stringify({ serverVersion: LINK_PROTOCOL_VERSION }));
+  }
+  let hello: UpMessage | UnknownMessage;
+  try {
+    hello = decodeUp(data);
+  } catch {
+    return refuse();
+  }
+  if (hello.type !== "hello") return refuse();
+  ws.data.hello = true;
+  openLink(link, ws, hello);
+}
+
+function openLink(link: Link, ws: LinkSocket, hello: Hello): void {
+  // One link per host: the newest wins and the previous daemon exits.
+  if (legacyUpgradeVersion(hello.v) || upgradeOnly(link)) {
+    // Nothing from another protocol, or an uncertain previous update, is replayed through the shim.
+    failAllOps(link, () => new HostOpError(503, "transport_lost", "The host update connection was replaced"));
+    link.sender = new LinkSender();
+    link.outbox = new Outbox();
+    link.outboxBytes = 0;
+    link.unacked = 0;
+  }
+  const previous = link.socket;
+  link.socket = ws;
+  link.capacity = null;
+  link.configState = null;
+  link.configOwned = false;
+  link.configReported = false;
+  previous?.close(LINK_CLOSE.replaced, "replaced by a newer link");
+  if (previous) {
+    // Upload bytes the old socket may have lost must not be followed by later ones on this socket: they resume instead.
+    link.sender.dropBlobs();
+    notify(hub().uploadListeners, link.id, null);
+  }
+  // Every sequenced uplink message answers a downlink one, so a daemon that
+  // has applied none (ack 0) has sent none: it is a fresh process whose
+  // uplink numbering starts again at 1.
+  if (hello.ack <= 0) {
+    link.up = new SeqWindow();
+    // Such a daemon is asked again and answers from byte 0: the pieces of the replaced socket would prefix its result. The
+    // same process (ack above 0) resends only the `res` of a result whose pieces already arrived.
+    for (const pending of link.pending.values()) Object.assign(pending, { blob: [], blobBytes: 0 });
+  }
+  // After a restart of this server the daemon is ahead: number above its ack.
+  link.downSeq = Math.max(link.downSeq, hello.ack);
+  released(link, link.outbox.ack(hello.ack));
+  link.unknownLog.reset();
+  link.hostVersion = hello.v;
+  link.shared = !upgradeOnly(link);
+  link.notifier = !upgradeOnly(link) && hello.link?.notifier === true;
+  enqueue(link, encodeLine({ type: "welcome", v: hello.v, hostId: link.id }));
+  // Resend what the daemon has not applied, in order and paced, before anything new.
+  link.sentSeq = hello.ack;
+  link.unacked = 0;
+  link.awaitingDrain = false;
+  flush(link);
+  link.ompVersion = hello.ompVersion;
+  link.ompwebVersion = hello.ompwebVersion ?? null;
+  link.workspaceOps = new Set(upgradeOnly(link) ? [] : hello.workspaceOps ?? []);
+  endWorkspaceWatches(link.id);
+  link.platform = hello.platform;
+  link.recoveryHome = hello.home;
+  link.recoveryInventory = hello.channels;
+  link.autoApprove = hello.autoApproveExtension;
+  sawDaemon(link);
+  persistLastSeen(link);
+  clearInterval(link.pingTimer);
+  link.pingTimer = setInterval(() => enqueue(link, encodeLine({ type: "ping" })), linkTimings.pingMs);
+  link.pingTimer.unref?.();
+  if (upgradeOnly(link)) {
+    link.listedSessions = new Set();
+    setStatus(link, "needs-upgrade");
+    return;
+  }
+  setStatus(link, hello.ompVersion === null ? "omp-missing" : "online");
+  reattach(link, hello.channels);
+  notify(hub().helloListeners, link.id, hello.channels);
+}
+
+/** A frame on the link's current socket: a result's bytes (binary), or uplink messages (text). */
+function onFrame(link: Link, ws: LinkSocket, data: string | Uint8Array): void {
+  sawDaemon(link);
+  if (typeof data !== "string") {
+    let result: { id: string; bytes: Uint8Array };
+    try {
+      result = decodeBlobFrame(data);
+    } catch {
+      return ws.close(LINK_CLOSE.policy, "Malformed result frame");
+    }
+    // A large result comes in pieces, in order. Pieces for an op no longer waiting are dropped;
+    // past blobBytes none are kept, so its `res` then fails host_blob_missing.
+    const pending = link.pending.get(result.id);
+    if (pending) {
+      pending.blobBytes += result.bytes.byteLength;
+      const limit = pending.op === "readFileChunk" ? LINK_LIMITS.pieceBytes : LINK_LIMITS.blobBytes;
+      if (pending.blobBytes <= limit) {
+        pending.blob.push(result.bytes);
+        // The deadline is for silence: at one unacked window per round trip a valid 64 MiB result outlasts a fixed one.
+        // Only bytes the hub keeps count, so empty or surplus frames cannot hold an op open.
+        if (result.bytes.byteLength > 0) pending.timer.refresh();
+      }
+    }
+    // The daemon counts its frames in flight by these answers, binary ones included.
+    enqueue(link, encodeLine({ type: "ack", ack: link.up.acked }));
+    return;
+  }
+  if (Buffer.byteLength(data) > LINK_LIMITS.uplinkBytes) return ws.close(LINK_CLOSE.tooBig, "Uplink frame too large");
+  let messages: (UpMessage | UnknownMessage)[];
+  // The decoded line of each part that completes one.
+  const wholes = new Map<UpMessage | UnknownMessage, UpMessage | UnknownMessage>();
+  const parts = link.parts.clone();
+  try {
+    // Decode the whole frame first, joined lines included: a frame with one bad line applies nothing. The parts go
+    // through a copy of the joiner, and applyUp's dedup is mirrored by a running high mark.
+    let high = link.up.acked;
+    messages = data.split("\n").filter(Boolean).map((line) => {
+      const message = decodeUp(line);
+      const seq = "seq" in message ? message.seq : null;
+      if (seq === null || seq <= high) return message;
+      high = seq;
+      const whole = message.type === "part" ? parts.add(message) : null;
+      if (whole !== null) wholes.set(message, decodeUp(whole));
+      return message;
+    });
+  } catch {
+    return ws.close(LINK_CLOSE.invalidData, "Malformed uplink frame");
+  }
+  link.parts = parts;
+  for (const message of messages) {
+    if (message.type === "ack") ackDown(link, message.ack);
+    else applyUp(link, message, wholes.get(message));
+  }
+  // One answer per frame, also to one with nothing sequenced in it: a v5 daemon counts its frames in flight by them.
+  enqueue(link, encodeLine({ type: "ack", ack: link.up.acked }));
+  // The daemon's ack may have opened the unacked window.
+  flush(link);
+}
+
+/**
+ * Spec Rules → Reattach. Listed channels this server has a transport for carry
+ * on unchanged. A spawned child the daemon no longer lists died while the link
+ * was down: its transport gets a synthesized exit, marked `lost`. Listed
+ * channels without a transport are children of a previous run of this server:
+ * adopted (see adopt), or killed as orphans when that is not possible. Either
+ * way they stay registered until their `exit` (see orphanExit).
+ */
+function reattach(link: Link, listed: HelloChannel[], refreshExisting = true): void {
+  // Hello and channels_changed both carry the host's full listing.
+  link.listedSessions = new Set(listed.flatMap(({ sessionId }) => sessionId ? [sessionId] : []));
+  const live = new Set(listed.map(({ ch }) => ch));
+  for (const [ch, transport] of refreshExisting ? link.channels : []) {
+    // A spawn still in flight is not listed yet.
+    if (!transport.spawned || live.has(ch)) continue;
+    link.channels.delete(ch);
+    transport.lost = true;
+    transport.deliverExit(null, null);
+  }
+  for (const hello of listed) {
+    const { ch, sessionId, cwd } = hello;
+    const existing = link.channels.get(ch);
+    if (existing) {
+      existing.spawned = true;
+      existing.creationHello = hello.creationId ? hello : undefined;
+      const identityChanged = sessionId !== null && existing.session !== sessionId;
+      if (sessionId) existing.session = sessionId;
+      if (refreshExisting || identityChanged) existing.deliverResync();
+      continue;
+    }
+    if ([...link.pending.values()].some(op => op.op === "open" && op.sessionId === sessionId)) continue;
+    const child = new RemoteRpcTransport(link.id, ch, sessionId);
+    child.spawned = true;
+    child.creationHello = hello.creationId ? hello : undefined;
+    link.channels.set(ch, child);
+    let owned: { creationId: string; sessionId?: string; cwd: string } | null = null;
+    if (hello.creationId) {
+      try { owned = pooledStartForChild(link.id, hello); }
+      catch { continue; } // An unreadable journal cannot prove this creation is an orphan.
+    }
+    if (!sessionId && !owned) { child.close(); continue; }
+    child.adoption = (async () => {
+      try {
+        const spawned = await link.host.spawnRpc({ cwd, recordedCwd: cwd, sessionFile: "", advisor: false,
+          ...(hello.creationId ? { creationId: hello.creationId } : {}) }, sessionId, { expectedChannel: ch });
+        if (spawned.transport !== child) throw new Error("Host changed a listed channel while joining");
+        return await adopt(link, child, sessionId ?? owned?.sessionId ?? "", spawned.cwd,
+          [...(spawned.pending ?? []), ...(spawned.streaming ? [spawned.streaming] : [])], spawned, owned?.creationId);
+      } catch (error) {
+        if (!owned) child.close();
+        console.warn(`[omp-web] could not join session ${sessionId} on ${labelOf(link.id)}: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+    })();
+  }
+}
+
+/** Spec "Adopting live children": a session wrapper takes the child over, by
+ * the identity the child itself reports (a new session is in no list before
+ * its first reply is written). Failed shared adoption leaves this link; pooled creations are retained. */
+async function adopt(link: Link, child: RemoteRpcTransport, sessionId: string, cwd: string, replay: string[],
+  metadata?: Pick<SpawnResult, "advisorSpawned" | "launchAdvisor">, creationId?: string): Promise<boolean> {
+  try {
+    // rpc-manager imports the hub: resolving adoption lazily avoids their initialization cycle.
+    const { adoptRpcSession } = await import("../rpc-manager");
+    const session = await adoptRpcSession({ host: link.host, transport: child, sessionId, cwd, replay, ...metadata, creationId });
+    if (creationId !== undefined) confirmPooledChild(creationId, link.id, cwd, session.sessionId);
+    return true;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (creationId !== undefined) {
+      console.warn(`[omp-web] retained creation ${creationId} on ${labelOf(link.id)} for owner reconciliation: ${reason}`);
+      return false;
+    }
+    child.close();
+    console.warn(`[omp-web] left the shared omp child of session ${sessionId} on ${labelOf(link.id)} running: this server could not adopt it (${reason})`);
+    return false;
+  }
+}
+
+/** A configuration report: a change reaches Settings (`hosts` subscribers). */
+function noteConfigState(link: Link, state: ConfigState, owned: boolean): void {
+  if (link.configOwned === owned && JSON.stringify(link.configState) === JSON.stringify(state)) return;
+  link.configState = state;
+  link.configOwned = owned;
+  notifyHostsChange();
+}
+
+/** The member runs this server's configuration as it is now, plugins included: Settings' `current`, and the sync's target otherwise. */
+function configCurrent(link: Link): boolean {
+  const state = link.configState;
+  return link.configOwned && state !== null && state.version !== null && state.version === hub().masterConfig.version && state.files === "current" && state.plugins === "current";
+}
+
+/** `whole`: for a `part` that completes a line, that line decoded. `joined`: that line itself, which gets no dedup of
+ * its own (its parts were deduped). */
+function applyUp(link: Link, message: UpMessage | UnknownMessage, whole?: UpMessage | UnknownMessage, joined = false): void {
+  if (upgradeOnly(link) && message.type === "channels_changed") {
+    if (joined || link.up.applied(message.seq)) link.recoveryInventory = message.channels;
+    return;
+  }
+  const recoveryOutput = (message.type === "stdout" || message.type === "stderr" || message.type === "exit")
+    && message.ch === link.recovery?.channel;
+  if (upgradeOnly(link) && !recoveryOutput && !["ping", "pong", "hello", "ack", "unknown", "part", "res"].includes(message.type)) {
+    if ("seq" in message && message.seq !== null) link.up.applied(message.seq);
+    return;
+  }
+  if (message.type === "ping") return enqueue(link, encodeLine({ type: "pong" }));
+  if (message.type === "pong" || message.type === "hello" || message.type === "ack") return;
+  if (message.type === "capacity") {
+    link.capacity = { sample: message.sample, receivedAt: performance.now() };
+    return;
+  }
+  if (message.type === "config_state") {
+    link.configReported = true;
+    noteConfigState(link, message.state, message.owned);
+    return;
+  }
+  if (message.type === "unknown") {
+    // A newer daemon's message, or one only the server sends: skipped, but its seq is applied so it is acked and never resent.
+    if (message.seq !== null) link.up.applied(message.seq);
+    const note = link.unknownLog.note(message);
+    if (note) console.warn(`[omp-web] ${labelOf(link.id)}: ${note}`);
+    return;
+  }
+  // Already applied before a resend.
+  if (!joined && !link.up.applied(message.seq)) return;
+  if (message.type === "channels_changed") link.recoveryInventory = message.channels;
+  if (recoveryOutput && link.recovery) {
+    if (message.type === "stdout") {
+      let frame: unknown;
+      try { frame = JSON.parse(message.line); } catch { return; }
+      if (isRecord(frame) && String(frame.id) === (link.recovery.requestId ?? "1") && (frame.t === "res" || frame.type === "response")) {
+        const recovery = link.recovery;
+        const data = isRecord(frame.data) ? frame.data : null;
+        const failed = frame.ok === false || frame.success === false || !!(data && typeof data.exitCode === "number" && data.exitCode !== 0);
+        if (failed) {
+          rejectLegacyBootstrap(link.id, recovery.id, data && typeof data.exitCode === "number"
+            ? `The fixed recovery bootstrap exited with code ${data.exitCode}; the host did not acknowledge an upgrade`
+            : "The legacy runner refused the fixed recovery bootstrap; no upgrade was acknowledged");
+        }
+        // Historical hosts refuse a new runner while the staged update is running; retain this preparation lease.
+        if (recovery.phase === "prepare" && !failed) return;
+        void request(link.id, "close", { ch: recovery.channel }, linkTimings.opTimeoutMs, undefined, recovery.id)
+          .catch(() => {}).finally(() => { if (link.recovery === recovery) link.recovery = undefined; });
+      }
+    } else if (message.type === "exit") link.recovery = undefined;
+    return;
+  }
+  switch (message.type) {
+    case "part":
+      return whole ? applyUp(link, whole, undefined, true) : undefined;
+    case "stdout":
+      return link.channels.get(message.ch)?.deliverLine(message.line);
+    case "stderr":
+      return link.channels.get(message.ch)?.deliverStderr(message.chunk);
+    case "omp_version":
+      link.ompVersion = message.ompVersion;
+      return setStatus(link, link.status === "omp-missing" ? "online" : link.status);
+    case "resync":
+      return link.channels.get(message.ch)?.deliverResync();
+    case "exit": {
+      const transport = link.channels.get(message.ch);
+      link.channels.delete(message.ch);
+      return transport?.deliverExit(message.code, message.signal as NodeJS.Signals | null, message.reason);
+    }
+    case "res":
+      return settle(link, message);
+    case "notifier":
+      link.notifier = message.on;
+      return;
+    case "channels_changed":
+      reattach(link, message.channels, false);
+      return;
+    case "sessions_changed":
+      void import("./session-index").then(({ invalidateHostSessionList }) => {
+        invalidateHostSessionList(link.id);
+        notify(hub().sessionChangeListeners, link.id);
+        return import("../rpc-manager");
+      }).then(({ notifyRunningChange }) => notifyRunningChange({ refreshSessionList: true }));
+      return;
+    case "upload_ack":
+      return notify(hub().uploadListeners, link.id, message);
+    case "workspace_file":
+      return hub().fileListeners.get(JSON.stringify([link.id, message.id, message.epoch]))?.(message.event);
+    case "stats":
+      return applyStats(link, message);
+  }
+}
+
+function settle(link: Link, message: Res): void {
+  const pending = link.pending.get(message.id);
+  // Timed out, or an id this server never issued.
+  if (!pending) return;
+  link.pending.delete(message.id);
+  clearTimeout(pending.timer);
+  const label = labelOf(link.id);
+  if (!message.ok) {
+    const { status, code, message: text } = message.error;
+    pending.reject(new HostOpError(isStatus(status) ? status : 502, code, `${label}: ${text}`));
+    return;
+  }
+  if (!message.blob) return pending.resolve(message.result);
+  const limit = pending.op === "readFileChunk" ? LINK_LIMITS.pieceBytes : LINK_LIMITS.blobBytes;
+  if (pending.blob.length === 0 || pending.blobBytes > limit || pending.blobBytes !== message.blob.bytes) {
+    return pending.reject(new HostOpError(502, "host_blob_missing", `${label} did not deliver the ${pending.op} result`));
+  }
+  const blob = pending.blob.length === 1 ? pending.blob[0] : Buffer.concat(pending.blob);
+  if (pending.op === "readMedia" || pending.op === "readFileChunk") return pending.resolve({ ok: true, value: blob });
+  try {
+    pending.resolve(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(blob)));
+  } catch {
+    pending.reject(new HostOpError(502, "host_bad_result", `${label} sent an unreadable ${pending.op} result`));
+  }
+}
+
+function request(hostId: string, op: HostOpName, args: Record<string, unknown>, timeoutMs = linkTimings.opTimeoutMs, accept?: (value: unknown) => unknown, recoveryId?: string): Promise<unknown> {
+  const link = linkFor(hostId);
+  const label = labelOf(hostId);
+  if (hub().frozen) return Promise.reject(new HostOpError(503, "server_stopping", "omp-web is shutting down"));
+  if (upgradeOnly(link) && !upgradeOp(op) && !(recoveryId && recoveryId === link.recovery?.id)) {
+    return Promise.reject(new HostOpError(426, "host_upgrade_required", "Update this host before using its application protocol"));
+  }
+  if (!link.socket || (!isLinkUp(link.status) && !upgradeOnly(link))) {
+    return Promise.reject(new HostOpError(503, "host_offline", `${label} is offline`));
+  }
+  const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+  const id = randomUUID();
+  const timer = setTimeout(() => failOp(link, id, new HostOpError(504, "host_timeout", `${label} did not answer ${op} in time`)), timeoutMs);
+  // A deadline, like the ping and offline timers: never what keeps the server running.
+  timer.unref?.();
+  // Accept runs synchronously while applying `res`, before following stdout in the same frame.
+  const pending: PendingOp = { op, resolve: (value) => {
+    try { resolve(accept ? accept(value) : value); } catch (error) { reject(error); }
+  }, reject, timer, blob: [], blobBytes: 0, ...(recoveryId ? { recoveryId } : {}), ...(op === "open" ? { sessionId: typeof args.sessionId === "string" ? args.sessionId : null } : {}) };
+  link.pending.set(id, pending);
+  try {
+    sendDown(link, { type: "req", id, op, args }, id);
+  } catch (error) {
+    clearTimeout(timer);
+    link.pending.delete(id);
+    reject(error instanceof LinkLimitError ? new HostOpError(413, "host_request_too_large", `The request is too large for ${label}`) : error);
+  }
+  return promise;
+}
+
+/** Shape check for daemon results other than the lists: an OpResult whose
+ * value has the fields main reads (a 500 TypeError in a route otherwise). */
+function validResult(op: keyof SessionOps, result: unknown, args: unknown[]): boolean {
+  if (!isRecord(result)) return false;
+  if (result.ok === false) return isStatus(result.status) && typeof result.code === "string" && typeof result.error === "string";
+  if (result.ok !== true || !("value" in result)) return false;
+  const { value } = result;
+  switch (op) {
+    // Media bytes only ever arrive through the blob leg.
+    case "readMedia":
+      return value instanceof Uint8Array;
+    case "searchSessions":
+      return isRecord(value) && Object.entries(value).every(([id, score]) =>
+        isValidSessionId(id) && typeof score === "number" && Number.isFinite(score));
+    // Main uses these paths (spawn cwd, project keys): they must be strings.
+    case "validateCwd":
+      return isRecord(value) && typeof value.cwd === "string" && typeof value.projectRoot === "string" && (value.projectKey === undefined || typeof value.projectKey === "string");
+    case "preparePoolProject":
+      return isRecord(value) && preparedPath(value.cwd) && preparedPath(value.projectRoot)
+        && typeof value.baseCommit === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.baseCommit);
+    case "exportSession":
+      return isRecord(value) && typeof value.html === "string" && typeof value.fileName === "string";
+    case "readSession":
+      return isRecord(value) && isRecord(value.info) && isRecord(value.context);
+    case "readContext": {
+      // The context route reads a different shape per mode.
+      const options = isRecord(args[2]) ? args[2] : {};
+      if (!isRecord(value)) return false;
+      if (options.boundary) return Array.isArray(value.entryIds);
+      if (options.sync) return isRecord(value.history) && nullableString(value.leafId) && nullableString(value.tipId);
+      return isRecord(value.context);
+    }
+    case "archiveSession":
+      return isRecord(value) && typeof value.archivedPath === "string";
+    // The route reads `projects` and iterates `newRoots`.
+    case "updateProject":
+      return isRecord(value) && Array.isArray(value.projects) && value.projects.every((project) => projectEntry(project) !== null)
+        && Array.isArray(value.newRoots) && value.newRoots.every((root) => typeof root === "string");
+    case "restoreArchive":
+      return isRecord(value) && typeof value.sessionId === "string" && isValidSessionId(value.sessionId);
+    // An answer without the daemon process's identity cannot be matched to the claim: the route would otherwise trust it.
+    case "restoreReserve":
+      return isRecord(value) && typeof value.instance === "string" && value.instance !== "";
+    // An unknown answer must not read as "fenced and stopped": the route drops its claim on `running: false`.
+    case "restoreFence":
+      return isRecord(value) && typeof value.instance === "string" && value.instance !== "" && typeof value.running === "boolean";
+    default:
+      return true;
+  }
+}
+
+/** Paths belong to the daemon's OS, which need not be the web server's OS. */
+function preparedPath(value: unknown): boolean {
+  if (typeof value !== "string" || value.includes("\0")) return false;
+  const path = value.startsWith("/") ? posix : win32;
+  return path.isAbsolute(value) && path.normalize(value) === value;
+}
+
+const optionalString = (value: unknown) => value === undefined || typeof value === "string";
+const optionalNumber = (value: unknown) => value === undefined || (typeof value === "number" && Number.isFinite(value));
+const nullableString = (value: unknown) => value === null || typeof value === "string";
+
+/** A daemon's session-list entry reduced to SessionInfo's fields; null when one has the wrong type. */
+function sessionEntry(value: unknown): SessionInfo | null {
+  if (!isRecord(value)) return null;
+  const { path, id, cwd, name, created, modified, lastMessageAt, messageCount, firstMessage, parentSessionId, projectRoot, projectKey, worktreeBranch } = value;
+  if (
+    typeof path !== "string" || typeof id !== "string" || !isValidSessionId(id) || typeof cwd !== "string"
+    || typeof created !== "string" || typeof modified !== "string" || typeof firstMessage !== "string"
+    || typeof messageCount !== "number" || !Number.isFinite(messageCount)
+    || ![name, lastMessageAt, parentSessionId, projectRoot, projectKey, worktreeBranch].every(optionalString)
+  ) return null;
+  return { path, id, cwd, name, created, modified, lastMessageAt, messageCount, firstMessage, parentSessionId, projectRoot, projectKey, worktreeBranch } as SessionInfo;
+}
+
+/** A daemon's project-registry entry reduced to its known fields; null when one has the wrong type. */
+function projectEntry(value: unknown): ProjectRegistryEntry | null {
+  if (!isRecord(value)) return null;
+  const { path, addedAt, hidden, alias, sortOrder, pinOrder, launchConfig } = value;
+  if (
+    typeof path !== "string" || !path || typeof addedAt !== "string" || typeof hidden !== "boolean"
+    || !optionalString(alias) || !optionalNumber(sortOrder) || !optionalNumber(pinOrder)
+    || !(launchConfig === undefined || (isRecord(launchConfig)
+      && optionalString(launchConfig.profile)
+      && (launchConfig.advisor === undefined || typeof launchConfig.advisor === "boolean")
+      && (launchConfig.extraArgs === undefined || (Array.isArray(launchConfig.extraArgs) && launchConfig.extraArgs.every((arg) => typeof arg === "string")))))
+  ) return null;
+  return { path, addedAt, hidden, alias, sortOrder, pinOrder, launchConfig } as ProjectRegistryEntry;
+}
+
+/** A daemon's archive entry reduced to ArchivedSessionInfo's fields; null when one has the wrong type. */
+function archiveEntry(value: unknown): ArchivedSessionInfo | null {
+  if (!isRecord(value)) return null;
+  const { key, id, cwd, name, created, archivedAt, messageCount, firstMessage, size, status, restorePending } = value;
+  if (
+    typeof key !== "string" || typeof id !== "string" || typeof cwd !== "string" || typeof created !== "string"
+    || typeof archivedAt !== "string" || typeof firstMessage !== "string"
+    || typeof messageCount !== "number" || !Number.isFinite(messageCount) || typeof size !== "number" || !Number.isFinite(size)
+    || !optionalString(name) || !optionalString(status) || (restorePending !== undefined && restorePending !== true)
+  ) return null;
+  return { key, id, cwd, name, created, archivedAt, messageCount, firstMessage, size, status, ...(restorePending ? { restorePending: true } : {}) } as ArchivedSessionInfo;
+}
+
+const MEDIA_HASH_RE = /^[0-9a-f]{64}$/;
+
+/** Ops that rewrite or move a session's file: an exiting orphan of that session may still flush it. */
+const ORPHAN_SENSITIVE_OPS: Partial<Record<keyof SessionOps, true>> = { archiveSession: true, deleteSession: true, renameSessionFile: true };
+
+/** A clone/fetch may outlast ordinary operations, but preparation still has a bounded deadline. */
+const POOL_PREPARE_TIMEOUT_MS = 10 * 60_000;
+const SESSION_SEARCH_TIMEOUT_MS = 5_000;
+
+function remoteSessionOps(hostId: string): SessionOps {
+  const ops: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+  for (const [op, params] of Object.entries(SESSION_OP_PARAMS) as [keyof SessionOps, readonly string[]][]) {
+    ops[op] = async (...args) => {
+      if (op === "readMedia" && !MEDIA_HASH_RE.test(String(args[0]))) {
+        return { ok: false, status: 400, code: "invalid_hash", error: "Invalid media hash" };
+      }
+      if (ORPHAN_SENSITIVE_OPS[op]) await orphanExit(hostId, String(args[0]));
+      const timeout = op === "preparePoolProject" ? POOL_PREPARE_TIMEOUT_MS
+        : op === "searchSessions" ? SESSION_SEARCH_TIMEOUT_MS : linkTimings.opTimeoutMs;
+      const result = await request(hostId, op, Object.fromEntries(params.map((name, i) => [name, args[i]])), timeout);
+      if (op === "listSessionIdsForRestore") {
+        if (Array.isArray(result) && result.every((id) => typeof id === "string" && id.length > 0)) return result;
+        throw new HostOpError(502, "host_bad_result", `${labelOf(hostId)} sent an incomplete active-session inventory`);
+      }
+      const list: ((value: unknown) => object | null) | null = op === "listSessions" ? sessionEntry : op === "listProjects" ? projectEntry : op === "listArchives" ? archiveEntry : null;
+      // Untrusted list entries: malformed ones are dropped, the rest keep only their known fields.
+      if (list && Array.isArray(result)) return result.map(list).filter((entry) => entry !== null);
+      if (!list && validResult(op, result, args)) return result;
+      throw new HostOpError(502, "host_bad_result", `${labelOf(hostId)} sent an invalid ${op} result`);
+    };
+  }
+  return ops as unknown as SessionOps;
+}
+
+function remoteWorkspaceOps(hostId: string): WorkspaceOps {
+  const ops: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+  for (const [op, params] of Object.entries(WORKSPACE_OP_PARAMS) as [keyof WorkspaceOps, readonly string[]][]) {
+    ops[op] = async (...args) => {
+      const link = linkFor(hostId);
+      if (link.socket && !link.workspaceOps?.has(op)) {
+        throw new HostOpError(501, "workspace_unsupported", `Update or restart the ompweb host daemon on ${labelOf(hostId)} to use workspace files`);
+      }
+      const result = await request(hostId, op, Object.fromEntries(params.map((name, i) => [name, args[i]])), op === "publishUpload" ? UPLOAD_ATTACH_TIMEOUT_MS : linkTimings.opTimeoutMs);
+      if (!validWorkspaceResult(op, result)) throw new HostOpError(502, "host_bad_result", `${labelOf(hostId)} sent an invalid ${op} result`);
+      return result;
+    };
+  }
+  return ops as unknown as WorkspaceOps;
+}
+
+/** An omp child on a linked host. Output that arrives before `RpcProcess`
+ * subscribes is held for the first listener, as the local transport does, up
+ * to channelBufferBytes: overflow closes this server's membership. */
+export class RemoteRpcTransport implements RpcTransport {
+  readonly hostId: string;
+  readonly ch: string;
+  /** Every linked daemon owns its children's lifecycle (RpcTransport reads this). */
+  readonly hostOwnedLifecycle = true;
+  /** RpcTransport.id: the channel id, for log correlation. */
+  get id(): string {
+    return this.ch;
+  }
+  /** Set for a child of a previous run the daemon listed in `hello` (the session it runs); null for children this server spawned. */
+  readonly sessionId: string | null;
+  /** The session the child last named in a `hello` or `session` frame, else `sessionId`: tags its link samples. */
+  session: string | null;
+  /** The daemon confirmed the spawn (or listed the channel); until then a `hello` without it is not a loss. */
+  spawned = false;
+  /** A later start owns this creation proxy too: its allocating attempt may no longer discard it. */
+  reusedForCreation = false;
+  /** The daemon stopped listing this child: it died while the link was down. Set before the synthesized exit. */
+  lost = false;
+  /** A listed child being taken over (see reattach): resolves true once adopted, false once killed instead. */
+  adoption: Promise<boolean> | null = null;
+  /** A retained creation hello is also the authority for retrying adoption after journal recovery. */
+  creationHello?: HelloChannel;
+  private readonly lineListeners: Array<(line: string) => void> = [];
+  private readonly stderrListeners: Array<(chunk: string) => void> = [];
+  private readonly exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
+  private readonly resyncListeners: Array<() => void> = [];
+  private readonly pendingLines: string[] = [];
+  private readonly pendingStderr: string[] = [];
+  private heldLineBytes = 0;
+  private heldStderrBytes = 0;
+  private overflowed = false;
+  private exitInfo: [number | null, NodeJS.Signals | null] | null = null;
+  private closed = false;
+  private interested = false;
+  private preparing = 0;
+  private preparationHandoff = false;
+  private opening: OpenChannelRequest | null = null;
+  private refreshing = false;
+
+  constructor(hostId: string, ch: string, sessionId: string | null = null) {
+    this.hostId = hostId;
+    this.ch = ch;
+    this.sessionId = sessionId;
+    this.session = sessionId;
+  }
+
+  write(line: string, callback: (error?: Error | null) => void): void {
+    if (this.exitInfo || this.closed) return callback(new Error("RPC process is not running"));
+    // sendDown would drop it: a command waiting on it fails now instead of at its timeout.
+    if (hub().frozen) return callback(new Error("omp-web is shutting down"));
+    try {
+      // Kept in the link outbox until the daemon acks it, across reconnects; queued per channel, in order.
+      sendDown(linkFor(this.hostId), { type: "stdin", ch: this.ch, line }, this.ch);
+      callback(null);
+    } catch (error) {
+      // Nothing was queued: a command too large for the link is refused like an oversize request body.
+      if (error instanceof LinkLimitError) return callback(new HostOpError(413, "request_too_large", "Agent command is too large"));
+      callback(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  onLine(listener: (line: string) => void): void {
+    this.lineListeners.push(listener);
+    for (const line of this.pendingLines.splice(0)) listener(line);
+    this.heldLineBytes = 0;
+  }
+
+  onStderr(listener: (chunk: string) => void): void {
+    this.stderrListeners.push(listener);
+    for (const chunk of this.pendingStderr.splice(0)) listener(chunk);
+    this.heldStderrBytes = 0;
+  }
+
+  onExit(listener: (code: number | null, signal: NodeJS.Signals | null) => void): void {
+    this.exitListeners.push(listener);
+    const info = this.exitInfo;
+    if (info) queueMicrotask(() => listener(info[0], info[1]));
+  }
+
+  /** The host dropped buffered output for this child; the session must reconcile. */
+  onResync(listener: () => void): void {
+    this.resyncListeners.push(listener);
+  }
+
+  /** The link has no stdin EOF: closing input leaves the shared channel (the host owns the child). */
+  endInput(): void {
+    this.close();
+  }
+
+  killTree(force: boolean): void {
+    if (this.exitInfo) return;
+    sendDown(linkFor(this.hostId), { type: "kill", ch: this.ch, force }, this.ch);
+  }
+
+  setInterest(on: boolean): void {
+    if (this.closed || this.exitInfo || this.interested === on) return;
+    this.interested = on;
+    this.sendInterest();
+  }
+
+  /** `takeOver`: only the command that asked its open for a preparation lease inherits it, never an unrelated one. */
+  setPreparing(on: boolean, takeOver = false): void {
+    if (this.closed || this.exitInfo) return;
+    const wasPreparing = this.preparing > 0;
+    this.preparing = Math.max(0, this.preparing + (on ? 1 : -1));
+    if (on && takeOver && this.preparationHandoff) {
+      this.preparationHandoff = false;
+      this.preparing -= 1; // The first real command takes over the open-to-send lease without a false gap.
+    }
+    if (wasPreparing !== (this.preparing > 0)) this.sendInterest();
+  }
+
+  /** Acquire (rejects 409 `session_busy` while another web app edits) or release the host's history-edit lease. */
+  async setEditing(on: boolean): Promise<void> {
+    if (this.closed || this.exitInfo) return;
+    await request(this.hostId, "editLease", { ch: this.ch, on });
+  }
+
+  private sendInterest(): void {
+    sendDown(linkFor(this.hostId), { type: "interest", ch: this.ch, on: this.interested, preparing: this.preparing > 0 }, this.ch);
+  }
+
+  async setHostTools(tools: unknown[], schemes: HostUriScheme[]): Promise<void> {
+    if (this.closed || this.exitInfo) throw new Error("RPC channel is closed");
+    validateHostTools(tools, schemes);
+    sendDown(linkFor(this.hostId), { type: "host_tools", ch: this.ch, tools, schemes }, this.ch);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    const link = linkFor(this.hostId);
+    if (link.channels.get(this.ch) === this) link.channels.delete(this.ch);
+    if (!this.exitInfo) void request(this.hostId, "close", { ch: this.ch }).catch(() => {});
+    this.deliverExit(null, null);
+  }
+
+  noteOpen(opening: OpenChannelRequest): void {
+    // Reconciliation is a read/join, never another explicit advisor change.
+    this.opening = { sessionId: opening.sessionId, launch: opening.launch, expectedChannel: this.ch };
+    if (opening.preparing && !this.preparationHandoff) {
+      this.preparationHandoff = true;
+      this.preparing += 1;
+    }
+    if (this.interested || this.preparing > 0) this.sendInterest();
+  }
+
+  /** A wrapper reads this child's lines (else they are held for the one adopting it). */
+  get listening(): boolean {
+    return this.lineListeners.length > 0;
+  }
+
+  replayOpen(pending: string[], streaming: string | null): void {
+    if (this.lineListeners.length === 0) return;
+    notify(this.resyncListeners);
+    for (const line of pending) this.deliverLine(line);
+    if (streaming) this.deliverLine(streaming);
+  }
+
+  async resync(): Promise<void> {
+    if (!this.opening || this.refreshing || this.closed || this.exitInfo) return;
+    this.refreshing = true;
+    try {
+      const sessionId = this.session ?? this.opening.sessionId;
+      if (!sessionId) throw new Error("The shared channel has not reported its session identity");
+      await request(this.hostId, "open", { ...this.opening, sessionId }, linkTimings.opTimeoutMs, (value) => {
+        if (!isOpenResult(value) || value.ch !== this.ch || value.pending === null) throw new Error("Host could not reconcile the shared channel");
+        this.refreshing = false;
+        if (this.interested || this.preparing > 0) this.sendInterest();
+        notify(this.resyncListeners);
+        for (const line of value.pending) this.deliverLine(line);
+        if (value.streaming) this.deliverLine(value.streaming);
+      });
+    } catch (error) {
+      // A redial's hello reattaches this channel and retries its snapshot.
+      if (error instanceof HostOpError && error.code === "host_offline") return;
+      this.close();
+      console.warn(`[omp-web] closed shared channel ${this.ch}: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  /** The byte size of `text` when it may be held for a listener; null past the cap, where the child is killed once. */
+  private holdable(text: string): number | null {
+    const bytes = Buffer.byteLength(text);
+    if (!this.overflowed && this.heldLineBytes + this.heldStderrBytes + bytes <= LINK_LIMITS.channelBufferBytes) return bytes;
+    if (!this.overflowed) {
+      this.overflowed = true;
+      this.close();
+    }
+    return null;
+  }
+
+  deliverLine(line: string): void {
+    if (this.closed) return;
+    if (line.includes('"t":"hello"') || line.includes('"t":"session"')) this.noteSession(line);
+    if (this.lineListeners.length > 0) return notify(this.lineListeners, line);
+    const bytes = this.holdable(line);
+    if (bytes === null) return;
+    this.pendingLines.push(line);
+    this.heldLineBytes += bytes;
+  }
+
+  deliverStderr(chunk: string): void {
+    if (this.stderrListeners.length > 0) return notify(this.stderrListeners, chunk);
+    const bytes = this.holdable(chunk);
+    if (bytes === null) return;
+    this.pendingStderr.push(chunk);
+    this.heldStderrBytes += bytes;
+  }
+
+  deliverResync(): void {
+    notify(this.resyncListeners);
+    void this.resync();
+  }
+
+  /** Set when the host stopped the child on purpose (see the `exit` message's `reason`). */
+  stopReason?: string;
+
+  deliverExit(code: number | null, signal: NodeJS.Signals | null, reason?: string): void {
+    if (this.exitInfo) return;
+    this.stopReason = reason;
+    this.exitInfo = [code, signal];
+    notify(this.exitListeners, code, signal);
+  }
+
+  private noteSession(line: string): void {
+    let frame: unknown;
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (isRecord(frame) && (frame.t === "hello" || frame.t === "session") && typeof frame.sessionId === "string" && isValidSessionId(frame.sessionId)) {
+      this.session = frame.sessionId;
+    }
+  }
+}
+
+function isSpawnResult(value: unknown): value is { cwd: string; fellBack: boolean; launchAdvisor: boolean; autoApproveExtension: boolean } {
+  return isRecord(value)
+    && typeof value.cwd === "string"
+    && typeof value.fellBack === "boolean"
+    && typeof value.launchAdvisor === "boolean"
+    && typeof value.autoApproveExtension === "boolean";
+}
+
+function isOpenResult(value: unknown): value is OpenChannelResult {
+  if (!isRecord(value)) return false;
+  const { ch, joined, pending, streaming, advisorSpawned } = value;
+  return isSpawnResult(value)
+    && typeof ch === "string" && ch.length > 0
+    && typeof joined === "boolean"
+    && typeof advisorSpawned === "boolean"
+    && (pending === null || (Array.isArray(pending) && pending.every((line) => typeof line === "string")))
+    && (streaming === null || typeof streaming === "string");
+}
+
+/** Legacy hosts retain their single-server lifecycle and notification behaviour. */
+export function hostOwnsLifecycle(hostId: string): boolean {
+  return hub().links.get(hostId)?.shared === true;
+}
+
+export function isNotifier(hostId: string): boolean {
+  const link = hub().links.get(hostId);
+  return !link || !link.shared || link.notifier;
+}
+
+/** A linked machine: the `Host` calls go over its link. */
+export class RemoteHost implements Host {
+  readonly id: string;
+  readonly sessionOps: SessionOps;
+  readonly workspaceOps: WorkspaceOps;
+
+  constructor(id: string) {
+    this.id = id;
+    this.sessionOps = remoteSessionOps(id);
+    this.workspaceOps = remoteWorkspaceOps(id);
+  }
+
+  supportsWorkspaceOp(name: keyof WorkspaceOps): boolean {
+    return linkFor(this.id).workspaceOps?.has(name) ?? false;
+  }
+
+  get label(): string {
+    return labelOf(this.id);
+  }
+
+  status(): HostStatus {
+    return linkFor(this.id).status;
+  }
+
+  onStatus(listener: (status: HostStatus) => void): () => void {
+    const listeners = linkFor(this.id).statusListeners;
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  }
+
+  async spawnRpc(spawnRequest: SpawnRequest, sessionId: string | null = null, options?: { replaceAdvisor?: boolean; preparing?: boolean; expectedChannel?: string }): Promise<SpawnResult> {
+    const link = linkFor(this.id);
+    if (link.status === "omp-missing") throw new HostOpError(503, "host_omp_missing", `omp is not installed on ${this.label}`);
+    const { creationId } = spawnRequest;
+    if (creationId !== undefined) {
+      if (typeof creationId !== "string" || !CREATION_ID_RE.test(creationId)) {
+        throw new HostOpError(400, "invalid_request", "Invalid creation identity");
+      }
+    }
+    // A pure join (expectedChannel) starts nothing, so it is neither refused nor flagged. An unreadable registry or pool
+    // file refuses the start: a host that may be sharing must never run a session with its own stored logins.
+    let sharing = false;
+    let configVersion: string | undefined;
+    if (options?.expectedChannel === undefined && this.id !== LOCAL_HOST_ID) {
+      let record: HostRecord | undefined;
+      try {
+        record = readHosts().find((host) => host.id === this.id);
+      } catch (error) {
+        if (!(error instanceof HostRegistryUnreadableError)) throw error;
+        throw new HostOpError(503, "host_registry_unreadable", "The linked-hosts registry cannot be read; no session was started");
+      }
+      // A link that outlived its record (hosts.json deleted or hand-edited) cannot say whether it shares.
+      if (!record) throw new HostOpError(409, "host_unregistered", "This host is no longer in the linked-hosts registry; no session was started");
+      const readPools = (): HostPool[] => {
+        try {
+          return loadPools();
+        } catch {
+          throw new HostOpError(503, "pool_storage_unavailable", "The host pool configuration cannot be read; no session was started");
+        }
+      };
+      let pools = readPools();
+      // A member runs only on the master's configuration, which its daemon applies before omp starts (spec K4).
+      if (isClusterMember(pools, this.id)) {
+        try {
+          configVersion = await masterConfigVersion();
+        } catch (error) {
+          throw new HostOpError(409, "cluster_config_invalid", error instanceof Error ? error.message : String(error));
+        }
+        // Read again after the wait, with none until the open is sent: a host that left meanwhile gets no version, so no apply follows its restore.
+        pools = readPools();
+        if (!isClusterMember(pools, this.id)) configVersion = undefined;
+      }
+      sharing = sharesCredentials(record, pools);
+    }
+    const launch = { ...spawnRequest, ...(sharing ? { shareCredentials: true as const } : {}), ...(configVersion === undefined ? {} : { configVersion }) };
+    const opening: OpenChannelRequest = { sessionId, launch, ...options };
+    // An open may wait for a cold child's `ready`, which sends nothing meanwhile.
+    return await request(this.id, "open", opening, LINK_LIMITS.channelReadyMs + linkTimings.opTimeoutMs, (value) => {
+      if (!isOpenResult(value) || (options?.expectedChannel !== undefined && value.ch !== options.expectedChannel)) {
+        throw new HostOpError(502, "host_bad_result", `${this.label} sent an invalid open result`);
+      }
+      if (value.pending === null) {
+        void request(this.id, "close", { ch: value.ch }).catch(() => {});
+        throw new HostOpError(502, "host_pending_overflow", "The shared channel's pending requests could not be restored");
+      }
+      const transport = link.channels.get(value.ch) ?? new RemoteRpcTransport(this.id, value.ch, sessionId);
+      if (creationId !== undefined && link.channels.has(value.ch)) transport.reusedForCreation = true;
+      transport.spawned = true;
+      transport.noteOpen(opening);
+      link.channels.set(value.ch, transport);
+      link.autoApprove = value.autoApproveExtension;
+      // An adopting wrapper already gets every line of a continuous member, held here: the snapshot would repeat them out of order.
+      const streaming = value.continuous === true && !transport.listening ? null : value.streaming;
+      transport.replayOpen(value.pending, value.streaming);
+      return { transport, cwd: value.cwd, fellBack: value.fellBack, launchAdvisor: value.launchAdvisor, advisorSpawned: value.advisorSpawned, joined: value.joined, pending: value.pending, streaming };
+    }) as SpawnResult;
+  }
+
+  async sessionFileExists(path: string): Promise<boolean> {
+    const exists = await request(this.id, "sessionFileExists", { path });
+    if (typeof exists !== "boolean") throw new HostOpError(502, "host_bad_result", `${this.label} sent an invalid sessionFileExists result`);
+    return exists;
+  }
+
+  invalidateSessionLists(sessionFile?: string): void {
+    // Best effort, like the local cache drop.
+    request(this.id, "invalidateSessionLists", { path: sessionFile }).catch(() => {});
+  }
+
+  autoApproveExtension(): boolean {
+    return linkFor(this.id).autoApprove;
+  }
+}
+
+/** `local` is this machine, reached through its daemon link (offline while none is linked); other ids must be registered hosts. */
+export function getHost(id: typeof LOCAL_HOST_ID): Host;
+export function getHost(id: string): Host | null;
+export function getHost(id: string): Host | null {
+  return id === LOCAL_HOST_ID || loadHosts().some((h) => h.id === id) ? linkFor(id).host : null;
+}
+
+const updateCompatibility = () => ({ min: MIN_LINK_PROTOCOL_VERSION, max: LINK_PROTOCOL_VERSION });
+
+async function requestHostUpdate(id: string, op: "checkUpdates" | "updateSoftware", args: Record<string, unknown>): Promise<unknown> {
+  if (!getMaintenanceHost(id)) return request(id, op, args);
+  try {
+    return await requestMaintenance(id, op, args);
+  } catch (error) {
+    if (error instanceof MaintenanceError) throw new HostOpError(error.status, error.code, error.message);
+    throw error;
+  }
+}
+
+function requireUpdateHost(id: string): void {
+  if (!getHost(id)) throw new HostOpError(404, "host_not_found", "Unknown host");
+  if (isUpdateDisabled()) throw new HostOpError(403, "updates_disabled", "Updates are disabled on this web server");
+}
+
+function softwareUpdate(value: unknown): value is HostSoftwareUpdate & Record<string, unknown> {
+  return isRecord(value) && nullableString(value.currentVersion) && nullableString(value.availableVersion)
+    && typeof value.updateAvailable === "boolean" && typeof value.canUpdate === "boolean"
+    && (value.canForceUpdate === undefined || typeof value.canForceUpdate === "boolean")
+    && (value.supportsReleasePin === undefined || typeof value.supportsReleasePin === "boolean")
+    && (value.supportsTwoPhaseUpdate === undefined || typeof value.supportsTwoPhaseUpdate === "boolean")
+    && (value.forceMethod === undefined || value.forceMethod === "native" || value.forceMethod === "recovery")
+    && nullableString(value.blockedReason) && typeof value.updateCommand === "string";
+}
+
+/** What a daemon that declares the runner channel reports for omp; anything else it sends is dropped. */
+function ompRunnerUpdate(value: Record<string, unknown>): HostOmpUpdate {
+  const blockers = value.blockers as Record<string, unknown>[] | undefined;
+  const operation = value.operation;
+  if (!nullableString(value.currentVersion) || !nullableString(value.availableVersion) || typeof value.updateAvailable !== "boolean" || typeof value.canUpdate !== "boolean" || !nullableString(value.blockedReason)
+    || !(blockers === undefined || Array.isArray(blockers) && blockers.every((blocker) => isRecord(blocker) && typeof blocker.code === "string" && typeof blocker.message === "string" && typeof blocker.forceable === "boolean"))
+    || !(operation === undefined || operation === null || updateOperation(operation))) {
+    throw new HostOpError(502, "host_bad_result", "The host returned an invalid update status");
+  }
+  return {
+    currentVersion: value.currentVersion, availableVersion: value.availableVersion, updateAvailable: value.updateAvailable, canUpdate: value.canUpdate, blockedReason: value.blockedReason, runnerChannel: true,
+    ...(blockers ? { blockers: blockers.map(({ code, message, forceable }) => ({ code, message, forceable }) as HostUpdateBlocker) } : {}),
+    ...(operation === undefined ? {} : { operation }),
+  };
+}
+
+function updateOperation(value: unknown): value is HostUpdateOperation {
+  return isRecord(value) && typeof value.id === "string" && value.id.length > 0 && value.id.length <= 128
+    && (value.target === "ompweb" || value.target === "omp") && typeof value.version === "string"
+    && ["running", "succeeded", "failed"].includes(String(value.state))
+    && (value.error === undefined || typeof value.error === "string")
+    && (value.prepared === undefined || value.prepared === true);
+}
+
+export interface HostUpgradeInventory {
+  host: HostRow;
+  sessionProcesses: number | null;
+  activeTurns: number | null;
+  sessionIds: string[];
+  maintenance: boolean;
+}
+
+/** Inventory stays on the maintenance plane; legacy metadata is never adopted as application sessions. */
+export async function getHostUpgradeInventory(recoveryOperations: string[] = []): Promise<HostUpgradeInventory[]> {
+  return Promise.all(hostsSnapshot().hosts.map(async (host) => {
+    const link = hub().links.get(host.id);
+    const ownedRecovery = link?.recoveryInventory?.filter((channel) => channel.creationId && recoveryOperations.includes(channel.creationId)) ?? [];
+    const maintenance = getMaintenanceHost(host.id);
+    if (maintenance) {
+      const status = await requestMaintenance(host.id, "status", {});
+      if (!isRecord(status) || !Number.isSafeInteger(status.sessionProcesses) || Number(status.sessionProcesses) < 0
+        || !Number.isSafeInteger(status.activeTurns) || Number(status.activeTurns) < 0 || !Array.isArray(status.sessions)) {
+        throw new HostOpError(502, "host_bad_result", `${host.label || host.id} returned invalid maintenance inventory`);
+      }
+      const sessionIds: string[] = [];
+      const recoveryIds = ownedRecovery.map((channel) => channel.sessionId);
+      let excluded = 0;
+      for (const session of status.sessions) {
+        if (!isRecord(session) || !(session.id === null || typeof session.id === "string")) throw new HostOpError(502, "host_bad_result", "A host returned invalid session inventory");
+        const own = recoveryIds.indexOf(session.id);
+        if (own !== -1) { recoveryIds.splice(own, 1); excluded++; continue; }
+        if (typeof session.id === "string") sessionIds.push(session.id);
+      }
+      return { host, maintenance: true, sessionProcesses: Number(status.sessionProcesses) - excluded, activeTurns: Number(status.activeTurns), sessionIds: sessionIds.sort() };
+    }
+    const sessions = link?.socket ? link.recoveryInventory?.filter((channel) => !ownedRecovery.includes(channel)) : undefined;
+    return {
+      host, maintenance: false, sessionProcesses: sessions?.length ?? null, activeTurns: null,
+      sessionIds: sessions?.flatMap((session) => session.sessionId ? [session.sessionId] : []).sort() ?? [],
+    };
+  }));
+}
+
+/** Every machine, including this one, checks on its daemon. Never fall back to the web server's installation. */
+export async function getHostSoftwareUpdates(id: string, force = false, compatibility: HostUpdateCompatibility = updateCompatibility(), releasePin?: ApprovedReleasePin, requireTwoPhase = false): Promise<HostUpdateInfo> {
+  requireUpdateHost(id);
+  if (releasePin) releasePin = validateApprovedReleasePin(releasePin);
+  const current = updateCompatibility();
+  const targetCompatibility = compatibility.min === current.min && compatibility.max === current.max ? {} : { targetCompatibility: compatibility };
+  const result = await requestHostUpdate(id, "checkUpdates", { compatibility: current, force, ...targetCompatibility, ...(releasePin ? { releasePin } : {}) });
+  if (!isRecord(result) || !softwareUpdate(result.ompweb) || !isRecord(result.omp) || !nullableString(result.omp.currentVersion)
+    || !["npm", "bun", "binary"].includes(String(result.ompweb.installMethod))
+    || !(result.ompweb.protocolVersion === null || (Number.isSafeInteger(result.ompweb.protocolVersion) && Number(result.ompweb.protocolVersion) > 0))
+    || !(result.operation === null || updateOperation(result.operation))) {
+    throw new HostOpError(502, "host_bad_result", "The host returned an invalid update status");
+  }
+  // A daemon that predates the runner channel reports only the omp version (and one older still reports a full update status for omp, which it ran as `omp update`): keep just the version unless the daemon declares the runner channel.
+  const omp = result.omp.runnerChannel === true ? ompRunnerUpdate(result.omp) : { currentVersion: result.omp.currentVersion };
+  const info = { ...result, omp } as unknown as HostUpdateInfo;
+  const protocol = info.ompweb.protocolVersion;
+  if ((!releasePin || info.ompweb.supportsReleasePin === true) && info.ompweb.updateAvailable && (protocol === null || protocol < compatibility.min || protocol > compatibility.max)) {
+    return { ...info, ompweb: { ...info.ompweb, canUpdate: false, canForceUpdate: false, blockedReason: protocol === null
+      ? "The target release's link protocol could not be verified. Update is blocked."
+      : `Update ompweb on this server first: this host update uses link protocol v${protocol}; the server supports v${compatibility.min}–v${compatibility.max}.` } };
+  }
+  const recovery = observeLegacyUpgrade(id, info);
+  if (recovery && (recovery.state === "running" || info.operation?.id === recovery.id || !info.operation)) info.operation = recovery;
+  const activeRecovery = linkFor(id).recovery;
+  if (activeRecovery?.phase && info.operation?.id === activeRecovery.id && info.operation.state !== "running") {
+    activeRecovery.phase = undefined;
+    void request(id, "close", { ch: activeRecovery.channel }, linkTimings.opTimeoutMs, undefined, activeRecovery.id)
+      .catch(() => {}).finally(() => { if (linkFor(id).recovery === activeRecovery) linkFor(id).recovery = undefined; });
+  }
+  // Old daemons have no force contract. Only explicitly approved recovery may use their execution channel.
+  if (id === LOCAL_HOST_ID && info.ompweb.canForceUpdate === undefined && !info.operation) info.operation = getHostUpdateOperation(); // an old daemon cannot report the recovery that is replacing it
+  if (info.ompweb.canForceUpdate === undefined && info.ompweb.updateAvailable && info.operation?.state !== "running") {
+    if (id === LOCAL_HOST_ID) {
+      // This machine's daemon is recovered through its private control endpoint, never through its runner or a downloaded helper.
+      try {
+        await checkHostRecovery({ version: releasePin?.version ?? info.ompweb.availableVersion ?? "", compatibility });
+        info.ompweb.canForceUpdate = true;
+        info.ompweb.forceMethod = "recovery";
+      } catch (error) {
+        info.ompweb.canForceUpdate = false;
+        if (!info.ompweb.canUpdate && error instanceof Error) info.ompweb.blockedReason = error.message;
+      }
+    } else {
+      const link = linkFor(id);
+      if (link.socket && link.recoveryHome && ["linux", "darwin", "win32"].includes(link.platform || "")) {
+        try {
+          const helper = await recoveryHelperRelease();
+          info.ompweb.canForceUpdate = helper.assets.some((asset) => asset.name.startsWith(`ompweb-${link.platform === "win32" ? "windows" : link.platform}-`));
+          info.ompweb.forceMethod = "recovery";
+        } catch { info.ompweb.canForceUpdate = false; }
+      }
+    }
+  }
+  if (releasePin && (info.ompweb.supportsReleasePin !== true || requireTwoPhase && info.ompweb.supportsTwoPhaseUpdate !== true) && info.ompweb.updateAvailable && info.operation?.state !== "running") {
+    const candidate = info.ompweb;
+    const prohibited = candidate.blockers?.some((blocker) => !blocker.forceable);
+    const eligible = !prohibited && (candidate.canUpdate || candidate.canForceUpdate);
+    candidate.canUpdate = false;
+    candidate.canForceUpdate = false;
+    candidate.blockedReason ||= "This host cannot enforce approved release pins; explicit forced recovery is required";
+    if (eligible) {
+      if (id === LOCAL_HOST_ID) {
+        try {
+          await checkHostRecovery({ version: releasePin.version, compatibility });
+          candidate.canForceUpdate = true;
+        } catch (error) { candidate.blockedReason = error instanceof Error ? error.message : "Pinned recovery is unavailable"; }
+      } else {
+        const link = linkFor(id);
+        if (link.socket && link.recoveryHome && (link.platform === "win32" ? win32.isAbsolute(link.recoveryHome) : posix.isAbsolute(link.recoveryHome)) && ["linux", "darwin", "win32"].includes(link.platform || "")) {
+          try {
+            const helper = await recoveryHelperRelease();
+            candidate.canForceUpdate = helper.assets.some((asset) => asset.name.startsWith(`ompweb-${link.platform === "win32" ? "windows" : link.platform}-`));
+          } catch { /* No verified helper means no pinned recovery. */ }
+        }
+      }
+      if (candidate.canForceUpdate) candidate.forceMethod = "recovery";
+    }
+  }
+  return info;
+}
+
+export async function updateHostSoftware(id: string, target: HostUpdateTarget, version: string, options: { force?: boolean; compatibility?: HostUpdateCompatibility; operationId?: string; releasePin?: ApprovedReleasePin; requireReleasePin?: boolean; phase?: "prepare" | "commit" | "cancel" } = {}): Promise<{ accepted: true; operation: HostUpdateOperation }> {
+  const compatibility = options.compatibility ?? updateCompatibility();
+  if (options.requireReleasePin && !options.releasePin) throw new HostOpError(400, "invalid_request", "Missing approved release pin");
+  if (options.releasePin) options.releasePin = validateApprovedReleasePin(options.releasePin, version);
+  if (options.phase !== undefined && (!["prepare", "commit", "cancel"].includes(options.phase) || !options.operationId || !options.releasePin || !options.requireReleasePin)) throw new HostOpError(400, "invalid_request", "Coordinated phases require an operation identity and approved artifacts");
+  const checked = await getHostSoftwareUpdates(id, true, compatibility, options.releasePin, options.phase !== undefined);
+  const matching = options.operationId && checked.operation?.id === options.operationId && checked.operation.target === target && checked.operation.version === version;
+  if (!options.phase && !options.releasePin && matching) {
+    return { accepted: true, operation: checked.operation! };
+  }
+  const candidate = checked[target];
+  const link = linkFor(id);
+  // This machine's old daemon is updated only by recovery, which Force confirms. A linked host's old daemon still updates
+  // itself for a normal update: the recovery helper its Force uses is offered beside that, not instead of it.
+  const recovery = candidate.forceMethod === "recovery" && (options.force === true || id === LOCAL_HOST_ID) || options.phase !== undefined && candidate.supportsTwoPhaseUpdate !== true;
+  const pinnedRecovery = options.releasePin !== undefined && recovery;
+  if (!matching && (!candidate.updateAvailable || !(options.force ? candidate.canForceUpdate || candidate.canUpdate : candidate.canUpdate) || candidate.availableVersion !== version && !pinnedRecovery)) {
+    // An omp update names its blocker (ompweb_update_active, omp_install_active...) for a caller that must not read English.
+    throw new HostOpError(409, target === "omp" ? candidate.blockers?.[0]?.code ?? "host_update_blocked" : "host_update_blocked", candidate.blockedReason ?? "The available version changed; check for updates again");
+  }
+  if (recovery && !options.force) throw new HostOpError(409, "host_update_blocked", "This host requires explicitly approved recovery");
+  if (options.force && recovery && id === LOCAL_HOST_ID) {
+    try { return await startHostRecovery({ operationId: options.operationId ?? randomUUID(), version, compatibility, force: true, releasePin: options.releasePin, requireReleasePin: options.requireReleasePin, phase: options.phase }); }
+    catch (error) { throw error instanceof HostRecoveryRefusal ? new HostOpError(error.httpStatus, error.code, error.message) : error; }
+  }
+  if (options.force && recovery) {
+    return startLegacyUpgrade({
+      hostId: id, version, compatibility, platform: link.platform || "",
+      operationId: options.operationId,
+      releasePin: options.releasePin, requireReleasePin: options.requireReleasePin,
+      phase: options.phase,
+      transport: {
+        async open(operationId) {
+          const home = link.recoveryHome;
+          if (!home || !(link.platform === "win32" ? win32.isAbsolute(home) : posix.isAbsolute(home))) throw new HostOpError(409, "recovery_unavailable", "The host did not advertise a usable recovery directory");
+          if (link.recovery?.id === operationId && link.recovery.channel) {
+            link.recovery.phase = options.phase;
+            link.recovery.requestId = options.phase === "commit" ? "2" : options.phase === "cancel" ? "3" : "1";
+            return link.recovery.channel;
+          }
+          link.recovery = { id: operationId, lines: new Set(), phase: options.phase,
+            requestId: options.phase === "commit" ? "2" : options.phase === "cancel" ? "3" : "1" };
+          const result = await request(id, "open", { sessionId: null, ...(options.phase ? { preparing: true } : {}), launch: {
+            creationId: operationId, cwd: home, recordedCwd: null, sessionFile: "", toolNames: [], advisor: false,
+          } }, LINK_LIMITS.channelReadyMs + linkTimings.opTimeoutMs, undefined, operationId);
+          if (!isOpenResult(result)) throw new HostOpError(502, "host_bad_result", "The host returned an invalid recovery channel");
+          link.recovery.channel = result.ch;
+          return result.ch;
+        },
+        send(channel, lines) {
+          if (link.recovery?.channel !== channel) throw new HostOpError(409, "recovery_changed", "The recovery channel changed before bootstrap");
+          link.recovery.lines = new Set(lines);
+          for (const line of lines) sendDown(link, { type: "stdin", ch: channel, line }, channel);
+        },
+      },
+    });
+  }
+  const current = updateCompatibility();
+  const result = await requestHostUpdate(id, "updateSoftware", {
+    target, version, compatibility: current,
+    ...(compatibility.min !== current.min || compatibility.max !== current.max ? { targetCompatibility: compatibility } : {}),
+    ...(options.force ? { force: true } : {}), ...(options.operationId ? { operationId: options.operationId } : {}),
+    ...(options.releasePin ? { releasePin: options.releasePin, requireReleasePin: true } : {}),
+    ...(options.phase ? { phase: options.phase } : {}),
+  });
+  if (!isRecord(result) || result.accepted !== true || !updateOperation(result.operation)
+    || result.operation.target !== target || result.operation.version !== version) {
+    throw new HostOpError(502, "host_bad_result", "The host returned an invalid update operation");
+  }
+  return { accepted: true, operation: result.operation };
+}
+
+export interface LinkedHostRow {
+  id: string;
+  label: string;
+  status: HostStatus;
+  ompVersion: string | null;
+  ompwebVersion?: string | null;
+  /** A connected maintenance API or legacy shim can update an incompatible application peer. */
+  upgradeOnly?: boolean;
+  apiVersion?: number;
+  platform: string | null;
+  lastSeenAt: string | null;
+  allowAgentStart: boolean;
+  shareCredentials: boolean;
+  /** Link protocol version the daemon last presented; null before it ever dialed. */
+  hostVersion: number | null;
+  serverVersion: number;
+  workspaceOps: string[];
+  /** v10: the daemon's last cluster configuration report; `owned` when the configuration it holds is this server's,
+   * `current` when that is the master's version with its plugins in line. */
+  clusterConfig?: ConfigState & { owned: boolean; current: boolean };
+}
+
+function hostConnectionFields(link: Link | undefined, maintenance: MaintenanceHello | null): Pick<LinkedHostRow, "status" | "upgradeOnly" | "apiVersion"> {
+  const applicationUp = !!link?.socket && isLinkUp(link.status);
+  const mismatch = !!maintenance && (maintenance.protocolVersion < MIN_LINK_PROTOCOL_VERSION || maintenance.protocolVersion > LINK_PROTOCOL_VERSION);
+  return {
+    status: maintenance && !applicationUp ? mismatch ? "needs-upgrade" : "offline" : link?.status ?? "offline",
+    ...(!applicationUp && ((link?.socket && upgradeOnly(link)) || mismatch) ? { upgradeOnly: true } : {}),
+    ...(maintenance ? { apiVersion: maintenance.apiVersion } : {}),
+  };
+}
+
+export function listHosts(): LinkedHostRow[] {
+  return loadHosts().filter((record) => record.id !== LOCAL_HOST_ID).map((record) => {
+    const link = hub().links.get(record.id);
+    const maintenance = getMaintenanceHost(record.id);
+    return {
+      id: record.id,
+      label: record.label,
+      ...hostConnectionFields(link, maintenance),
+      ompVersion: maintenance?.ompVersion ?? link?.ompVersion ?? null,
+      ompwebVersion: maintenance?.ompwebVersion ?? link?.ompwebVersion ?? null,
+      platform: maintenance?.platform ?? link?.platform ?? null,
+      lastSeenAt: link?.lastSeenAt ?? record.lastSeenAt,
+      allowAgentStart: record.allowAgentStart,
+      shareCredentials: record.shareCredentials,
+      hostVersion: link?.hostVersion ?? maintenance?.protocolVersion ?? null,
+      serverVersion: LINK_PROTOCOL_VERSION,
+      workspaceOps: [...(link?.workspaceOps ?? [])],
+      ...(link?.configState ? { clusterConfig: { ...link.configState, owned: link.configOwned, current: configCurrent(link) } } : {}),
+    };
+  });
+}
+
+/** Why the members cannot get this machine's configuration (spec K1, shown in Settings → Hosts): a ClusterConfigError's
+ * code and message, which name a file and never its content; any other error only by its name. */
+export interface MasterConfigError { code: string; message: string }
+
+/** The master's configuration version (lib/hosts/cluster-config-server.ts), kept for the rows' `current`. Throws its
+ * error, which the hosts snapshot carries until the configuration works again and is logged once per change. */
+export async function masterConfigVersion(): Promise<string> {
+  const master = hub().masterConfig;
+  let version: string | null = null;
+  let failure: MasterConfigError | null = null;
+  try {
+    version = await clusterConfigVersion();
+    return version;
+  } catch (error) {
+    failure = error instanceof ClusterConfigError ? { code: error.code, message: error.message } : { code: "unknown", message: error instanceof Error ? error.name : "unknown error" };
+    throw error;
+  } finally {
+    // A state kept from before `error` existed (`bun --hot`) lacks it.
+    const errorChanged = JSON.stringify(master.error ?? null) !== JSON.stringify(failure);
+    if (failure && errorChanged) console.warn(`[omp-web] cluster members cannot get this machine's configuration (${failure.code}: ${failure.message})`);
+    if (master.version !== version || errorChanged) {
+      // A new version reaches the members now, not at the next 30 s round (spec K3); the sync piles no op on another.
+      const changed = master.version !== null && version !== null && master.version !== version;
+      master.version = version;
+      master.error = failure;
+      notifyHostsChange();
+      if (changed) void syncClusterConfig();
+    }
+  }
+}
+
+const CLUSTER_CONFIG_OP_MS = 60_000;
+
+/** `clusterConfig` on a host's daemon (v10), waiting at most 60 s. The state it answers is kept only while the link has
+ * sent no `config_state` since it came up: the daemon reports each change at once, ahead of its sequenced answer, so a
+ * report that arrived first may already be newer (the plugin step finishing) and an answer must not take it back. */
+export async function clusterConfigOp(hostId: string, args: { action: "apply"; version: string } | { action: "restore" }): Promise<{ state: ConfigState; owned: boolean }> {
+  const link = linkFor(hostId);
+  link.configOps += 1;
+  let result: unknown;
+  try {
+    result = await request(hostId, "clusterConfig", args, CLUSTER_CONFIG_OP_MS);
+  } finally {
+    link.configOps -= 1;
+  }
+  let state: ConfigState;
+  try {
+    if (!isRecord(result) || typeof result.owned !== "boolean") throw new Error("owned must be a boolean");
+    state = decodeConfigState(result.state);
+  } catch {
+    throw new HostOpError(502, "host_bad_result", `${labelOf(hostId)} sent an invalid clusterConfig result`);
+  }
+  if (!link.configReported) noteConfigState(link, state, result.owned);
+  return { state, owned: result.owned };
+}
+
+/**
+ * One round of startClusterConfigSync. A linked host outside the cluster that still holds this server's configuration
+ * (its leave's restore failed or could not be sent), or has not said whether it does since its link came up (that report
+ * may have been dropped), gets `restore`: its answer says, and a host that does not hold it changes nothing. Each online
+ * member that is not current gets `apply`, which for the version it already holds costs nothing but a fresh report.
+ * Never while one of its ops is unanswered.
+ */
+export async function syncClusterConfig(): Promise<void> {
+  const members = (): Set<string> | null => {
+    try {
+      return new Set(clusterOf(loadPools())?.members.map((member) => member.hostId));
+    } catch {
+      return null; // who is a member is unknown: nobody gets either op
+    }
+  };
+  const ready = (link: Link) => link.configOps === 0;
+  const before = members();
+  if (!before) return;
+  // Read and sent with no await between: a host that joins meanwhile gets its apply after this restore. A host without omp
+  // still gets it: its files go back before its plugins are tried.
+  for (const link of hub().links.values()) {
+    if (link.id !== LOCAL_HOST_ID && !before.has(link.id) && (link.configOwned || link.configState === null) && isLinkUp(link.status) && ready(link)) clusterConfigOp(link.id, { action: "restore" }).catch(() => {});
+  }
+  if (![...before].some((id) => id !== LOCAL_HOST_ID)) return;
+  let version: string;
+  try {
+    version = await masterConfigVersion();
+  } catch {
+    return; // logged by masterConfigVersion
+  }
+  // The pools again, and nothing awaited before the sends: a host that left meanwhile never gets an apply after its restore.
+  for (const hostId of members() ?? []) {
+    const link = hub().links.get(hostId);
+    if (hostId === LOCAL_HOST_ID || !link || link.status !== "online" || !ready(link) || configCurrent(link)) continue;
+    clusterConfigOp(hostId, { action: "apply", version }).catch(() => {}); // the daemon reports a failure in its state
+  }
+}
+
+/** instrumentation.node.ts: at once, then every 30 s, members that are behind catch up and hosts that left get their own configuration back (spec K3, K6). */
+export function startClusterConfigSync(): void {
+  const state = hub();
+  if (state.configSync) return;
+  state.configSync = setInterval(() => void syncClusterConfig(), 30_000);
+  state.configSync.unref?.();
+  void syncClusterConfig();
+}
+
+export interface LocalHostRow {
+  id: "local";
+  /** The user's name for this machine; "" while it goes by the localized default. */
+  label: string;
+  status: HostStatus;
+  ompVersion: string | null;
+  ompwebVersion?: string | null;
+  upgradeOnly?: boolean;
+  apiVersion?: number;
+  platform: string | null;
+  lastSeenAt: null;
+  hostVersion: number | null;
+  serverVersion: number;
+  workspaceOps: string[];
+  /** `process.platform` of this server: picks the daemon install command while no daemon has linked. */
+  serverPlatform: string;
+  /** False under the dev server (`NODE_ENV=development`), where this machine runs sessions in-process and is offline by design: no install hints. */
+  daemonManaged: boolean;
+}
+
+export type HostRow = LocalHostRow | LinkedHostRow;
+
+/** Settings → Hosts payload (`GET /api/hosts` and the `hosts` channel): this machine first, then linked hosts. This machine's status is its daemon link's.
+ * `pools` is left out while pools.json cannot be read: a client keeps the last it had. `masterConfigError`: only while
+ * the members cannot get this machine's configuration. */
+export function hostsSnapshot(): { hosts: HostRow[]; pools?: HostPool[]; masterConfigError?: MasterConfigError } {
+  const link = hub().links.get(LOCAL_HOST_ID);
+  const maintenance = getMaintenanceHost(LOCAL_HOST_ID);
+  const local: LocalHostRow = {
+    id: "local",
+    label: customLocalLabel(),
+    ...hostConnectionFields(link, maintenance),
+    ompVersion: maintenance?.ompVersion ?? link?.ompVersion ?? null,
+    ompwebVersion: maintenance?.ompwebVersion ?? link?.ompwebVersion ?? null,
+    platform: maintenance?.platform ?? link?.platform ?? null,
+    lastSeenAt: null,
+    hostVersion: link?.hostVersion ?? maintenance?.protocolVersion ?? null,
+    serverVersion: LINK_PROTOCOL_VERSION,
+    workspaceOps: [...(link?.workspaceOps ?? [])],
+    serverPlatform: process.platform,
+    daemonManaged: process.env.NODE_ENV !== "development",
+  };
+  let pools: HostPool[] | undefined;
+  try {
+    pools = loadPools();
+  } catch {
+    // Left out; see above.
+  }
+  const { error } = hub().masterConfig;
+  return { hosts: [local, ...listHosts()], ...(pools && { pools }), ...(error && { masterConfigError: error }) };
+}
+
+/** Tell `hosts` subscribers the registry changed (rename, toggle, revoke); link changes notify on their own. */
+export function notifyHostsChange(): void {
+  notify(hub().changeListeners);
+}
+
+/** When the host last sent anything on its uplink (pongs included); null when it has no link here. */
+export function lastUplinkAt(hostId: string): number | null {
+  const lastSeenAt = hub().links.get(hostId)?.lastSeenAt;
+  return lastSeenAt ? Date.parse(lastSeenAt) : null;
+}
+
+/** Link telemetry is internal scheduling state; reading it never creates a link or broadcasts a change. */
+export function getHostCapacity(hostId: string): CapacitySnapshot | null {
+  return hub().links.get(hostId)?.capacity ?? null;
+}
+
+export function getHostLinkProtocol(hostId: string): number | null {
+  return hub().links.get(hostId)?.hostVersion ?? null;
+}
+
+/** Whether placement may use this host: `local` and hosts outside the cluster always; a cluster member only once it
+ * reports this server's current configuration (`clusterConfig.current`), so one with no report yet is not. */
+export function isHostConfigCurrent(hostId: string): boolean {
+  if (hostId === LOCAL_HOST_ID || !isClusterMember(loadPools(), hostId)) return true;
+  const link = hub().links.get(hostId);
+  return link !== undefined && configCurrent(link);
+}
+
+export function getHostOmpVersion(hostId: string): string | null {
+  return hub().links.get(hostId)?.ompVersion ?? null;
+}
+
+export function onHostsChange(listener: () => void): () => void {
+  const listeners = hub().changeListeners;
+  listeners.add(listener);
+  const detachMaintenance = onMaintenanceChange(listener);
+  return () => {
+    listeners.delete(listener);
+    detachMaintenance();
+  };
+}
+
+/** Fires on every accepted hello with the omp children the daemon still runs. Listeners
+ * run after reattach: lost channels have exited, others are adopted, retained by the journal, or killed. */
+export function onHostHello(listener: (hostId: string, channels: HelloChannel[]) => void): () => void {
+  const listeners = hub().helloListeners;
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/** Whether this server adopted a child of `sessionId` the host listed in a hello; waits for an adoption still running. */
+export async function adoptedChild(hostId: string, sessionId: string): Promise<boolean> {
+  const listed = [...(hub().links.get(hostId)?.channels.values() ?? [])].filter((child) => child.sessionId === sessionId);
+  return (await Promise.all(listed.map((child) => child.adoption))).includes(true);
+}
+
+/** Revisit an owned hello retained while the journal was unreadable, using the native adoption path. */
+export async function reconcilePooledChild(hostId: string, creationId: string): Promise<boolean> {
+  const link = hub().links.get(hostId);
+  if (!link || link.status !== "online") return false;
+  const children = [...link.channels.values()].filter((child) => child.creationHello?.creationId === creationId);
+  if (children.length > 1) throw new HostOpError(409, "creation_conflict", "Worker listed more than one child for a creation");
+  const child = children[0];
+  if (!child?.creationHello) return false;
+  const hello = child.creationHello;
+  const owned = pooledStartForChild(hostId, hello);
+  if (!owned) return false;
+  child.adoption ??= (async () => {
+    const sessionId = hello.sessionId ?? owned.sessionId ?? "";
+    const spawned = await link.host.spawnRpc({ cwd: hello.cwd, recordedCwd: hello.cwd, sessionFile: "", advisor: false, creationId },
+      hello.sessionId, { expectedChannel: hello.ch });
+    return adopt(link, child, sessionId, spawned.cwd, [...(spawned.pending ?? []), ...(spawned.streaming ? [spawned.streaming] : [])], spawned, creationId);
+  })();
+  return child.adoption;
+}
+
+/** Whether a host still runs a child of `sessionId`, joined by this server or not (a failed join leaves it running). */
+export function hostListsChild(sessionId: string): boolean {
+  for (const link of hub().links.values()) {
+    // A link kept across `bun --hot` from older code lacks the set: its listing is unknown, so stay retryable.
+    const listed: Set<string> | undefined = link.listedSessions;
+    if (isLinkUp(link.status) && (listed ? listed.has(sessionId) : true)) return true;
+  }
+  return false;
+}
+
+/** Resolves once every child of `sessionId` the host listed in a hello has exited or been adopted.
+ * Rejects with 503 if the host goes offline first: waiting through an outage
+ * would hold the session's start lock until the host redials. */
+export async function orphanExit(hostId: string, sessionId: string): Promise<void> {
+  const link = hub().links.get(hostId);
+  const listed = [...(link?.channels.values() ?? [])].filter((child) => child.sessionId === sessionId);
+  if (!link || listed.length === 0) return;
+  const { promise: offline, reject } = Promise.withResolvers<never>();
+  const onStatus = (status: HostStatus) => {
+    if (!isLinkUp(status)) reject(new HostOpError(503, "host_offline", `${labelOf(hostId)} is offline`));
+  };
+  onStatus(link.status);
+  link.statusListeners.add(onStatus);
+  const gone = listed.map((child) => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    child.onExit(() => resolve());
+    // An adopted child runs the live session: not an orphan to wait for.
+    void child.adoption?.then((adopted) => adopted && resolve());
+    return promise;
+  });
+  try {
+    await Promise.race([offline, Promise.all(gone)]);
+  } finally {
+    link.statusListeners.delete(onStatus);
+  }
+}
+
+/** An attach may copy 2 GiB (to another device): far longer than an op's usual deadline. */
+const UPLOAD_ATTACH_TIMEOUT_MS = 10 * 60_000;
+
+/** An upload op on `hostId`'s daemon (an offline one fails 503). */
+export function hostUploadOp(hostId: string, op: "uploadStart" | "uploadAbort" | "uploadAttach", args: Record<string, unknown>): Promise<unknown> {
+  return request(hostId, op, args, op === "uploadAttach" ? UPLOAD_ATTACH_TIMEOUT_MS : linkTimings.opTimeoutMs);
+}
+
+/** Tell `hostId`'s daemon how many days to keep sent uploads (null: for ever). A daemon from before the op answers 501. */
+export function setHostUploadRetention(hostId: string, days: number | null): Promise<unknown> {
+  return request(hostId, "setUploadRetention", { days });
+}
+
+/** Queue upload bytes (at most pieceBytes) for `hostId`'s daemon, fair with its other traffic; false when it has no socket. */
+export function sendUploadFrame(hostId: string, id: string, bytes: Uint8Array): boolean {
+  const link = hub().links.get(hostId);
+  if (!link?.socket || hub().frozen || upgradeOnly(link)) return false;
+  link.sender.push(`up:${id}`, { id, blob: bytes });
+  flush(link);
+  return true;
+}
+
+/** Forget upload bytes of `id` not sent yet (a resume or an abort). */
+export function dropUploadFrames(hostId: string, id: string): void {
+  hub().links.get(hostId)?.sender.drop(`up:${id}`);
+}
+
+/** Every host's `upload_ack`s, and null when a host's socket ends (its upload bytes in flight are lost). */
+export function onUploadEvent(listener: (hostId: string, ack: UploadAck | null) => void): () => void {
+  const listeners = hub().uploadListeners;
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/** End a host's link now (revoke). Its daemon gets 401 when it redials and stops its children. */
+export function closeHostLink(id: string): void {
+  closeMaintenanceHost(id);
+  const link = hub().links.get(id);
+  if (!link) return;
+  hub().links.delete(id);
+  stopTimers(link);
+  failAllOps(link, () => new HostOpError(503, "host_offline", "The host link was closed"));
+  link.socket?.close();
+  endSocket(link);
+  // Nothing will report these children again.
+  for (const transport of link.channels.values()) transport.deliverExit(null, null);
+  setStatus(link, "offline");
+}

@@ -43,6 +43,8 @@ export interface OmpModel {
   contextWindow?: number | null;
   maxTokens?: number | null;
   cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+  /** Vendor lineage/family/revision classification (packages/catalog/src/compat/types.ts `ModelIdentity`). */
+  identity?: { class: string; family?: string; revision?: string };
 }
 
 /** Entry of the get_login_providers response (modes/rpc/rpc-types.ts). */
@@ -116,8 +118,7 @@ async function startProcess(state: UtilityRpcState): Promise<RpcProcess> {
     },
   });
   try {
-    const ready = await proc.waitReady(READY_TIMEOUT_MS);
-    await proc.negotiateProtocol(ready);
+    await proc.waitReady(READY_TIMEOUT_MS);
   } catch (error) {
     void proc.dispose();
     throw error;
@@ -177,8 +178,7 @@ export async function runIsolatedUtilityCommand<T = unknown>(
     else signal.addEventListener("abort", onAbort, { once: true });
   }
   try {
-    const ready = await proc.waitReady(READY_TIMEOUT_MS);
-    await proc.negotiateProtocol(ready);
+    await proc.waitReady(READY_TIMEOUT_MS);
     return await proc.sendCommand<T>(command, options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
   } catch (error) {
     if (signal?.aborted) {

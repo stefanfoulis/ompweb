@@ -177,8 +177,8 @@ class TrayApplication : IDisposable
         if (_openBrowser) { /* explicit */ }
         else if (!_startup && cfgOpenBrowser == true) _openBrowser = true;
 
-        var nextDir = Path.Combine(_repoRoot, ".next");
-        if (_effectiveMode == "start" && !Directory.Exists(nextDir))
+        var buildIndex = Path.Combine(_repoRoot, "dist", "index.html");
+        if (_effectiveMode == "start" && !File.Exists(buildIndex))
         {
             _effectiveMode = "dev";
             if (_effectivePort == 30177) _effectivePort = 30178;
@@ -228,6 +228,22 @@ class TrayApplication : IDisposable
         return "node.exe";
     }
 
+    // Copy an omp-web credential from the user (then system) environment into the child,
+    // or remove it there. The tray's own environment was captured at logon, so a value
+    // changed or removed with `setx` since then must not survive a server restart: the
+    // old password would keep working after rotation.
+    private static string? SetChildCredential(ProcessStartInfo psi, string name)
+    {
+        var value = Environment.GetEnvironmentVariable(name, EnvironmentVariableTarget.User);
+        if (string.IsNullOrEmpty(value))
+            value = Environment.GetEnvironmentVariable(name, EnvironmentVariableTarget.Machine);
+        if (string.IsNullOrEmpty(value))
+            psi.EnvironmentVariables.Remove(name);
+        else
+            psi.EnvironmentVariables[name] = value;
+        return value;
+    }
+
     private void StartWebServer()
     {
         if (_childProcess != null && !_childProcess.HasExited) return;
@@ -237,10 +253,22 @@ class TrayApplication : IDisposable
 
         if (_nodeExe == null) _nodeExe = FindNodeExecutable();
 
+        // Never from inside the installation: a cwd there blocks the next replacement on Windows.
+        var workingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrWhiteSpace(workingDirectory))
+        {
+            // An empty value starts the child in the target's directory (or in this process's
+            // current one), and both of those are the installation.
+            WriteLog("USERPROFILE is empty: refusing to start the web server inside the installation.");
+            _state = "Stopped";
+            UpdateTrayUI();
+            return;
+        }
+
         var psi = new ProcessStartInfo
         {
             FileName = _nodeExe,
-            WorkingDirectory = _repoRoot,
+            WorkingDirectory = workingDirectory,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
@@ -254,14 +282,26 @@ class TrayApplication : IDisposable
         }
         else
         {
-            var nextBin = Path.Combine(_repoRoot, "node_modules", "next", "dist", "bin", "next");
-            psi.Arguments = $"\"{nextBin}\" dev -H {_effectiveHostname} -p {_effectivePort}";
+            var bunLauncher = Path.Combine(_repoRoot, "bin", "bun-runtime.js");
+            // The working directory is outside the installation, so both the dev entry and the config
+            // (Bun reads bunfig.toml from the working directory) are passed as absolute paths.
+            var bunfig = Path.Combine(_repoRoot, "bunfig.toml");
+            var devEntry = Path.Combine(_repoRoot, "server", "dev.ts");
+            psi.Arguments = $"\"{bunLauncher}\" \"--config={bunfig}\" --hot \"{devEntry}\" -H {_effectiveHostname} -p {_effectivePort}";
         }
 
         psi.EnvironmentVariables["OMP_WEB_PORT"] = _effectivePort.ToString();
+        // The child runs outside the installation, so name it explicitly (dev mode derives its root from this).
+        psi.EnvironmentVariables["OMP_WEB_PACKAGE_DIR"] = _repoRoot;
         psi.EnvironmentVariables["OMP_WEB_HOSTNAME"] = _effectiveHostname;
         psi.EnvironmentVariables["OMP_WEB_SERVICE"] = "1";
         psi.EnvironmentVariables["PORT"] = _effectivePort.ToString();
+        // bin/omp-web.js refuses a non-loopback bind without a password hash. A plaintext
+        // OMP_WEB_PASSWORD is passed through only so the server can refuse it with instructions.
+        if (string.IsNullOrEmpty(SetChildCredential(psi, "OMP_WEB_PASSWORD_HASH")))
+            WriteLog("WARN: OMP_WEB_PASSWORD_HASH not found in the user or system environment; a non-loopback bind will be refused by bin/omp-web.js (generate one with: ompweb hash-password)");
+        SetChildCredential(psi, "OMP_WEB_PASSWORD");
+        SetChildCredential(psi, "OMP_WEB_TRUSTED_HEADER_SHA256");
 
         var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
         proc.OutputDataReceived += (s, e) => { if (!string.IsNullOrEmpty(e.Data)) WriteLog($"[STDOUT] {e.Data}"); };

@@ -1,5 +1,6 @@
 // Types mirrored from oh-my-pi coding-agent session-entries (v3 format).
-import type { TodoPhase } from "./pi-types";
+import type { HtmlFormData, OptionNote, RpcAskDialogQuestion, TodoPhase } from "./pi-types";
+import type { MessageOrigin, SessionOriginRef } from "./message-origin";
 
 // omp-web cannot import the Bun-only @oh-my-pi packages, so the on-disk
 // shapes are re-declared here. Legacy pi v1/v2 fields are kept optional.
@@ -26,6 +27,8 @@ export interface SessionEntryBase {
   id: string;
   parentId: string | null;
   timestamp: string;
+  /** Client intent metadata stored on native message/custom-message entries, never sent to the model. */
+  clientMessageId?: string;
 }
 
 export interface TextContent {
@@ -36,12 +39,15 @@ export interface TextContent {
 /**
  * Image block. omp persists the flat {data, mimeType} shape (data may be a
  * `blob:sha256:` reference until resolved); legacy pi entries used the nested
- * Anthropic-style `source` shape. The UI handles both.
+ * Anthropic-style `source` shape. The UI handles both. Tool-result images
+ * reach the browser as `url` (`/api/media/<sha256>`, `?thumb=1` for a small
+ * preview) instead of inline base64.
  */
 export interface ImageContent {
   type: "image";
   data?: string;
   mimeType?: string;
+  url?: string;
   source?: {
     type: "base64" | "url";
     media_type?: string;
@@ -70,6 +76,11 @@ export interface UserMessage {
   role: "user";
   content: string | (TextContent | ImageContent)[];
   timestamp?: number;
+  clientMessageId?: string;
+  /** Rendered from a `branch_summary` entry, not a real prompt: omp cannot branch at it. */
+  branchSummary?: true;
+  /** Server-authored provenance, stored outside the native message entry and never supplied by browser commands. */
+  origin?: MessageOrigin;
 }
 
 export interface AssistantMessage {
@@ -108,6 +119,9 @@ export interface ToolResultMessage {
    * `tool_execution_update`), not a committed result. Rendering treats it as
    * "running" and keeps it out of the session's toolResult list. */
   partial?: boolean;
+  /** Sanitized one-line passive context omp emitted after this result's tool
+   * batch (`collectToolResults`); display-only, never part of the result. */
+  passiveContext?: string;
 }
 
 export interface CustomMessage {
@@ -117,6 +131,7 @@ export interface CustomMessage {
   display: boolean;
   details?: unknown;
   timestamp?: number;
+  clientMessageId?: string;
 }
 
 export interface BashExecutionMessage {
@@ -174,91 +189,117 @@ export type AgentMessage =
   | PythonExecutionMessage
   | FileMentionMessage;
 
-export type ExtensionUiRequest =
+/** omp's `ExtensionUIDialogOptions` as the runner sends them (no signal or callbacks). */
+export interface UiDialogOptions {
+  timeout?: number;
+  /** `input`: mask the entered text. */
+  secret?: boolean;
+  /** omp's checkbox list (ask multi-select): `checkedIndices` is the authoritative checked state. */
+  selectionMarker?: "radio" | "checkbox";
+  checkedIndices?: number[];
+  /** Leading options that get a marker; the rest are actions such as Other and Done. */
+  markableCount?: number;
+}
+
+// JSON turns an omitted middle argument into null.
+type UiDialogOptionsArg = UiDialogOptions | null;
+
+export type UiSelectItem = string | { label: string; description?: string };
+
+/** omp's `ExtensionApprovalPrompt`: a title line then details. */
+export interface UiApprovalPrompt {
+  full: string;
+  compact: string;
+  session?: string;
+  grants?: { scope: "folder" | "target"; label: string; alwaysLabel: string }[];
+}
+
+export type UiApprovalAnswer = "once" | "session" | "deny" | { grant: "folder" | "target"; always: boolean };
+
+/** omp's `ExtensionAskDialogSubmitResult`. */
+export interface UiAskDialogResult {
+  kind: "submit";
+  results: {
+    id: string;
+    question: string;
+    options: string[];
+    multi: boolean;
+    selectedOptions: string[];
+    customInput?: string;
+    customInputImages?: ImageContent[];
+    /** Remark on the answer this question got. */
+    note?: string;
+    noteImages?: ImageContent[];
+    /** Label of the option the note is on; unset when it is on the custom answer. */
+    noteOption?: string;
+    timedOut?: boolean;
+  }[];
+}
+
+/** omp's `ExtensionAskDialogChatResult`: discuss the question instead of answering it. */
+export interface UiChatResult {
+  kind: "chat";
+}
+
+/** omp's `ExtensionFormDialogResult`. */
+export interface UiFormDialogResult {
+  data: HtmlFormData;
+  /** Notes on the answers given, paired with them by `name`, `question` and `value`. */
+  notes?: OptionNote[];
+  timedOut?: boolean;
+}
+
+export type AgentConfirmPayload =
   | {
-      type: "extension_ui_request";
-      id: string;
-      method: "select";
-      title: string;
-      options: string[];
-      timeout?: number;
-      expiresAt?: number;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "confirm";
-      title: string;
+      kind: "send_to_session";
+      from: SessionOriginRef;
+      to: SessionOriginRef | null;
+      delivery: "prompt" | "steer" | "followUp";
       message: string;
-      timeout?: number;
-      expiresAt?: number;
     }
   | {
-      type: "extension_ui_request";
-      id: string;
-      method: "input";
-      title: string;
-      placeholder?: string;
-      timeout?: number;
-      expiresAt?: number;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "editor";
-      title: string;
-      prefill?: string;
-      /** omp sets this for plain-text answers (ask "Other"); render as prose, not code. */
-      promptStyle?: boolean;
-      timeout?: number;
-      expiresAt?: number;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "notify";
-      message: string;
-      notifyType?: "info" | "warning" | "error";
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "setStatus";
-      statusKey: string;
-      statusText?: string;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "setWidget";
-      widgetKey: string;
-      widgetLines?: string[];
-      widgetPlacement?: "aboveEditor" | "belowEditor";
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "setTitle";
-      title: string;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "set_editor_text";
-      text: string;
-    }
-  | {
-      type: "extension_ui_request";
-      id: string;
-      method: "custom";
-      lines: string[];
-      closed?: boolean;
+      kind: "new_session";
+      from: SessionOriginRef;
+      host: { id: string; label: string };
+      cwd: string;
+      name: string | null;
+      message: string | null;
     };
 
-export type ExtensionUiResponse =
-  | { type: "extension_ui_response"; id: string; value: string }
-  | { type: "extension_ui_response"; id: string; confirmed: boolean }
-  | { type: "extension_ui_response"; id: string; cancelled: true };
+/** What an omp dialog method returns; a cancel sends no value. */
+export type UiDialogValue = string | boolean | UiAskDialogResult | UiFormDialogResult | UiChatResult | UiApprovalAnswer;
+
+/**
+ * A dialog the runner opened: `method` is omp's `ExtensionUIContext` method, `args` its positional
+ * arguments. omp-web's own confirms carry string ids. `expiresAt` (epoch ms) is set when it times out.
+ */
+export type UiDialogRequest = { type: "ui_request"; id: number | string; expiresAt?: number } & (
+  | { method: "select"; args: [title: string, options: UiSelectItem[], dialogOptions?: UiDialogOptionsArg] }
+  | { method: "confirm"; args: [title: string, message: string, dialogOptions?: UiDialogOptionsArg]; serverPayload?: AgentConfirmPayload }
+  | { method: "input"; args: [title: string, placeholder?: string | null, dialogOptions?: UiDialogOptionsArg] }
+  | {
+      method: "editor";
+      args: [title: string, prefill?: string | null, dialogOptions?: UiDialogOptionsArg, editorOptions?: { promptStyle?: boolean } | null];
+    }
+  | { method: "askDialog"; args: [questions: RpcAskDialogQuestion[], dialogOptions?: UiDialogOptionsArg] }
+  /** omp's whole-form ask: the agent's `<form>` HTML, rendered as controls, never as markup. */
+  | { method: "formDialog"; args: [html: string, dialogOptions?: UiDialogOptionsArg] }
+  | { method: "approve"; args: [prompt: UiApprovalPrompt, dialogOptions?: UiDialogOptionsArg] }
+);
+
+/** A presentation call from the runner. */
+export type UiPresentationFrame = { type: "ui" } & (
+  | { method: "notify"; message: string; notifyType?: "info" | "warning" | "error" }
+  | { method: "setStatus"; statusKey: string; statusText?: string }
+  | { method: "setWidget"; widgetKey: string; widgetLines?: string[]; widgetPlacement?: "aboveEditor" | "belowEditor" }
+  | { method: "setTitle"; title: string }
+  | { method: "set_editor_text"; text: string }
+  | { method: "setWorkingMessage"; message?: string }
+  /** A custom component's rendered lines; keys go back as `ui_input`. */
+  | { method: "custom"; id: number; lines: string[]; closed?: boolean }
+);
+
+export type UiCustomFrame = Extract<UiPresentationFrame, { method: "custom" }>;
 
 export interface ExtensionStatusItem {
   key: string;
@@ -424,6 +465,8 @@ export interface SessionInfo {
   name?: string;
   created: string;
   modified: string;
+  /** ISO time of the last message entry (absent when the tail scan found none). */
+  lastMessageAt?: string;
   messageCount: number;
   firstMessage: string;
   parentSessionId?: string; // set if this session was forked from another
@@ -435,6 +478,15 @@ export interface SessionInfo {
   projectKey?: string;
   /** Branch name when cwd is a linked git worktree (not the main checkout) */
   worktreeBranch?: string;
+  /** Host the session's file lives on ("local" for this machine). Set by the
+   *  all-hosts session list; a host's own list leaves it out. */
+  hostId?: string;
+  /** Registered logical identity; physical owner/cwd/projectRoot remain unchanged. */
+  poolId?: string;
+  projectId?: string;
+  /** Set by /api/sessions when the session is pinned in the server-side pin
+   *  store (lib/pin-store.ts); absent means not pinned. */
+  pinned?: boolean;
 }
 
 /** Metadata for a gzip-compressed session in OMP's archive tree. */
@@ -449,6 +501,10 @@ export interface ArchivedSessionInfo {
   firstMessage: string;
   size: number;
   status?: "complete" | "interrupted" | "aborted" | "error" | "pending" | "unknown";
+  /** In-progress/interrupted restore evidence; its unique capture key is not an actionable restore target. */
+  restorePending?: true;
+  /** Host whose archive holds it ("local" for this machine). Set by the all-hosts list; a host's own list leaves it out. */
+  hostId?: string;
 }
 
 /** Workspace-level omp launch configuration; only affects omp children spawned for that workspace. */
@@ -472,8 +528,20 @@ export interface ManagedProject {
   alias?: string;
   /** Explicit sidebar position for registered projects. */
   sortOrder?: number;
+  /** Set when pinned: position among pinned workspaces (lower first). Pins
+   *  only apply while the sidebar sorts by name or activity. */
+  pinOrder?: number;
   /** Workspace-level omp launch configuration. */
   launchConfig?: ProjectLaunchConfig;
+  /** Host the project lives on ("local" for this machine). Set by GET /api/projects. */
+  hostId?: string;
+  /** Logical pool target; path/hostId, when present, are diagnostic only. */
+  poolId?: string;
+  projectId?: string;
+  projectKey?: string;
+  origin?: string;
+  name?: string;
+  defaultRef?: string;
 }
 
 export interface SessionContext {
@@ -483,15 +551,69 @@ export interface SessionContext {
   model: { provider: string; modelId: string } | null;
   /** Latest persisted todo snapshot on the selected session branch. */
   todoPhases: TodoPhase[];
+  /** Correlated native messages retained in the session's append history, including compacted entries. */
+  persistedClientMessageIds?: string[];
+  /** Explicit native withdrawals/consumption records; absence alone never resolves a handoff. */
+  resolvedClientMessageIds?: string[];
 }
 
 /** An omp child that exited unexpectedly; retained until that session starts again. */
+/** A host tool call for a session no tab is watching, sent to every open tab. */
+export interface CrossSessionHostToolCall {
+  sessionId: string;
+  hostId: string;
+  cwd: string;
+  id: string;
+  toolName: string;
+  arguments: Record<string, unknown>;
+}
+
+export type CrossSessionHostToolEvent = (CrossSessionHostToolCall & { type?: "host_tool_call" }) | {
+  type: "host_tool_cancel";
+  sessionId: string;
+  targetId: string;
+};
+
 export interface ExitedRpcSession {
   id: string;
   cwd: string;
+  /** Absent on this machine, as on `SessionInfo`. */
+  hostId?: string;
   at: number;
   code: number | null;
   signal: string | null;
   /** Last stderr line, if any. */
   detail: string;
+}
+
+/** How a held message goes to omp (docs/specs/2026-11-04-message-outbox-design.md O3). */
+export type OutboxMode = "prompt" | "followUp" | "steer";
+
+/** A message omp-web holds for a session until omp has it (the web server's outbox, lib/message-outbox.ts). */
+export interface OutboxEntry {
+  id: string;
+  sessionId: string;
+  mode: OutboxMode;
+  message: string;
+  images?: { type: "image"; data: string; mimeType: string }[];
+  uploads?: string[];
+  origin?: MessageOrigin;
+  state: "held" | "waiting_host" | "delivering" | "failed" | "delivered";
+  error?: string;
+  /** A lost reply: omp may have it; never resent by itself. */
+  mayHaveBeenSent?: boolean;
+  /** Only while delivering: authoritative persisted history captured before dispatch, never retained in tombstones. */
+  previousEntryIds?: string[];
+  /** Delivered native input still needs its correlated view; none is an explicit non-message completion. */
+  settlement?: "native" | "none" | "uncorrelated";
+  createdAt: number;
+}
+
+/** The session channel's outbox snapshot: every entry not yet delivered, in submission order. */
+export interface OutboxUpdateFrame {
+  type: "outbox_update";
+  entries: OutboxEntry[];
+  /** Recent delivered/removed ids: a late first subscription can retire browser copies without seeing their removal. */
+  settledIds: string[];
+  nativeSettledIds?: string[];
 }

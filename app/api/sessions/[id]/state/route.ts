@@ -1,12 +1,26 @@
-import { NextResponse } from "next/server";
 import { getExitedRpcSession, getRpcSession, WebRpcError } from "@/lib/rpc-manager";
-import { apiErrorResponse, resolveSessionPathOr404 } from "@/lib/api-utils";
+import { apiErrorResponse, opErrorResponse, resolveSessionHostOr404 } from "@/lib/api-utils";
+import { outboxScope, outboxSnapshot } from "@/lib/message-outbox";
 
+/** Every answer, an offline host's 503 included, carries the session's held messages (`outbox`): a tab opening a
+ * session with no omp running learns from it that there is an outbox to subscribe to. */
 export async function GET(
   _req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
+  const response = await sessionState(id);
+  const { entries, settledIds, ...settlements } = outboxSnapshot(id);
+  return Response.json({
+    ...(await response.json() as object),
+    outbox: entries,
+    outboxScope: outboxScope(),
+    outboxSettledIds: settledIds,
+    ...settlements,
+  }, { status: response.status });
+}
+
+async function sessionState(id: string): Promise<Response> {
   try {
     // A live process proves the session exists: omp does not create the session
     // file until the history holds an assistant message, so the path check
@@ -15,21 +29,22 @@ export async function GET(
     if (rpc?.isAlive()) {
       try {
         const state = await rpc.send({ type: "get_state" });
-        return NextResponse.json({ running: true, state });
+        return Response.json({ running: true, state });
       } catch (error) {
         if (error instanceof WebRpcError && error.code === "session_unresponsive") {
-          return NextResponse.json({ running: false, recovered: true });
+          return Response.json({ running: false, recovered: true });
         }
         throw error;
       }
     }
 
     const exited = getExitedRpcSession(id);
-    if (exited) return NextResponse.json({ running: false, exited });
+    if (exited) return Response.json({ running: false, exited });
 
-    const resolved = await resolveSessionPathOr404(id);
+    const resolved = await resolveSessionHostOr404(id);
     if ("response" in resolved) return resolved.response;
-    return NextResponse.json({ running: false });
+    const result = await resolved.host.sessionOps.readSessionState(id);
+    return result.ok ? Response.json(result.value) : opErrorResponse(result);
   } catch (error) {
     return apiErrorResponse(error);
   }

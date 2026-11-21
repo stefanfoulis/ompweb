@@ -1,3 +1,6 @@
+import type { AgentMessage } from "./types";
+import type { MessageOrigin } from "./message-origin";
+
 // Local mirrors of the omp shapes used by omp-web. omp's SDK packages are
 // Bun-only, so these types are hand-maintained against
 // oh-my-pi/packages/coding-agent/src/modes/rpc/rpc-types.ts (protocol v1).
@@ -7,6 +10,12 @@ export interface ContextUsage {
   contextWindow: number;
   tokens: number | null;
 }
+
+export type UsageLimitState =
+  | { stage: "low_priority"; resetsAtSec: number; allowanceLeftPercent?: number }
+  | { stage: "wrap_up"; resetsAtSec?: number; extraUsage: boolean };
+
+export type SlowModeScope = "session" | "global";
 
 export interface ModelLike {
   id: string;
@@ -50,6 +59,24 @@ export interface TodoPhase {
   tasks: TodoItem[];
 }
 
+export interface QueuedMessages {
+  steering: string[];
+  followUp: string[];
+  /** Native intent IDs aligned with the visible queue slots; null denotes an older uncorrelated message. */
+  clientMessageIds?: { steering: (string | null)[]; followUp: (string | null)[] };
+  /** Trusted origins aligned with the visible queue slots; null denotes an ordinary message. */
+  messageOrigins?: { steering: (MessageOrigin | null)[]; followUp: (MessageOrigin | null)[] };
+}
+
+export interface ClientMessageStatus {
+  messages: { clientMessageId: string; message: AgentMessage }[];
+  /** Null when the native queue snapshot exceeded the response budget; the browser then reads history. */
+  queuedMessages: QueuedMessages | null;
+  resolvedClientMessageIds: string[];
+  persistedClientMessageIds: string[];
+  unresolvedClientMessageIds: string[];
+}
+
 /** Mirror of omp's RpcSessionState (the raw `get_state` payload). */
 export interface RpcSessionState {
   model?: OmpModel;
@@ -66,12 +93,27 @@ export interface RpcSessionState {
   autoRetryEnabled?: boolean;
   messageCount: number;
   queuedMessageCount: number;
+  /** Includes admitted submissions, scheduled turns and background deliveries; absent on older OMP. */
+  isSettled?: boolean;
+  hasPendingAsyncWork?: boolean;
+  /** Displayable queue-chip texts (omp ≥ 18.4.4); mirrored live by `queue_update`. */
+  queuedMessages?: QueuedMessages;
+  /** Native RPC/session metadata can correlate accepted input without matching its text. */
+  supportsClientMessageIds?: boolean;
   todoPhases: TodoPhase[];
   systemPrompt?: string[];
   contextUsage?: { tokens: number; contextWindow: number; percent: number };
   fastMode?: boolean;
   fastModeEnabled?: boolean;
   fastModeActive?: boolean;
+  /** `/slow` applies to the active model (omp ≥ slow-mode RPC). */
+  slowModeSupported?: boolean;
+  /** Slow setting for the active model; false whenever unsupported. */
+  slowModeEnabled?: boolean;
+  /** Present iff supported: `global` = persisted omp config shared by every session/terminal; `session` = this session's flex tier. */
+  slowModeScope?: SlowModeScope;
+  /** Structured provider usage-limit state; absent outside wrap-up and low priority. */
+  usageLimit?: UsageLimitState;
   /** omp's reported output throughput; null/undefined when not generating. */
   tokensPerSecond?: number | null;
 }
@@ -97,11 +139,17 @@ export interface WebSessionState {
   model?: ModelLike & { name?: string; reasoning?: boolean; thinking?: { efforts?: string[] } };
   messageCount: number;
   queuedMessageCount: number;
+  queuedMessages: QueuedMessages;
+  supportsClientMessageIds?: boolean;
   contextUsage: ContextUsage | null;
   systemPrompt: string;
   thinkingLevel: string;
   fastModeEnabled: boolean;
   fastModeActive?: boolean;
+  slowModeSupported: boolean;
+  slowModeEnabled: boolean;
+  slowModeScope?: SlowModeScope;
+  usageLimit?: UsageLimitState;
   autoRetryEnabled?: boolean;
   tokensPerSecond?: number | null;
   todoPhases: TodoPhase[];
@@ -140,6 +188,8 @@ export interface BashResultInfo {
   outputBytes?: number;
   artifactId?: string;
   workingDir?: string;
+  /** omp-web: omp held the result back for the next prompt (a turn was running). */
+  deferred?: boolean;
 }
 
 export interface GenerationSpeedInfo {
@@ -169,24 +219,48 @@ export interface SessionStatsInfo {
   contextUsage?: ContextUsage;
 }
 
+/** One question of omp's ask dialog (`method: "ask"`, omp's `askDialog`). */
+export interface RpcAskDialogQuestion {
+  id: string;
+  question: string;
+  header?: string;
+  options: Array<{ label: string; description?: string; preview?: string }>;
+  multi?: boolean;
+  /** Index into `options`. */
+  recommended?: number;
+}
+
+/** Per-question answer, sent back in question order. */
+export interface RpcAskDialogAnswer {
+  id: string;
+  selectedOptions: string[];
+  customInput?: string;
+}
+
 /**
- * omp's rpc-ui extension UI request frames, including the methods missing from
- * the browser-facing union in lib/types.ts (`open_url`, `cancel`). The wrapper
- * adds `expiresAt` when a timeout is present so reconnecting clients can
- * expire stale dialogs.
+ * A submitted whole-form ask (omp's `formDialog`), by control `name`: radios, single checkboxes and
+ * single selects give their value (omitted when nothing is chosen), checkbox groups and multi-selects
+ * an array, `number`/`range` inputs a number, other text fields their text. Mirrors pi-tui's html-form.
  */
-export type OmpExtensionUiRequest =
-  | { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number; expiresAt?: number }
-  | { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number; expiresAt?: number }
-  | { type: "extension_ui_request"; id: string; method: "input"; title: string; placeholder?: string; timeout?: number; expiresAt?: number }
-  | { type: "extension_ui_request"; id: string; method: "editor"; title: string; prefill?: string; promptStyle?: boolean; timeout?: number; expiresAt?: number }
-  | { type: "extension_ui_request"; id: string; method: "cancel"; targetId: string }
-  | { type: "extension_ui_request"; id: string; method: "notify"; message: string; notifyType?: "info" | "warning" | "error" }
-  | { type: "extension_ui_request"; id: string; method: "setStatus"; statusKey: string; statusText: string | undefined }
-  | { type: "extension_ui_request"; id: string; method: "setWidget"; widgetKey: string; widgetLines: string[] | undefined; widgetPlacement?: "aboveEditor" | "belowEditor" }
-  | { type: "extension_ui_request"; id: string; method: "setTitle"; title: string }
-  | { type: "extension_ui_request"; id: string; method: "set_editor_text"; text: string }
-  | { type: "extension_ui_request"; id: string; method: "open_url"; url: string; launchUrl?: string; instructions?: string };
+export type HtmlFormData = Record<string, string | number | string[]>;
+
+/**
+ * A note the user attached to one answer of a form dialog, separate from the
+ * submitted values (omp's `OptionNote`). omp pairs a note with its answer by
+ * `name` and `question`, and `value` is that answer as `HtmlFormData` spells
+ * it, so both must match what the submission reports.
+ */
+export interface OptionNote {
+  name: string;
+  question: string;
+  /** The option's shown label. */
+  option: string;
+  /** The option's submitted value, as it appears in the form data. */
+  value: string;
+  text: string;
+  /** Images pasted into the note; omp numbers their `[Image #N]` markers. */
+  images?: { type: "image"; data: string; mimeType: string }[];
+}
 
 /**
  * omp's RPC host-tool bridge: omp-web registers host tools (set_host_tools)
