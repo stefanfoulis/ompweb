@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import type { ExtensionUiRequest } from "@/lib/types";
 import type {
   ChoiceField,
@@ -20,6 +20,9 @@ import { useModalDialog } from "@/hooks/useModalDialog";
 import { useTouchTargets } from "@/hooks/useTouchTargets";
 import { shouldDeferAttachedFocus, useKeyboardPressGuard, useMobileInputOpen, useViewportMaxHeight } from "./ExtensionDialog";
 import { MarkdownBody } from "./MarkdownBody";
+import { createPortal } from "react-dom";
+import { Maximize2, Minimize2 } from "lucide-react";
+import { getAskDialogExpanded, getAskDialogHeight, setAskDialogExpanded, setAskDialogHeight } from "@/lib/composer-prefs";
 
 /**
  * Rich question dialog — web parity for the TUI ask overlay
@@ -39,6 +42,18 @@ const MAX_TAB_LABEL_CHARS = 24;
 // Layout-viewport cap for the composer panel. While the soft keyboard is up
 // the panel is capped to the visual viewport instead (see useViewportMaxHeight).
 const ATTACHED_PANEL_MAX_HEIGHT = "min(480px, 65dvh)";
+
+// Resize-handle bounds for the attached panel: short enough that a question
+// with little content is not forced tall, capped near the viewport so a drag
+// cannot push the footer off-screen.
+const ASK_DIALOG_MIN_HEIGHT = 160;
+const ASK_DIALOG_HEIGHT_STEP = 24;
+
+/** Clamps a dragged/typed panel height to the handle's travel range. */
+function clampAskDialogHeight(px: number): number {
+  const max = typeof window !== "undefined" ? Math.round(window.innerHeight * 0.9) : px;
+  return Math.min(max, Math.max(ASK_DIALOG_MIN_HEIGHT, px));
+}
 
 export type AskDialogRequest = Extract<ExtensionUiRequest, { method: "ask" | "form" }>;
 export type AskDialogResponse =
@@ -495,6 +510,11 @@ export function AskDialog({
   const viewportMaxHeight = useViewportMaxHeight();
   const { touchTargets } = useTouchTargets();
   const footerMinHeight = touchTargets === "accessible" ? 44 : undefined;
+  // Only meaningful while attached: the full-chat overlay keeps its existing
+  // single size. Both persist the user's last choice per browser.
+  const [expanded, setExpanded] = useState(() => getAskDialogExpanded());
+  const [customHeight, setCustomHeight] = useState<number | undefined>(() => getAskDialogHeight());
+  const resizeDragRef = useRef<{ startY: number; startHeight: number; height: number } | null>(null);
 
   useEffect(() => {
     setStates(createInitialStates(itemsForRequest(request).items));
@@ -607,20 +627,28 @@ export function AskDialog({
       setStates((prev) => prev.map(finalizeNoteEditorState));
       return;
     }
+    // Shrinking back is the safer default: a stray Escape while expanded must
+    // not also discard the answers underneath it.
+    if (attached && expanded) {
+      collapseExpanded();
+      return;
+    }
     cancel();
   };
 
   // A composer-attached request is a regular in-flow panel, not a modal, so
   // useModalDialog's document-level Escape/Tab handling only applies when
   // rendered as the full overlay.
-  const panelRef = useModalDialog<HTMLDivElement>({ onClose: resolveEscape, active: !attached });
-  const keyboardOpen = useMobileInputOpen(panelRef, attached);
+  const panelRef = useModalDialog<HTMLDivElement>({ onClose: resolveEscape, active: !attached || expanded });
+  const keyboardOpen = useMobileInputOpen(panelRef, attached && !expanded);
   // With the keyboard up the panel fills the visible area instead of the
   // taller layout-viewport cap, so the footer (Cancel / Chat about this /
   // Submit) stays in reach (#236).
-  const attachedMaxHeight = keyboardOpen && viewportMaxHeight !== undefined
-    ? `${viewportMaxHeight}px`
-    : ATTACHED_PANEL_MAX_HEIGHT;
+  const keyboardCapHeight = keyboardOpen && viewportMaxHeight !== undefined ? `${viewportMaxHeight}px` : undefined;
+  const attachedMaxHeight = keyboardCapHeight ?? ATTACHED_PANEL_MAX_HEIGHT;
+  // A custom-resized panel grows past the default cap, up to the viewport —
+  // still shrinking for the on-screen keyboard like the default cap does.
+  const resizedMaxHeight = keyboardCapHeight ?? "90dvh";
   const pressGuard = useKeyboardPressGuard();
   // Leaving a text field closes the phone keyboard; the panel takes focus
   // back because the arrow-key cursor lives on it.
@@ -630,6 +658,63 @@ export function AskDialog({
     if (!panel || !isEditableElement(active) || !panel.contains(active)) return;
     active.blur();
     panel.focus();
+  };
+
+  const collapseExpanded = () => {
+    setExpanded(false);
+    setAskDialogExpanded(false);
+    requestAnimationFrame(() => panelRef.current?.focus());
+  };
+
+  const toggleExpanded = () => {
+    const next = !expanded;
+    setExpanded(next);
+    setAskDialogExpanded(next);
+    requestAnimationFrame(() => panelRef.current?.focus());
+  };
+
+  const handleResizePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const startHeight = panel.getBoundingClientRect().height;
+    resizeDragRef.current = { startY: event.clientY, startHeight, height: startHeight };
+  };
+
+  const handleResizePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = resizeDragRef.current;
+    if (!drag) return;
+    // The panel sits at the bottom of the chat column, so dragging the top
+    // edge up (a smaller clientY) must grow it.
+    const next = clampAskDialogHeight(drag.startHeight + (drag.startY - event.clientY));
+    drag.height = next;
+    setCustomHeight(next);
+  };
+
+  const endResizeDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = resizeDragRef.current;
+    if (!drag) return;
+    resizeDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    setAskDialogHeight(drag.height);
+  };
+
+  const handleResizeDoubleClick = () => {
+    resizeDragRef.current = null;
+    setCustomHeight(undefined);
+    setAskDialogHeight(undefined);
+  };
+
+  const handleResizeKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    // Claims the arrows before the panel's own handler, which otherwise moves
+    // the option cursor on the same keys.
+    event.preventDefault();
+    event.stopPropagation();
+    const current = customHeight ?? panelRef.current?.getBoundingClientRect().height ?? ASK_DIALOG_MIN_HEIGHT;
+    const next = clampAskDialogHeight(current + (event.key === "ArrowUp" ? ASK_DIALOG_HEIGHT_STEP : -ASK_DIALOG_HEIGHT_STEP));
+    setCustomHeight(next);
+    setAskDialogHeight(next);
   };
 
   useEffect(() => {
@@ -1026,6 +1111,227 @@ export function AskDialog({
   const titleText = remainingMs === undefined ? t("askDialog.title") : `${t("askDialog.title")} (${Math.ceil(remainingMs / 1000)}s)`;
   const currentError = !isReviewTab && showErrors ? errors[currentIndex] : undefined;
 
+  const panelNode = (
+    <div
+      ref={panelRef}
+      role="dialog"
+      aria-modal={attached && !expanded ? undefined : "true"}
+      aria-label={titleText}
+      tabIndex={-1}
+      onKeyDown={handleContainerKeyDown}
+      // Keeps the phone keyboard up while a text box of this panel has focus.
+      {...pressGuard}
+      className={attached && !expanded ? undefined : "animate-scale-in"}
+      style={{
+        width: attached ? (expanded ? "min(1200px, 100%)" : "100%") : "min(640px, 100%)",
+        boxSizing: "border-box",
+        // Flex/grid children below must be able to shrink: a min-content
+        // question, option or preview is wider than a phone, and without
+        // this the panel grows past its composer column and gets clipped
+        // (#234).
+        minWidth: 0,
+        display: "flex",
+        flexDirection: "column",
+        border: "1px solid var(--border)",
+        borderRadius: attached && !expanded ? "var(--radius-card)" : "var(--radius-modal)",
+        background: "var(--bg)",
+        boxShadow: attached && !expanded ? "var(--shadow-card)" : "var(--shadow-modal)",
+        overflow: "hidden",
+        outline: "none",
+        height: attached && expanded ? "100%" : attached && customHeight !== undefined ? `${customHeight}px` : undefined,
+        maxHeight: attached
+          ? (expanded ? "100%" : customHeight !== undefined ? resizedMaxHeight : attachedMaxHeight)
+          : "min(640px, 85dvh)",
+      }}
+    >
+      {attached && !expanded && (
+        <div
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label={t("askDialog.resize")}
+          aria-valuenow={customHeight}
+          tabIndex={0}
+          onPointerDown={handleResizePointerDown}
+          onPointerMove={handleResizePointerMove}
+          onPointerUp={endResizeDrag}
+          onPointerCancel={endResizeDrag}
+          onDoubleClick={handleResizeDoubleClick}
+          onKeyDown={handleResizeKeyDown}
+          style={{ flexShrink: 0, height: 10, display: "flex", alignItems: "center", justifyContent: "center", cursor: "ns-resize", touchAction: "none" }}
+        >
+          <div aria-hidden="true" style={{ width: 32, height: 3, borderRadius: 2, background: "var(--border)" }} />
+        </div>
+      )}
+      <div className="ask-dialog-content" style={{ minWidth: 0, minHeight: 0, flex: "1 1 auto", overflowY: "auto", overflowX: "hidden", overflowWrap: "anywhere" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "12px 14px", borderBottom: "1px solid var(--border)" }}>
+          <div style={{ minWidth: 0, color: "var(--text)", fontSize: 14, fontWeight: 650 }}>{titleText}</div>
+          {attached && (
+            <button
+              type="button"
+              onClick={toggleExpanded}
+              aria-label={expanded ? t("askDialog.collapse") : t("askDialog.expand")}
+              title={expanded ? t("askDialog.collapse") : t("askDialog.expand")}
+              aria-pressed={expanded}
+              style={{ display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, padding: 4, border: "none", background: "transparent", color: "var(--text-muted)", cursor: "pointer" }}
+            >
+              {expanded ? <Minimize2 size={14} aria-hidden="true" /> : <Maximize2 size={14} aria-hidden="true" />}
+            </button>
+          )}
+        </div>
+
+        <div role="tablist" aria-label={t("askDialog.title")} style={{ display: "flex", gap: 4, minWidth: 0, padding: "6px 10px", borderBottom: "1px solid var(--border)", overflowX: "auto", background: "var(--bg-panel)" }}>
+          {items.map((item, index) => {
+            const selected = !isReviewTab && index === currentIndex;
+            const answered = isAnswered(item, states[index]);
+            return (
+              <button
+                key={item.key}
+                type="button"
+                role="tab"
+                id={`ask-tab-${index}`}
+                aria-selected={selected}
+                aria-controls={`ask-panel-${index}`}
+                aria-label={`${item.label} (${answered ? t("askDialog.answered") : t("askDialog.unanswered")})`}
+                onClick={() => setActiveTab(index)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                  padding: "5px 9px",
+                  borderRadius: 999,
+                  border: `1px solid ${selected ? "var(--border)" : "transparent"}`,
+                  background: selected ? "var(--bg)" : "transparent",
+                  color: selected ? "var(--text)" : "var(--text-muted)",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
+                <span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: 999, background: answered ? "var(--status-success)" : "var(--border)", flexShrink: 0 }} />
+                {item.label}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            role="tab"
+            id="ask-tab-review"
+            aria-selected={isReviewTab}
+            aria-controls="ask-panel-review"
+            onClick={() => setActiveTab(reviewTabIndex)}
+            style={{
+              padding: "5px 9px",
+              borderRadius: 999,
+              border: `1px solid ${isReviewTab ? "var(--border)" : "transparent"}`,
+              background: isReviewTab ? "var(--bg)" : "transparent",
+              color: isReviewTab ? "var(--text)" : "var(--text-muted)",
+              cursor: "pointer",
+              fontSize: 12,
+              whiteSpace: "nowrap",
+              flexShrink: 0,
+            }}
+          >
+            {t("askDialog.review")}
+          </button>
+        </div>
+
+        <div style={{ padding: 14 }}>
+          {!isReviewTab && currentItem && currentState && (
+            <div role="tabpanel" id={`ask-panel-${currentIndex}`} aria-labelledby={`ask-tab-${currentIndex}`} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 10 }}>
+              {currentItem.header && (
+                <span style={{ justifySelf: "start", fontSize: 10, padding: "1px 6px", borderRadius: 999, border: "1px solid var(--border)", color: "var(--text-muted)", background: "var(--bg-panel)" }}>
+                  {currentItem.header}
+                </span>
+              )}
+              <ContextRuns runs={currentItem.context} header={currentItem.header} />
+              <div style={{ minWidth: 0, color: "var(--text)", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{currentItem.question}</div>
+              {currentItem.control.kind === "choice" ? (
+                <div role={currentItem.control.multi ? "group" : "radiogroup"} aria-label={currentItem.question} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 6 }}>
+                  {currentRows.map((row, rowIndex) => renderRow(row, rowIndex))}
+                </div>
+              ) : (
+                currentRows.map((row, rowIndex) => renderRow(row, rowIndex))
+              )}
+              {currentError && <div role="alert" style={errorStyle}>{currentError}</div>}
+              {highlightedPreview && (
+                // The preview wraps rather than scrolling the row sideways;
+                // only a fenced code block inside keeps its own scroller.
+                <div style={{ minWidth: 0, overflowX: "hidden", border: "1px solid var(--border)", borderRadius: 7, padding: 10, background: "var(--bg-panel)", fontSize: 12 }}>
+                  <MarkdownBody>{highlightedPreview}</MarkdownBody>
+                </div>
+              )}
+            </div>
+          )}
+
+          {isReviewTab && (
+            <div role="tabpanel" id="ask-panel-review" aria-labelledby="ask-tab-review" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 10 }}>
+              {showErrors && hasErrors && (
+                <div role="alert" style={errorStyle}>{t("askDialog.fixErrors")}</div>
+              )}
+              {unansweredCount > 0 && (
+                <div style={{ color: "var(--status-warning)", fontSize: 12 }}>{tn("askDialog.unansweredWarning", unansweredCount)}</div>
+              )}
+              <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 8 }}>
+                {items.map((item, index) => {
+                  const state = states[index];
+                  const answered = isAnswered(item, state);
+                  const summary = answered ? answerSummary(item, state) : undefined;
+                  const note = noteForSubmittedAnswer(item, state);
+                  const error = showErrors ? errors[index] : undefined;
+                  return (
+                    <div key={item.key} style={{ minWidth: 0, fontSize: 13, lineHeight: 1.5, overflowWrap: "anywhere" }}>
+                      <span style={{ color: "var(--text-dim)" }}>{index + 1}. {item.label}:</span>{" "}
+                      <span style={{ color: answered ? "var(--text)" : "var(--status-warning)" }}>{answered ? summary : t("askDialog.unanswered")}</span>
+                      {note && <div style={{ marginLeft: 14, color: "var(--text-muted)", fontSize: 12 }}>{t("askDialog.note")}: {note}</div>}
+                      {error && <div style={{ ...errorStyle, marginLeft: 14 }}>{error}</div>}
+                    </div>
+                  );
+                })}
+              </div>
+              {/* Form content after the last field has no tab of its own. */}
+              <ContextRuns runs={trailing} />
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="extension-dialog-footer" style={{ display: "flex", flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end", gap: 8, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-panel)" }}>
+        <button type="button" onClick={cancel} style={{ ...secondaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.cancel")}</button>
+        <button type="button" onClick={() => respond({ chat: true })} style={{ ...secondaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.chatAboutThis")}</button>
+        {isReviewTab && (
+          <button type="button" onClick={() => submit()} style={{ ...primaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.submit")}</button>
+        )}
+      </div>
+    </div>
+  );
+
+  if (attached && expanded && typeof document !== "undefined") {
+    return createPortal(
+      <div
+        className="animate-fade-in"
+        onMouseDown={(event) => {
+          // A click on the backdrop itself shrinks back rather than
+          // canceling: a stray click must not discard the answers.
+          if (event.target === event.currentTarget) collapseExpanded();
+        }}
+        style={{
+          position: "fixed",
+          inset: 0,
+          zIndex: 1000,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 16,
+          background: "var(--overlay-backdrop)",
+        }}
+      >
+        {panelNode}
+      </div>,
+      document.body,
+    );
+  }
+
   return (
     <div
       className={attached ? undefined : "animate-fade-in"}
@@ -1043,165 +1349,7 @@ export function AskDialog({
         background: "var(--overlay-backdrop)",
       }}
     >
-      <div
-        ref={panelRef}
-        role="dialog"
-        aria-modal={attached ? undefined : "true"}
-        aria-label={titleText}
-        tabIndex={-1}
-        onKeyDown={handleContainerKeyDown}
-        // Keeps the phone keyboard up while a text box of this panel has focus.
-        {...pressGuard}
-        className={attached ? undefined : "animate-scale-in"}
-        style={{
-          width: attached ? "100%" : "min(640px, 100%)",
-          boxSizing: "border-box",
-          // Flex/grid children below must be able to shrink: a min-content
-          // question, option or preview is wider than a phone, and without
-          // this the panel grows past its composer column and gets clipped
-          // (#234).
-          minWidth: 0,
-          display: "flex",
-          flexDirection: "column",
-          border: "1px solid var(--border)",
-          borderRadius: attached ? "var(--radius-card)" : "var(--radius-modal)",
-          background: "var(--bg)",
-          boxShadow: attached ? "var(--shadow-card)" : "var(--shadow-modal)",
-          overflow: "hidden",
-          outline: "none",
-          maxHeight: attached ? attachedMaxHeight : "min(640px, 85dvh)",
-        }}
-      >
-        <div className="ask-dialog-content" style={{ minWidth: 0, minHeight: 0, overflowY: "auto", overflowX: "hidden", overflowWrap: "anywhere" }}>
-          <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--border)" }}>
-            <div style={{ color: "var(--text)", fontSize: 14, fontWeight: 650 }}>{titleText}</div>
-          </div>
-
-          <div role="tablist" aria-label={t("askDialog.title")} style={{ display: "flex", gap: 4, minWidth: 0, padding: "6px 10px", borderBottom: "1px solid var(--border)", overflowX: "auto", background: "var(--bg-panel)" }}>
-            {items.map((item, index) => {
-              const selected = !isReviewTab && index === currentIndex;
-              const answered = isAnswered(item, states[index]);
-              return (
-                <button
-                  key={item.key}
-                  type="button"
-                  role="tab"
-                  id={`ask-tab-${index}`}
-                  aria-selected={selected}
-                  aria-controls={`ask-panel-${index}`}
-                  aria-label={`${item.label} (${answered ? t("askDialog.answered") : t("askDialog.unanswered")})`}
-                  onClick={() => setActiveTab(index)}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 5,
-                    padding: "5px 9px",
-                    borderRadius: 999,
-                    border: `1px solid ${selected ? "var(--border)" : "transparent"}`,
-                    background: selected ? "var(--bg)" : "transparent",
-                    color: selected ? "var(--text)" : "var(--text-muted)",
-                    cursor: "pointer",
-                    fontSize: 12,
-                    whiteSpace: "nowrap",
-                    flexShrink: 0,
-                  }}
-                >
-                  <span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: 999, background: answered ? "var(--status-success)" : "var(--border)", flexShrink: 0 }} />
-                  {item.label}
-                </button>
-              );
-            })}
-            <button
-              type="button"
-              role="tab"
-              id="ask-tab-review"
-              aria-selected={isReviewTab}
-              aria-controls="ask-panel-review"
-              onClick={() => setActiveTab(reviewTabIndex)}
-              style={{
-                padding: "5px 9px",
-                borderRadius: 999,
-                border: `1px solid ${isReviewTab ? "var(--border)" : "transparent"}`,
-                background: isReviewTab ? "var(--bg)" : "transparent",
-                color: isReviewTab ? "var(--text)" : "var(--text-muted)",
-                cursor: "pointer",
-                fontSize: 12,
-                whiteSpace: "nowrap",
-                flexShrink: 0,
-              }}
-            >
-              {t("askDialog.review")}
-            </button>
-          </div>
-
-          <div style={{ padding: 14 }}>
-            {!isReviewTab && currentItem && currentState && (
-              <div role="tabpanel" id={`ask-panel-${currentIndex}`} aria-labelledby={`ask-tab-${currentIndex}`} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 10 }}>
-                {currentItem.header && (
-                  <span style={{ justifySelf: "start", fontSize: 10, padding: "1px 6px", borderRadius: 999, border: "1px solid var(--border)", color: "var(--text-muted)", background: "var(--bg-panel)" }}>
-                    {currentItem.header}
-                  </span>
-                )}
-                <ContextRuns runs={currentItem.context} header={currentItem.header} />
-                <div style={{ minWidth: 0, color: "var(--text)", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{currentItem.question}</div>
-                {currentItem.control.kind === "choice" ? (
-                  <div role={currentItem.control.multi ? "group" : "radiogroup"} aria-label={currentItem.question} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 6 }}>
-                    {currentRows.map((row, rowIndex) => renderRow(row, rowIndex))}
-                  </div>
-                ) : (
-                  currentRows.map((row, rowIndex) => renderRow(row, rowIndex))
-                )}
-                {currentError && <div role="alert" style={errorStyle}>{currentError}</div>}
-                {highlightedPreview && (
-                  // The preview wraps rather than scrolling the row sideways;
-                  // only a fenced code block inside keeps its own scroller.
-                  <div style={{ minWidth: 0, overflowX: "hidden", border: "1px solid var(--border)", borderRadius: 7, padding: 10, background: "var(--bg-panel)", fontSize: 12 }}>
-                    <MarkdownBody>{highlightedPreview}</MarkdownBody>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {isReviewTab && (
-              <div role="tabpanel" id="ask-panel-review" aria-labelledby="ask-tab-review" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 10 }}>
-                {showErrors && hasErrors && (
-                  <div role="alert" style={errorStyle}>{t("askDialog.fixErrors")}</div>
-                )}
-                {unansweredCount > 0 && (
-                  <div style={{ color: "var(--status-warning)", fontSize: 12 }}>{tn("askDialog.unansweredWarning", unansweredCount)}</div>
-                )}
-                <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 8 }}>
-                  {items.map((item, index) => {
-                    const state = states[index];
-                    const answered = isAnswered(item, state);
-                    const summary = answered ? answerSummary(item, state) : undefined;
-                    const note = noteForSubmittedAnswer(item, state);
-                    const error = showErrors ? errors[index] : undefined;
-                    return (
-                      <div key={item.key} style={{ minWidth: 0, fontSize: 13, lineHeight: 1.5, overflowWrap: "anywhere" }}>
-                        <span style={{ color: "var(--text-dim)" }}>{index + 1}. {item.label}:</span>{" "}
-                        <span style={{ color: answered ? "var(--text)" : "var(--status-warning)" }}>{answered ? summary : t("askDialog.unanswered")}</span>
-                        {note && <div style={{ marginLeft: 14, color: "var(--text-muted)", fontSize: 12 }}>{t("askDialog.note")}: {note}</div>}
-                        {error && <div style={{ ...errorStyle, marginLeft: 14 }}>{error}</div>}
-                      </div>
-                    );
-                  })}
-                </div>
-                {/* Form content after the last field has no tab of its own. */}
-                <ContextRuns runs={trailing} />
-              </div>
-            )}
-          </div>
-        </div>
-
-        <div className="extension-dialog-footer" style={{ display: "flex", flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end", gap: 8, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-panel)" }}>
-          <button type="button" onClick={cancel} style={{ ...secondaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.cancel")}</button>
-          <button type="button" onClick={() => respond({ chat: true })} style={{ ...secondaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.chatAboutThis")}</button>
-          {isReviewTab && (
-            <button type="button" onClick={() => submit()} style={{ ...primaryButtonStyle, minHeight: footerMinHeight }}>{t("askDialog.submit")}</button>
-          )}
-        </div>
-      </div>
+      {panelNode}
     </div>
   );
 }

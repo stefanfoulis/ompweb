@@ -1,13 +1,18 @@
 import "../tests/setup-dom.mjs";
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
+import test, { afterEach, before } from "node:test";
 import React from "react";
-const { cleanup, render, screen } = await import("@testing-library/react/pure.js");
+const { cleanup, render, screen, waitFor } = await import("@testing-library/react/pure.js");
 const { default: userEvent } = await import("@testing-library/user-event");
 
 const { AskDialog } = await import("./AskDialog.tsx");
 
 afterEach(cleanup);
+before(() => {
+  window.Element.prototype.setPointerCapture = () => {};
+  window.Element.prototype.hasPointerCapture = () => false;
+  window.Element.prototype.releasePointerCapture = () => {};
+});
 
 function makeRequest(questions, extra) {
   return { type: "extension_ui_request", id: "ask-1", method: "ask", questions, ...extra };
@@ -304,4 +309,51 @@ test("the recommended option is marked and receives the initial keyboard cursor,
   await user.keyboard("{ArrowDown}{Enter}");
   await user.click(screen.getByRole("button", { name: "Submit" }));
   assert.deepEqual(response, { answers: [{ id: "q1", selectedOptions: ["Blue"] }] });
+});
+
+test("expand moves the panel into a portal, Escape shrinks it back without responding, and the resize handle resizes and resets", async () => {
+  localStorage.clear();
+  const user = userEvent.setup();
+  let response;
+  const { container } = render(React.createElement(AskDialog, {
+    request: makeRequest([
+      { id: "q1", question: "Pick a color", options: [{ label: "Red" }, { label: "Blue" }] },
+      { id: "q2", question: "Pick a size", options: [{ label: "Small" }, { label: "Large" }] },
+    ]),
+    onRespond: (_request, result) => { response = result; },
+    attached: true,
+  }));
+
+  // A single-select pick advances to the next tab; come back so the chosen
+  // option is visible across the remount into the portal.
+  await user.click(screen.getByRole("radio", { name: "Red" }));
+  await user.click(screen.getByRole("tab", { name: /Pick a color/ }));
+  assert.equal(screen.getByRole("radio", { name: "Red" }).checked, true);
+
+  await user.click(screen.getByRole("button", { name: "Expand" }));
+  const expandedDialog = screen.getByRole("dialog");
+  assert.equal(container.contains(expandedDialog), false, "expanded panel renders through the portal, outside the local container");
+  assert.equal(screen.getByRole("radio", { name: "Red" }).checked, true, "answers and tab state survive the remount");
+
+  expandedDialog.focus();
+  await user.keyboard("{Escape}");
+  assert.equal(container.contains(screen.getByRole("dialog")), true, "Escape shrinks the panel back in place");
+  assert.equal(response, undefined, "Escape while expanded must not cancel or submit the dialog");
+  // Shrinking back hands focus to the panel on the next frame; wait for it so
+  // that focus move cannot land after the handle is focused below.
+  await waitFor(() => assert.equal(document.activeElement, screen.getByRole("dialog")));
+
+  const handle = screen.getByRole("separator", { name: "Resize (drag, double-click to reset)" });
+  handle.focus();
+  await user.keyboard("{ArrowUp}");
+  const panel = screen.getByRole("dialog");
+  // jsdom reports 0 for getBoundingClientRect, so the +24 step lands below
+  // the floor, and the floor itself is what the handle settles on.
+  assert.equal(panel.style.height, "160px");
+  assert.equal(localStorage.getItem("omp-web:ask-dialog-height"), "160");
+
+  await user.dblClick(handle);
+  assert.equal(screen.getByRole("dialog").style.height, "");
+
+  localStorage.clear();
 });

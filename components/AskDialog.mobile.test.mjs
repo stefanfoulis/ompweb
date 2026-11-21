@@ -136,7 +136,7 @@ test("the option row, its text, its description and the preview cannot push past
 test("the panel, its scroller and the Other field can shrink inside the column", () => {
   const html = staticMarkup();
   assert.match(html, /role="dialog"[^>]*style="[^"]*box-sizing:border-box;min-width:0/);
-  assert.match(html, /class="ask-dialog-content" style="min-width:0;min-height:0;overflow-y:auto;overflow-x:hidden/);
+  assert.match(html, /class="ask-dialog-content" style="min-width:0;min-height:0;flex:1 1 auto;overflow-y:auto;overflow-x:hidden/);
   assert.match(html, /<input type="text"[^>]*style="flex:1;min-width:0;box-sizing:border-box/);
   assert.doesNotMatch(html, /white-space:pre;/);
 });

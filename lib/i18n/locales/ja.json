@@ -1995,5 +1995,8 @@
   "askDialog.errorMaxLength": "{count} 文字以内にしてください",
   "askDialog.errorEmail": "メールアドレスを入力してください",
   "askDialog.errorUrl": "完全な URL を入力してください",
-  "askDialog.errorPattern": "{pattern} に一致する必要があります"
+  "askDialog.errorPattern": "{pattern} に一致する必要があります",
+  "askDialog.expand": "拡大",
+  "askDialog.collapse": "元に戻す",
+  "askDialog.resize": "サイズ変更（ドラッグ、ダブルクリックでリセット）"
 }

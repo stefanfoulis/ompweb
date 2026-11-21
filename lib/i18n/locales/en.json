@@ -2036,5 +2036,8 @@
   "askDialog.errorMaxLength": "At most {count} characters",
   "askDialog.errorEmail": "Enter an email address",
   "askDialog.errorUrl": "Enter a full URL",
-  "askDialog.errorPattern": "Must match {pattern}"
+  "askDialog.errorPattern": "Must match {pattern}",
+  "askDialog.expand": "Expand",
+  "askDialog.collapse": "Shrink back",
+  "askDialog.resize": "Resize (drag, double-click to reset)"
 }

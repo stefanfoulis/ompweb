@@ -1995,5 +1995,8 @@
   "askDialog.errorMaxLength": "最多 {count} 个字符",
   "askDialog.errorEmail": "请输入电子邮件地址",
   "askDialog.errorUrl": "请输入完整的 URL",
-  "askDialog.errorPattern": "必须匹配 {pattern}"
+  "askDialog.errorPattern": "必须匹配 {pattern}",
+  "askDialog.expand": "放大",
+  "askDialog.collapse": "还原",
+  "askDialog.resize": "调整大小（拖动，双击重置）"
 }

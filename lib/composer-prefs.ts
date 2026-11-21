@@ -75,3 +75,52 @@ export function isWordCompletionEnabled(mode: WordCompletionMode = getWordComple
   if (mode !== "auto") return mode === "on";
   return typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches;
 }
+
+const ASK_DIALOG_HEIGHT_KEY = "omp-web:ask-dialog-height";
+
+/** The user's last chosen height for the composer-attached ask panel, so the
+ * next question opens at the same size. Undefined means no override: the
+ * panel falls back to its default cap. */
+export function getAskDialogHeight(): number | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const value = window.localStorage.getItem(ASK_DIALOG_HEIGHT_KEY);
+    const parsed = value === null ? NaN : Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  } catch {
+    // storage unavailable — fall through to the default
+  }
+  return undefined;
+}
+
+export function setAskDialogHeight(px: number | undefined): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (px === undefined) window.localStorage.removeItem(ASK_DIALOG_HEIGHT_KEY);
+    else window.localStorage.setItem(ASK_DIALOG_HEIGHT_KEY, String(px));
+  } catch {
+    // storage unavailable — the preference simply won't persist
+  }
+}
+
+const ASK_DIALOG_EXPANDED_KEY = "omp-web:ask-dialog-expanded";
+
+/** Whether the last ask panel was left as a near-fullscreen overlay. */
+export function getAskDialogExpanded(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(ASK_DIALOG_EXPANDED_KEY) === "1";
+  } catch {
+    // storage unavailable — fall through to the default
+  }
+  return false;
+}
+
+export function setAskDialogExpanded(on: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(ASK_DIALOG_EXPANDED_KEY, on ? "1" : "0");
+  } catch {
+    // storage unavailable — the preference simply won't persist
+  }
+}
