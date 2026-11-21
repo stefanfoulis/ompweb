@@ -469,6 +469,9 @@ export interface SessionInfo {
   /** Registered logical identity; physical owner/cwd/projectRoot remain unchanged. */
   poolId?: string;
   projectId?: string;
+  /** Set by /api/sessions when the session is pinned in the server-side pin
+   *  store (lib/pin-store.ts); absent means not pinned. */
+  pinned?: boolean;
 }
 
 /** Metadata for a gzip-compressed session in OMP's archive tree. */

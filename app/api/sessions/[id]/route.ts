@@ -6,6 +6,7 @@ import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-fo
 import { clearExitedRpcSession, getLiveRpcSessionIds, getRpcSession, WebRpcError } from "@/lib/rpc-manager";
 import { forgetSessionReplacementMappings } from "@/lib/message-outbox";
 import { removeSessionWatches } from "@/lib/github/watch-store";
+import { setSessionPinned } from "@/lib/pin-store";
 
 /** Stable, client-safe error body for catch-all handlers: details go to the
  *  server log only, never to the browser. */
@@ -144,6 +145,7 @@ export async function DELETE(
     }
     invalidateHostSessionList(resolved.host.id);
     clearExitedRpcSession(id);
+    setSessionPinned(id, false); // the session is gone; so is any pin on it
     try {
       removeSessionWatches(id);
     } catch (error) {

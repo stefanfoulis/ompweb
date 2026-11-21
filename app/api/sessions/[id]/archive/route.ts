@@ -2,6 +2,7 @@ import { apiErrorResponse, hostOfflineResponse, opErrorResponse, resolveSessionH
 import { HostOpError } from "@/lib/hosts/link-protocol";
 import { invalidateHostSessionList } from "@/lib/hosts/session-index";
 import { clearExitedRpcSession, getRpcSession } from "@/lib/rpc-manager";
+import { setSessionPinned } from "@/lib/pin-store";
 
 /** POST /api/sessions/[id]/archive — stop the live child, then archive the
  * native OMP JSONL and its sibling artifacts using OMP's gc layout. */
@@ -36,6 +37,7 @@ export async function POST(
     if (!result.ok) return opErrorResponse(result);
     invalidateHostSessionList(resolved.host.id);
     clearExitedRpcSession(id);
+    setSessionPinned(id, false); // the session left the list; so does any pin on it
     return Response.json({ ok: true, archived: true, archivedPath: result.value.archivedPath });
   } catch (error) {
     if (error instanceof HostOpError) return apiErrorResponse(error);

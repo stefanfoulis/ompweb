@@ -3,7 +3,7 @@
 import { memo, useCallback, useId, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { AgentMessage, ExitedRpcSession, ManagedProject, ProjectLaunchConfig, SessionInfo } from "@/lib/types";
 import { formatExitedSessionNotice, useI18n } from "@/lib/i18n";
-import { ChevronDown, ChevronRight, Folder, GitBranch, MessageCircleQuestion, MoreHorizontal, Pencil, Pin, Plus } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder, GitBranch, MessageCircleQuestion, MoreHorizontal, Pencil, Pin, Plus, Star } from "lucide-react";
 import { Tooltip } from "./ui/primitives";
 import { ConfirmDialog } from "./ui/field";
 import { copyText } from "@/lib/clipboard";
@@ -711,6 +711,7 @@ const SessionItem = memo(function SessionItem({
   onToggleCollapse,
   matchesExpanded = false,
   onToggleMatches,
+  workspaceLabel,
 }: {
   session: SessionInfo;
   isSelected: boolean;
@@ -730,6 +731,9 @@ const SessionItem = memo(function SessionItem({
   /** Present while a search is active: shows the session's hits below the row. */
   matchesExpanded?: boolean;
   onToggleMatches?: () => void;
+  /** Workspace name shown beside the title; set by the flat Current/Pinned
+   *  list, where rows are not nested under a workspace row. */
+  workspaceLabel?: string;
 }) {
   const { t, locale } = useI18n();
   const exitTitle = exited ? formatExitedSessionNotice(exited) : "";
@@ -752,6 +756,29 @@ const SessionItem = memo(function SessionItem({
     ? "color-mix(in srgb, var(--bg-selected) 70%, transparent)"
     : hovered ? "var(--bg-hover)" : "transparent";
 
+  // The pin is server state reached through the session list, so the row
+  // carries its own answer until a refreshed list confirms it: `from` is the
+  // value the list showed when the user clicked, and the moment the list says
+  // something else the override is stale and the list wins again.
+  const serverPinned = session.pinned === true;
+  const [pinOverride, setPinOverride] = useState<{ from: boolean; to: boolean } | null>(null);
+  const pinned = pinOverride?.from === serverPinned ? pinOverride.to : serverPinned;
+  const togglePinned = useCallback(async () => {
+    const next = !pinned;
+    setPinOverride({ from: serverPinned, to: next });
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/pin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pinned: next }),
+      });
+      if (!response.ok) throw new Error("Session pin failed");
+      onRenamed?.();
+    } catch {
+      setPinOverride(null);
+      toast.error(next ? t("sessionSidebar.pinFailed") : t("sessionSidebar.unpinFailed"));
+    }
+  }, [pinned, serverPinned, session.id, onRenamed, t]);
   const startRename = useCallback((event: React.MouseEvent) => {
     event.stopPropagation();
     setRenameValue(session.name ?? "");
@@ -907,7 +934,8 @@ const SessionItem = memo(function SessionItem({
       ) : (
         <>
           {depth > 0 && <GitBranch size={11} strokeWidth={2} style={{ flexShrink: 0, color: "var(--text-dim)" }} aria-hidden="true" />}
-          <button ref={contentButtonRef} type="button" className="session-item-button" aria-current={isSelected ? "true" : undefined} onKeyDown={(event) => { if (event.key === "Delete" && !deleting) { event.preventDefault(); setConfirmDelete(true); } }} style={{ display: "flex", alignItems: "center", flex: 1, minWidth: 0 }}>
+          <button ref={contentButtonRef} type="button" className="session-item-button" aria-current={isSelected ? "true" : undefined} onKeyDown={(event) => { if (event.key === "Delete" && !deleting) { event.preventDefault(); setConfirmDelete(true); } }} style={{ display: "flex", alignItems: "center", gap: 5, flex: 1, minWidth: 0 }}>
+            {pinned && <Star size={10} strokeWidth={2} fill="currentColor" aria-label={t("sessionSidebar.pinned")} style={{ flexShrink: 0, color: "var(--text-dim)" }} />}
             <span title={title} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)", fontSize: 12.5, fontWeight: isSelected ? 600 : 500, lineHeight: 1.35, letterSpacing: "-0.005em" }}>
               {title}
             </span>
@@ -922,6 +950,7 @@ const SessionItem = memo(function SessionItem({
               </span>
             )}
           </button>
+          {workspaceLabel && <span title={workspaceLabel} style={{ maxWidth: 72, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-dim)", fontSize: 10, flexShrink: 1 }}>{workspaceLabel}</span>}
           {session.worktreeBranch && <span title={t("sessionSidebar.worktreeTitle", { path: session.cwd })} style={{ display: "flex", alignItems: "center", gap: 3, maxWidth: 56, minWidth: 0, overflow: "hidden", color: "var(--text-dim)", fontSize: 10, flexShrink: 1 }}><GitBranch size={10} strokeWidth={2.4} aria-hidden="true" /><span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.worktreeBranch}</span></span>}
           {hasChildren && <button className="session-item-icon-button" onClick={(event) => { event.stopPropagation(); onToggleCollapse?.(); }} title={collapsed ? t("sessionSidebar.expandForks") : t("sessionSidebar.collapseForks")} aria-label={collapsed ? t("sessionSidebar.expandForks") : t("sessionSidebar.collapseForks")} aria-expanded={!collapsed} style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, flexShrink: 0, border: "none", background: "none", color: "var(--text-dim)", cursor: "pointer", transform: collapsed ? "rotate(-90deg)" : "none", transition: "transform var(--dur-fast) var(--ease-out-warm)" }}><ChevronDown size={12} strokeWidth={1.8} aria-hidden="true" /></button>}
           <div style={{ display: "flex", alignItems: "center", gap: SIDEBAR_STATUS_GAP, flexShrink: 0 }}>
@@ -945,6 +974,7 @@ const SessionItem = memo(function SessionItem({
                   <MoreHorizontal size={14} strokeWidth={2} aria-hidden="true" />
                 </button>
                 <SidebarPortalMenu anchor={menuButtonRef} open={actionMenuOpen} onClose={() => setActionMenuOpen(false)} placement="below" point={menuPoint} minWidth={150}>
+                  <button type="button" role="menuitem" data-menu-shortcut="p" aria-keyshortcuts="P" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void togglePinned(); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontSize: 11 }}><span>{pinned ? t("sessionSidebar.unpin") : t("sessionSidebar.pin")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>P</kbd></button>
  <button type="button" role="menuitem" data-menu-shortcut="a" aria-keyshortcuts="A" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleArchive(); }} disabled={archiveBlocked} title={archiveTitle} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: archiveBlocked ? "var(--text-dim)" : "var(--text-muted)", cursor: archiveBlocked ? "not-allowed" : "pointer", textAlign: "left", fontSize: 11, opacity: archiveBlocked ? 0.55 : 1 }}><span>{t("sessionSidebar.archive")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>A</kbd></button>
                   <button type="button" role="menuitem" data-menu-shortcut="r" aria-keyshortcuts="R" className="sidebar-menu-item" onClick={(event) => { startRename(event); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontSize: 11 }}><span>{t("sessionSidebar.rename")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>R</kbd></button>
                   <button type="button" role="menuitem" data-menu-shortcut="c" aria-keyshortcuts="C" className="sidebar-menu-item" onClick={(event) => { event.stopPropagation(); setActionMenuOpen(false); void handleCopyTranscript(); }} disabled={copyingTranscript} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: copyingTranscript ? "default" : "pointer", textAlign: "left", fontSize: 11, opacity: copyingTranscript ? 0.55 : 1 }}><span>{t("sessionSidebar.copyTranscript")}</span><kbd style={{ float: "right", marginLeft: 16, color: "var(--text-dim)", fontFamily: "inherit" }}>C</kbd></button>

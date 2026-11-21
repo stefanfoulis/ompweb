@@ -17,7 +17,7 @@ import { HOST_STATUS_COLOR, hostName, hostStatusText } from "./host-status";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { initialSessionMatches } from "@/lib/initial-navigation";
 import type { SearchMatchTarget } from "./SessionSearchMatches";
-import { compileSearchQuery, scoreSearchFields, searchField, TITLE_WEIGHT } from "@/lib/session-search";
+import { compileSearchQuery, FIRST_MESSAGE_WEIGHT, scoreSearchFields, searchField, TITLE_WEIGHT } from "@/lib/session-search";
 import { Archive, ArrowDownUp, ArrowLeft, ArrowRight, Check, ChevronRight, FileUp, Loader2, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, X } from "lucide-react";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 import { openEventStream } from "@/lib/event-stream";
@@ -53,6 +53,12 @@ import {
 } from "./SessionSidebar-helpers";
 import { OmpWebTitle, SIDEBAR_BUTTON_TRANSITION, SidebarIconButton, SidebarPortalMenu } from "./SessionSidebar-chrome";
 import { HostGroup, ProjectRow } from "./SessionSidebar-rows";
+import {
+  CurrentSessionList,
+  SidebarViewToggle,
+  selectCurrentSessions,
+  useSidebarView,
+} from "./SessionSidebar-current";
 
 /** Deadline for one /api/sessions fetch. A wedged-but-listening server never
  * answers; without this the initial spinner would pend forever. */
@@ -258,6 +264,9 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const sortButtonRef = useRef<HTMLButtonElement>(null);
   const closeSortMenu = useCallback(() => setSortMenuOpen(false), []);
   const pinsActive = projectSortMode !== "none";
+  // Current (flat: pinned + active), Pinned (flat: pinned only) or All (the
+  // workspace tree); per browser.
+  const [sidebarView, setSidebarView] = useSidebarView();
 
   // Once the SSE stream has delivered a frame it is the source of truth for
   // running state; late /api/sessions responses must not overwrite it.
@@ -974,6 +983,46 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     return entries;
   }, [sortedProjects, sessionsByProject, runningOnly, trimmedSearchQuery, currentTranscriptSearch, runningSessionIds, effectiveRecentCompletedSet]);
 
+  // The flat views' list: the running-only filter and the tree's own ranked
+  // search (streamed transcript scores where the server has answered, local
+  // title scores otherwise), applied to the pinned/running/unread/recently-
+  // completed set, or to the pinned set alone in Pinned.
+  const currentSessions = useMemo(() => {
+    if (sidebarView === "all") return NO_SESSIONS;
+    let list = selectCurrentSessions(visibleSessions, runningSessionIds, unreadSessionIds, effectiveRecentCompletedSet, { pinnedOnly: sidebarView === "pinned" });
+    // The running-only filter button is hidden in Current (its own inclusion
+    // rule already covers running and recently-completed sessions), but the
+    // toggle's state is shared across views — ignore it here so switching
+    // into Current from a filtered All never silently drops sessions.
+    if (runningOnly && sidebarView !== "current") list = list.filter((s) => runningSessionIds.has(s.id));
+    const query = compileSearchQuery(trimmedSearchQuery);
+    if (!query) return list;
+    const serverScores = currentTranscriptSearch?.scores;
+    const scores = new Map<string, number>();
+    for (const s of list) {
+      const score = serverScores?.[s.id]
+        ?? scoreSearchFields([searchField(s.name ?? "", TITLE_WEIGHT), searchField(s.firstMessage, FIRST_MESSAGE_WEIGHT)], query);
+      if (score !== null) scores.set(s.id, score);
+    }
+    // Best match first; ties keep the activity order (stable sort).
+    return list.filter((s) => scores.has(s.id)).sort((a, b) => (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0));
+  }, [sidebarView, visibleSessions, runningSessionIds, unreadSessionIds, effectiveRecentCompletedSet, runningOnly, trimmedSearchQuery, currentTranscriptSearch]);
+
+  // A workspace's own name for the flat list: its registry alias when it has
+  // one, otherwise the folder name the tree's rows show.
+  const workspaceAliases = useMemo(() => {
+    const aliases = new Map<string, string>();
+    for (const project of projects) {
+      const alias = project.alias?.trim();
+      if (alias) aliases.set(comparableProjectPath(project.path), alias);
+    }
+    return aliases;
+  }, [projects]);
+  const workspaceLabelFor = useCallback((session: SessionInfo) => {
+    const root = session.projectRoot || session.cwd;
+    return workspaceAliases.get(comparableProjectPath(root)) ?? projectLabel(root);
+  }, [workspaceAliases]);
+
   const treesByProject = useMemo(() => {
     const m = new Map<string, ReturnType<typeof buildSessionTree>>();
     for (const { project, sessions, scores } of visibleProjectEntries) m.set(projectIdentity(project), buildSessionTree(sessions, scores));
@@ -1628,80 +1677,98 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         </button>
       </div>
 
-      {/* Workspaces section header: label + search / sort / filter / add */}
-      <div style={{ flexShrink: 0, padding: "4px 10px 2px", display: "flex", alignItems: "center", gap: 2 }}>
-        <span
-          style={{
-            flex: 1,
-            color: "var(--text-muted)",
-            fontSize: 11,
-            fontWeight: 600,
-            letterSpacing: "0.08em",
-            textTransform: "uppercase",
-          }}
-        >
-          {t("projects.heading")}
-        </span>
-        <SidebarIconButton
-          label={t("sessionSidebar.search")}
-          title={t("sessionSidebar.searchTitle")}
-          active={searchOpen}
-          onClick={() => {
-            const nextOpen = !searchOpen;
-            setSearchOpen(nextOpen);
-            if (nextOpen) setTimeout(() => searchInputRef.current?.focus(), 0);
-            else setSearchQuery("");
-          }}
-        >
-          <Search size={15} strokeWidth={1.9} aria-hidden="true" />
-        </SidebarIconButton>
-        <SidebarIconButton
-          ref={sortButtonRef}
-          label={t("projects.sort")}
-          active={pinsActive || sortMenuOpen}
-          menuExpanded={sortMenuOpen}
-          onClick={() => setSortMenuOpen((open) => !open)}
-        >
-          <ArrowDownUp size={15} strokeWidth={1.9} aria-hidden="true" />
-        </SidebarIconButton>
-        <SidebarPortalMenu anchor={sortButtonRef} open={sortMenuOpen} onClose={closeSortMenu} placement="below" minWidth={150}>
-          {([
-            ["none", t("projects.sortNone")],
-            ["alphabetical", t("projects.sortAlphabetical")],
-            ["updated", t("projects.sortUpdated")],
-          ] as const).map(([mode, label]) => (
-            <button
-              key={mode}
-              type="button"
-              role="menuitemradio"
-              aria-checked={projectSortMode === mode}
-              className="sidebar-menu-item"
-              onClick={() => chooseProjectSortMode(mode)}
-              style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}
+      {/* Section header: the Current / Pinned / All switch + search / sort / filter / add.
+          The controls keep their own row when the switch and all of them no
+          longer fit side by side — a narrow sidebar, or touch targets, which
+          are 40px wide instead of 26px. */}
+      <div style={{ flexShrink: 0, padding: "4px 10px 2px", display: "flex", alignItems: "center", flexWrap: "wrap", gap: 2 }}>
+        {/* -7px: the toggle's own button padding, so its label lines up with
+            the workspace rows underneath. */}
+        <div style={{ marginLeft: -7 }}>
+          <SidebarViewToggle
+            view={sidebarView}
+            onChange={(view) => {
+              setSidebarView(view);
+              // The sort orders the workspace tree; its menu must not outlive
+              // the switch to a flat list, which hides the button.
+              setSortMenuOpen(false);
+            }}
+          />
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 2, marginLeft: "auto" }}>
+          <SidebarIconButton
+            label={t("sessionSidebar.search")}
+            title={t("sessionSidebar.searchTitle")}
+            active={searchOpen}
+            onClick={() => {
+              const nextOpen = !searchOpen;
+              setSearchOpen(nextOpen);
+              if (nextOpen) setTimeout(() => searchInputRef.current?.focus(), 0);
+              else setSearchQuery("");
+            }}
+          >
+            <Search size={15} strokeWidth={1.9} aria-hidden="true" />
+          </SidebarIconButton>
+          {/* The sort orders workspaces, so it only applies to the tree in All;
+              Current and Pinned are flat lists, ordered by activity (or by search rank). */}
+          {sidebarView === "all" && (
+            <>
+              <SidebarIconButton
+                ref={sortButtonRef}
+                label={t("projects.sort")}
+                active={pinsActive || sortMenuOpen}
+                menuExpanded={sortMenuOpen}
+                onClick={() => setSortMenuOpen((open) => !open)}
+              >
+                <ArrowDownUp size={15} strokeWidth={1.9} aria-hidden="true" />
+              </SidebarIconButton>
+              <SidebarPortalMenu anchor={sortButtonRef} open={sortMenuOpen} onClose={closeSortMenu} placement="below" minWidth={150}>
+                {([
+                  ["none", t("projects.sortNone")],
+                  ["alphabetical", t("projects.sortAlphabetical")],
+                  ["updated", t("projects.sortUpdated")],
+                ] as const).map(([mode, label]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={projectSortMode === mode}
+                    className="sidebar-menu-item"
+                    onClick={() => chooseProjectSortMode(mode)}
+                    style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}
+                  >
+                    <Check size={12} strokeWidth={2} aria-hidden="true" style={{ flexShrink: 0, visibility: projectSortMode === mode ? "visible" : "hidden" }} />
+                    {label}
+                  </button>
+                ))}
+              </SidebarPortalMenu>
+            </>
+          )}
+          {/* Current's own inclusion rule already covers running and
+              recently-completed sessions, so the filter here would just
+              re-narrow it to "running only" with no visible control to undo
+              it — the button only makes sense in Pinned and All. */}
+          {sidebarView !== "current" && (
+            <SidebarIconButton
+              label={t("sessionSidebar.filterRunning")}
+              title={t("sessionSidebar.filterRunningTitle", { count: recentRunsLimit })}
+              active={runningOnly}
+              onClick={() => setRunningOnly((v) => !v)}
             >
-              <Check size={12} strokeWidth={2} aria-hidden="true" style={{ flexShrink: 0, visibility: projectSortMode === mode ? "visible" : "hidden" }} />
-              {label}
-            </button>
-          ))}
-        </SidebarPortalMenu>
-        <SidebarIconButton
-          label={t("sessionSidebar.filterRunning")}
-          title={t("sessionSidebar.filterRunningTitle", { count: recentRunsLimit })}
-          active={runningOnly}
-          onClick={() => setRunningOnly((v) => !v)}
-        >
-          <SlidersHorizontal size={15} strokeWidth={1.9} aria-hidden="true" />
-        </SidebarIconButton>
-        <SidebarIconButton
-          label={t("projects.add")}
-          title={t("projects.addTitle")}
-          onClick={() => {
-            setAddProjectOpen(true, selectedPoolProject ? projectTargetId(selectedPoolProject) : LOCAL_HOST_ID);
-            setAddProjectError(null);
-          }}
-        >
-          <Plus size={15} strokeWidth={1.9} aria-hidden="true" />
-        </SidebarIconButton>
+              <SlidersHorizontal size={15} strokeWidth={1.9} aria-hidden="true" />
+            </SidebarIconButton>
+          )}
+          <SidebarIconButton
+            label={t("projects.add")}
+            title={t("projects.addTitle")}
+            onClick={() => {
+              setAddProjectOpen(true, selectedPoolProject ? projectTargetId(selectedPoolProject) : LOCAL_HOST_ID);
+              setAddProjectError(null);
+            }}
+          >
+            <Plus size={15} strokeWidth={1.9} aria-hidden="true" />
+          </SidebarIconButton>
+        </div>
       </div>
       {searchOpen && (
         <div style={{ padding: "0 10px 6px", flexShrink: 0 }}>
@@ -1789,18 +1856,36 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
               <button className="load-retry-button" type="button" onClick={() => { loadSessions(false); void loadProjects(); }} style={{ minHeight: 32, padding: "4px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>{t("sessionSidebar.refresh")}</button>
             </div>
           )}
-          {!loading && !projectsError && !error && sortedProjects.length === 0 && (
+          {!loading && !projectsError && !error && sidebarView !== "all" && (
+            <CurrentSessionList
+              sessions={currentSessions}
+              selectedSessionId={selectedSessionId}
+              runningSessionIds={runningSessionIds}
+              awaitingInputIds={awaitingInputIds}
+              unreadSessionIds={unreadSessionIds}
+              recentlyCompletedIds={effectiveRecentCompletedSet}
+              exitedSessions={exitedSessions}
+              relativeTimeNow={relativeTimeNow}
+              workspaceLabelFor={workspaceLabelFor}
+              onSelectSession={handleSelectSessionFromList}
+              onRenamed={loadSessions}
+              onSessionDeleted={handleSessionDeleted}
+              filtersActive={filtersActive}
+              pinnedOnly={sidebarView === "pinned"}
+            />
+          )}
+          {!loading && !projectsError && !error && sidebarView === "all" && sortedProjects.length === 0 && (
             <div style={{ padding: "10px 4px", color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
               {t("projects.noProjects")}
             </div>
           )}
-          {!loading && !projectsError && !error && sortedProjects.length > 0 && visibleProjectEntries.length === 0 && (
+          {!loading && !projectsError && !error && sidebarView === "all" && sortedProjects.length > 0 && visibleProjectEntries.length === 0 && (
             <div style={{ padding: "14px 4px", color: "var(--text-dim)", fontSize: 11.5, lineHeight: 1.5 }}>
               {t("sessionSidebar.noMatches")}
             </div>
           )}
 
-          {groupProjectsByHost(visibleProjectEntries, hostList, pools).map(({ host, projects: entries }) => {
+          {sidebarView === "all" && groupProjectsByHost(visibleProjectEntries, hostList, pools).map(({ host, projects: entries }) => {
             // A search or running filter hides hosts that have no match.
             if (showHostGroups && filtersActive && entries.length === 0) return null;
             const rows = entries.map(({ project, sessions }) => {
