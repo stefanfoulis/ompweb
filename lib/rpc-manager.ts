@@ -150,6 +150,34 @@ export class WebRpcError extends Error {
   }
 }
 
+/** A submitted ask answer, as omp's `ExtensionAskDialogSubmitResult` spells it. */
+function isAskResult(value: Record<string, unknown>): boolean {
+  if (value.kind !== "submit" || !Array.isArray(value.results)) return false;
+  return value.results.every((result: unknown) => isRecord(result)
+    && typeof result.id === "string"
+    && typeof result.question === "string"
+    && Array.isArray(result.options) && result.options.every((option: unknown) => typeof option === "string")
+    && Array.isArray(result.selectedOptions) && result.selectedOptions.every((option: unknown) => typeof option === "string")
+    && (result.customInput === undefined || typeof result.customInput === "string")
+    && (result.note === undefined || typeof result.note === "string")
+    && (result.noteOption === undefined || typeof result.noteOption === "string"));
+}
+
+/** A submitted form answer: omp's `HtmlFormData` and the notes on its answers. */
+function isFormResult(value: Record<string, unknown>): boolean {
+  if (!isRecord(value.data)) return false;
+  const values = Object.values(value.data).every((entry) => typeof entry === "string" || typeof entry === "number"
+    || (Array.isArray(entry) && entry.every((item: unknown) => typeof item === "string")));
+  if (!values) return false;
+  if (value.notes === undefined) return true;
+  return Array.isArray(value.notes) && value.notes.every((note: unknown) => isRecord(note)
+    && typeof note.name === "string"
+    && typeof note.question === "string"
+    && typeof note.option === "string"
+    && typeof note.value === "string"
+    && typeof note.text === "string");
+}
+
 // Commands forwarded to omp verbatim (request shape already matches rpc-types).
 const PASSTHROUGH_COMMANDS = new Set([
   "abort",
@@ -2875,11 +2903,11 @@ export class AgentSessionWrapper {
         if (runnerId !== undefined && !Number.isSafeInteger(runnerId)) throw new WebRpcError("Invalid dialog id", "invalid_ui_response");
         const method = this.pendingUiRequests.get(key)?.method;
         // A malformed answer would drop the dialog from reconnect replay while omp rejects it.
-        if (value !== undefined && (method === "askDialog" || method === "formDialog") && !isRecord(value)) {
-          throw new WebRpcError("Invalid dialog answer", "invalid_ui_response");
-        }
-        if (value !== undefined && method === "formDialog" && isRecord(value) && !isRecord(value.data)) {
-          throw new WebRpcError("Invalid form dialog answer", "invalid_ui_response");
+        // Either question also answers "chat about this", which asks the agent to discuss it instead.
+        if (value !== undefined && (method === "askDialog" || method === "formDialog")) {
+          const chat = isRecord(value) && value.kind === "chat";
+          const answer = isRecord(value) && (method === "askDialog" ? isAskResult(value) : isFormResult(value));
+          if (!chat && !answer) throw new WebRpcError("Invalid dialog answer", "invalid_ui_response");
         }
         const wasPending = this.pendingUiRequests.has(key);
         this.forgetPendingUiRequest(key);

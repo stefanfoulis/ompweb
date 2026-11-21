@@ -1,5 +1,5 @@
 // Types mirrored from oh-my-pi coding-agent session-entries (v3 format).
-import type { HtmlFormData, RpcAskDialogQuestion, TodoPhase } from "./pi-types";
+import type { HtmlFormData, OptionNote, RpcAskDialogQuestion, TodoPhase } from "./pi-types";
 import type { MessageOrigin, SessionOriginRef } from "./message-origin";
 
 // omp-web cannot import the Bun-only @oh-my-pi packages, so the on-disk
@@ -226,12 +226,27 @@ export interface UiAskDialogResult {
     multi: boolean;
     selectedOptions: string[];
     customInput?: string;
+    customInputImages?: ImageContent[];
+    /** Remark on the answer this question got. */
+    note?: string;
+    noteImages?: ImageContent[];
+    /** Label of the option the note is on; unset when it is on the custom answer. */
+    noteOption?: string;
+    timedOut?: boolean;
   }[];
+}
+
+/** omp's `ExtensionAskDialogChatResult`: discuss the question instead of answering it. */
+export interface UiChatResult {
+  kind: "chat";
 }
 
 /** omp's `ExtensionFormDialogResult`. */
 export interface UiFormDialogResult {
   data: HtmlFormData;
+  /** Notes on the answers given, paired with them by `name`, `question` and `value`. */
+  notes?: OptionNote[];
+  timedOut?: boolean;
 }
 
 export type AgentConfirmPayload =
@@ -252,7 +267,7 @@ export type AgentConfirmPayload =
     };
 
 /** What an omp dialog method returns; a cancel sends no value. */
-export type UiDialogValue = string | boolean | UiAskDialogResult | UiFormDialogResult | UiApprovalAnswer;
+export type UiDialogValue = string | boolean | UiAskDialogResult | UiFormDialogResult | UiChatResult | UiApprovalAnswer;
 
 /**
  * A dialog the runner opened: `method` is omp's `ExtensionUIContext` method, `args` its positional

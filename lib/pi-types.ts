@@ -245,6 +245,24 @@ export interface RpcAskDialogAnswer {
 export type HtmlFormData = Record<string, string | number | string[]>;
 
 /**
+ * A note the user attached to one answer of a form dialog, separate from the
+ * submitted values (omp's `OptionNote`). omp pairs a note with its answer by
+ * `name` and `question`, and `value` is that answer as `HtmlFormData` spells
+ * it, so both must match what the submission reports.
+ */
+export interface OptionNote {
+  name: string;
+  question: string;
+  /** The option's shown label. */
+  option: string;
+  /** The option's submitted value, as it appears in the form data. */
+  value: string;
+  text: string;
+  /** Images pasted into the note; omp numbers their `[Image #N]` markers. */
+  images?: { type: "image"; data: string; mimeType: string }[];
+}
+
+/**
  * omp's RPC host-tool bridge: omp-web registers host tools (set_host_tools)
  * that the agent can call; the server emits host_tool_call frames the UI
  * executes, and the UI answers with host_tool_result. Mirrors
