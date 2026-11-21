@@ -3220,8 +3220,8 @@ test("StrictMode final unmount owns the observer attached after its first cleanu
 // ---------------------------------------------------------------------------
 
 /** Mid-run baseline used by the recovery tests. */
-async function startStreamingRun(sid) {
-  const { w, es } = await startRun(sid, "q1");
+async function startStreamingRun(sid, options = {}) {
+  const { w, es } = await startRun(sid, "q1", false, options);
   await act(async () => {
     es.emit({ type: "agent_start" });
     es.emit({ type: "message_update", message: assistantMsg("a1", "streaming") });
@@ -4032,7 +4032,7 @@ test("forking carries the advisor choice to the child's next native command", as
     match: (method, url) => method === "POST" && url.startsWith("/api/agent/advisor-parent"),
     produce: async () => ({ value: { success: true, data: { newSessionId: "advisor-child" } } }),
   });
-  await act(async () => { await w.latest.handleFork("e0", false); });
+  await act(async () => { await w.latest.handleFork("e0"); });
   assert.deepEqual(forked, ["advisor-child"]);
   assert.equal(localStorage.getItem("omp-advisor-enabled:advisor-child"), "true");
   const { sendAgentCommand } = await import("@/lib/agent-client");
@@ -4040,21 +4040,53 @@ test("forking carries the advisor choice to the child's next native command", as
   assert.ok(world.calls.some((call) => call.url === "/api/agent/advisor-child?advisor=1"));
 });
 
-test("an edit-and-resend fork puts the branched prompt into the child's composer", async () => {
+test("a prompt's fork puts that prompt back into the child's composer", async () => {
   const { getDraft, clearDraft } = await import("@/lib/draft-store");
-  for (const [editPrompt, child] of [[true, "edit-child"], [false, "keep-child"]]) {
+  for (const [prefill, child] of [["retry this", "edit-child"], [undefined, "keep-child"]]) {
     resetWorld();
     primeSession("fork-parent", [userMsg("u0", "q")]);
     const w = await mountSession("fork-parent", undefined, { onSessionForked: () => {} });
     world.holds.push({
       match: (method, url) => method === "POST" && url.startsWith("/api/agent/fork-parent"),
-      produce: async () => ({ value: { success: true, data: { newSessionId: child, text: "retry this" } } }),
+      // The real rpc-manager echoes the command's own prefill back as `text`,
+      // since `fork_at` returns no prompt text of its own.
+      produce: async () => ({ value: { success: true, data: { newSessionId: child, text: prefill } } }),
     });
-    await act(async () => { await w.latest.handleFork("u0", editPrompt); });
-    assert.equal(getDraft(child)?.value, editPrompt ? "retry this" : undefined);
+    await act(async () => { await w.latest.handleFork("u0", prefill); });
+    assert.equal(getDraft(child)?.value, prefill);
     clearDraft(child);
     w.unmount();
   }
+});
+
+test("forking while the agent runs spawns the fork and leaves the running turn streaming", async () => {
+  resetWorld();
+  primeSession("s1", [userMsg("u0", "q")]);
+  const forked = [];
+  const { w, es } = await startStreamingRun("s1", { onSessionForked: (id) => forked.push(id) });
+  // Matched on the command, not just the URL: the live run's own background
+  // POSTs to this session must not consume the fork's reply.
+  world.holds.push({
+    match: (method, url, body) => method === "POST" && url.startsWith("/api/agent/s1") && body?.type === "fork",
+    produce: async () => ({ value: { success: true, data: { newSessionId: "mid-run-child" } } }),
+  });
+
+  await act(async () => { await w.latest.handleFork("a1"); });
+
+  const forkCalls = world.calls.filter((call) => call.method === "POST" && call.body?.type === "fork");
+  assert.deepEqual(forkCalls.map((call) => [call.url, call.body.entryId]), [["/api/agent/s1", "a1"]]);
+  // The running session's own process is never addressed: no native branch, no abort.
+  assert.deepEqual(world.calls.filter((call) => call.body?.type === "branch"), []);
+  assert.deepEqual(forked, ["mid-run-child"]);
+  assert.equal(w.latest.agentRunning, true);
+
+  await act(async () => {
+    es.emit({ type: "message_update", message: assistantMsg("a1", "streaming on") });
+    await Promise.resolve();
+  });
+  await settle(90);
+  assert.equal(w.latest.agentRunning, true);
+  assert.equal(w.latest.streamState.streamingMessage?.content[0].text, "streaming on");
 });
 
 test("a second fork click while one is in flight sends no second fork command", async () => {
@@ -4071,8 +4103,8 @@ test("a second fork click while one is in flight sends no second fork command", 
     },
   });
   let first;
-  await act(async () => { first = w.latest.handleFork("u0", false); await sleep(20); });
-  await act(async () => { await w.latest.handleFork("u0", false); });
+  await act(async () => { first = w.latest.handleFork("u0"); await sleep(20); });
+  await act(async () => { await w.latest.handleFork("u0"); });
   release();
   await act(async () => { await first; });
   const forkCalls = world.calls.filter((c) => c.method === "POST" && c.url.startsWith("/api/agent/fork-busy"));

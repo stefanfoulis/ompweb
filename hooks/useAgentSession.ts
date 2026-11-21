@@ -3963,10 +3963,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [addNotice, catchUp, connectEvents, isNew, onSessionMoved, opts.chatInputRef, reloadActiveSessionHistory]);
 
-  // editPrompt: omp's `branch` drops the chosen user prompt from the fork and
-  // returns its text — put it in the fork's composer (edit-and-resend).
-  const handleFork = useCallback(async (entryId: string, editPrompt: boolean) => {
-    if (bashRunningRef.current || agentRunningRef.current || forkInFlightRef.current || editInFlightRef.current) return;
+  // `prefill` is the text of the prompt the fork cuts away: the fork keeps the
+  // history before it and the composer offers the prompt for editing.
+  // No gate on the running agent — forking only reads this session's own
+  // file (fork_at), so its turn keeps going untouched; an Edit in progress is
+  // still waited out, since it is rewriting that same file.
+  const handleFork = useCallback(async (entryId: string, prefill?: string) => {
+    if (forkInFlightRef.current || editInFlightRef.current) return;
     const sid = sessionIdRef.current;
     if (!sid) return;
     forkInFlightRef.current = true;
@@ -3975,10 +3978,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const result = await sendAgentCommand<{ cancelled?: boolean; newSessionId?: string; text?: string }>(sid, {
         type: "fork",
         entryId,
+        prefill,
       });
       const { cancelled, newSessionId, text } = result ?? {};
       if (!cancelled && newSessionId) {
-        if (editPrompt && text) setDraft(newSessionId, { value: text, images: [], files: [], promptOnly: true });
+        if (text) setDraft(newSessionId, { value: text, images: [], files: [], promptOnly: true });
         // The forked child keeps its spawn flags: carry the advisor choice to
         // the new id, or the toggle flips off on switch and the next prompt
         // respawns the fork without --advisor.
@@ -3993,12 +3997,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         onSessionForked?.(newSessionId);
       }
     } catch (e) {
-      console.error("Fork failed:", e);
+      // A fork that cannot start (e.g. an unknown entry) exits before it
+      // writes anything; the route forwards that message.
+      addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
     } finally {
       forkInFlightRef.current = false;
       setForkingEntryId(null);
     }
-  }, [advisorEnabled, onSessionForked]);
+  }, [addNotice, advisorEnabled, onSessionForked]);
 
   const handleLeafChange = useCallback(async (leafId: string | null) => {
     if (bashRunningRef.current || agentRunningRef.current || editInFlightRef.current) return;

@@ -2783,20 +2783,19 @@ export class AgentSessionWrapper {
         return this.editMessage(command.entryId);
 
       case "fork": {
-        // omp's `branch` is pi-web's fork: it creates a branched session file
-        // and switches this live process onto it (entryId must be a user
-        // message entry, matching the web UI's fork buttons).
-        if (this.bashRunning) {
-          throw new Error("Cannot fork while a shell command is running");
-        }
-        const result = await this.proc.sendCommand<{ text: string; cancelled: boolean }>({
-          type: "branch",
+        // `fork_at` reads this live process's own session file and writes a
+        // new one with the history up to and including `entryId` (the cut
+        // lib/chat-fork.ts resolves) — nothing here is touched, so a fork
+        // never waits for, or stops, a running turn.
+        const result = await this.proc.sendCommand<{ sessionId: string; sessionFile: string }>({
+          type: "fork_at",
           entryId: command.entryId as string,
         });
-        if (result.cancelled) return { cancelled: true };
-        const newSessionId = await this.refreshIdentityAfterSessionChange();
-        // `text` is the branched prompt omp hands back for edit-and-resend.
-        return { cancelled: false, newSessionId, text: result.text };
+        this.host.invalidateSessionLists(result.sessionFile);
+        invalidateHostSessionList(this.host.id);
+        // The fork's composer prefill, if any, is already known client-side
+        // (the row's own ForkTarget.prefill); fork_at never returns one.
+        return { cancelled: false, newSessionId: result.sessionId, text: command.prefill as string | undefined };
       }
 
       case "new_session":

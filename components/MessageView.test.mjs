@@ -89,6 +89,7 @@ test("trusted session origins render as left-side source cards with raw text on 
   const view = render(React.createElement(MessageView, {
     message: { role: "user", content: `${sessionHeader}\n\nCheck the failed build.`, origin: sessionOrigin },
     entryId: "entry-1",
+    forkEntryId: "entry-1",
     onEdit: async () => true,
     onFork() {},
   }));
@@ -122,6 +123,7 @@ test("origin edit and fork confirmations close when the rendered entry changes",
   const props = {
     message: { role: "user", content: `${sessionHeader}\n\nFirst.`, origin: sessionOrigin },
     entryId: "entry-1",
+    forkEntryId: "entry-1",
     onEdit: async () => true,
     onFork() {},
   };
@@ -1131,8 +1133,8 @@ test("agent replies offer copy and fork at their resolved target", async (t) => 
     // Resolved by resolveForkTargets: the newest reply falls back to its own
     // turn's prompt with edit-and-resend.
     forkEntryId: "user-1",
-    forkEditsPrompt: true,
-    onFork: (entryId, editPrompt) => forked.push([entryId, editPrompt]),
+    forkPrefill: "Retry this turn.",
+    onFork: (entryId, prefill) => forked.push([entryId, prefill]),
   };
   const view = render(React.createElement(MessageView, props));
   assert.ok(view.getByRole("button", { name: "Copy message" }));
@@ -1142,12 +1144,12 @@ test("agent replies offer copy and fork at their resolved target", async (t) => 
   assert.deepEqual(forked, []);
   await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Fork" })); });
-  assert.deepEqual(forked, [["user-1", true]]);
+  assert.deepEqual(forked, [["user-1", "Retry this turn."]]);
 
   await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
   view.rerender(React.createElement(MessageView, { ...props, forkDisabled: true }));
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Fork" })); });
-  assert.deepEqual(forked, [["user-1", true]], "a row blocked while the dialog was open does not fork");
+  assert.deepEqual(forked, [["user-1", "Retry this turn."]], "a row blocked while the dialog was open does not fork");
   view.unmount();
 });
 
@@ -1180,7 +1182,7 @@ test("a streaming reply and an unforkable row keep no fork action", () => {
   assert.doesNotMatch(noTarget, new RegExp(`aria-label="${FORK_LABEL}"`));
 });
 
-test("user messages fork at their own entry and edit the prompt", async (t) => {
+test("a user row forks at its resolved cut, with its own text as the fork's prefill", async (t) => {
   const originalMatchMedia = window.matchMedia;
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
   t.after(() => {
@@ -1191,13 +1193,14 @@ test("user messages fork at their own entry and edit the prompt", async (t) => {
   const view = render(React.createElement(MessageView, {
     message: { role: "user", content: "Keep this forkable." },
     entryId: "user-7",
-    forkEntryId: "user-7",
-    onFork: (entryId, editPrompt) => forked.push([entryId, editPrompt]),
+    forkEntryId: "user-6",
+    forkPrefill: "Keep this forkable.",
+    onFork: (entryId, prefill) => forked.push([entryId, prefill]),
   }));
   await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
   assert.deepEqual(forked, []);
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Fork" })); });
-  assert.deepEqual(forked, [["user-7", true]]);
+  assert.deepEqual(forked, [["user-6", "Keep this forkable."]]);
   view.unmount();
 });
 
@@ -1338,6 +1341,7 @@ test("an open confirmation closes when the row starts showing another message", 
   const row = (entryId, content) => React.createElement(MessageView, {
     message: { role: "user", content },
     entryId,
+    forkEntryId: entryId,
     onEdit: async (id, text) => { calls.push(["edit", id, text]); return true; },
     onFork: (id) => calls.push(["fork", id]),
   });

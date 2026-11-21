@@ -51,6 +51,8 @@ export function OriginMessageView({
   onOpenFile,
   sessionId,
   entryId,
+  forkEntryId,
+  forkPrefill,
   onFork,
   forking,
   forkDisabled,
@@ -63,7 +65,10 @@ export function OriginMessageView({
   onOpenFile?: (filePath: string) => void;
   sessionId?: string;
   entryId?: string;
-  onFork?: (entryId: string, editPrompt: boolean) => void;
+  /** Entry the fork of this row cuts at, inclusive (see lib/chat-fork.ts). */
+  forkEntryId?: string;
+  forkPrefill?: string;
+  onFork?: (entryId: string, prefill?: string) => void;
   forking?: boolean;
   forkDisabled?: boolean;
   onEdit?: (entryId: string, content: string) => Promise<boolean>;
@@ -84,7 +89,7 @@ export function OriginMessageView({
   useEffect(() => {
     setConfirmingEditId(null);
     setConfirmingForkId(null);
-  }, [entryId]);
+  }, [entryId, forkEntryId]);
   const github = origin.kind === "github" ? origin.github : undefined;
   const title = session ? "Session message" : github ? "GitHub update" : "Automated message";
   const Icon = session ? MessagesSquare : github ? GitPullRequest : Bot;
@@ -132,19 +137,19 @@ export function OriginMessageView({
               </Tooltip>
             </>
           )}
-          {entryId && onFork && (
+          {forkEntryId && onFork && (
             <>
               <ConfirmDialog
-                open={confirmingForkId === entryId}
-                onOpenChange={(open) => setConfirmingForkId(open ? entryId ?? null : null)}
+                open={confirmingForkId === forkEntryId}
+                onOpenChange={(open) => setConfirmingForkId(open ? forkEntryId ?? null : null)}
                 title={t("messageView.forkConfirmTitle")}
-                description={t("messageView.forkConfirmEditBody")}
+                description={t(forkPrefill === undefined ? "messageView.forkConfirmBody" : "messageView.forkConfirmEditBody")}
                 confirmLabel={t("messageView.newSession")}
                 cancelLabel={t("chatInput.cancel")}
-                onConfirm={() => { const id = confirmingForkId; setConfirmingForkId(null); if (id === entryId && !forking && !forkDisabled) onFork(id, true); }}
+                onConfirm={() => { const id = confirmingForkId; setConfirmingForkId(null); if (id === forkEntryId && !forking && !forkDisabled) onFork(id, forkPrefill); }}
               />
               <Tooltip content={t("messageView.newSessionTitle")}>
-                <button type="button" disabled={forking || forkDisabled} onClick={() => setConfirmingForkId(entryId ?? null)} aria-label={t("messageView.newSessionTitle")} style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 8px", border: 0, background: "none", color: "var(--text-dim)", fontSize: 11, cursor: "pointer" }}>
+                <button type="button" disabled={forking || forkDisabled} onClick={() => setConfirmingForkId(forkEntryId ?? null)} aria-label={t("messageView.newSessionTitle")} style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 8px", border: 0, background: "none", color: "var(--text-dim)", fontSize: 11, cursor: "pointer" }}>
                   <GitFork size={11} aria-hidden="true" />{t("messageView.newSession")}
                 </button>
               </Tooltip>

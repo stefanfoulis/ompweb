@@ -232,7 +232,7 @@ interface CommittedTranscriptProps {
   isNew: boolean;
   forkingEntryId: string | null;
   editingEntryId: string | null;
-  handleFork: (entryId: string, editPrompt: boolean) => void;
+  handleFork: (entryId: string, prefill?: string) => void;
   handleEdit: (entryId: string, content: string) => Promise<boolean>;
   modelNames: Record<string, string>;
   messageCwd: string | undefined;
@@ -271,7 +271,7 @@ interface CommittedTranscriptProps {
  * change `streamingMessage`, rendered separately) do not re-run the O(history)
  * grouping/splitting work at display-frame cadence.
  */
-const CommittedTranscript = memo(function CommittedTranscript({
+export const CommittedTranscript = memo(function CommittedTranscript({
   messages, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, isCompacting, externalRunActive, isNew, forkingEntryId, editingEntryId,
   handleFork, handleEdit, modelNames, messageCwd, onOpenFile, sessionId,
   toolCallsDefaultCollapsed, hideToolActivity, neverFoldActivity, showToolCallsUnfolded, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
@@ -279,7 +279,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
 }: CommittedTranscriptProps) {
   const { t } = useI18n();
   const { toolResultsMap, lastAnchorIdx, visibleRefIndexByMessage } = conversationMeta;
-  // omp's `branch` command accepts a user entry only; see lib/chat-fork.ts.
+  // Each row's inclusive cut point; see lib/chat-fork.ts.
   const forkTargets = useMemo(() => resolveForkTargets(messages, entryIds), [messages, entryIds]);
   // The advisor-card button appears only on the single last advisor card
   // still sitting unaddressed at the end of the transcript, and only while
@@ -318,10 +318,13 @@ const CommittedTranscript = memo(function CommittedTranscript({
     }
     if (options.showTimestamp !== undefined) showTimestamp = options.showTimestamp;
     const forkTarget = forkTargets[idx];
-    // Assistant rows fork from reply text or a visible error, not from each thinking/tool step:
-    // every row of a turn forks at the same prompt, so the extra buttons were only clutter.
+    // Assistant rows fork from reply text or a visible error, not from each
+    // thinking/tool step: a fork at one of those cuts mid-turn, and a button
+    // on every step was only clutter.
     const forkableRow = msg.role !== "assistant" || !!msg.errorMessage?.trim() || (Array.isArray(msg.content) && msg.content.some(isReplyBlock));
-    const canOfferFork = !sessionBusy && !isNew && !!forkTarget && forkableRow;
+    // A fork spawns its own omp on a copy of the session file, so it is
+    // offered during a run too; only a row omp cannot cut at has no target.
+    const canOfferFork = !isNew && !!forkTarget && forkableRow;
     const canOfferEdit = !sessionBusy && !isCompacting && !isNew && msg.role === "user" && !msg.branchSummary && !!entryIds[idx];
     const historyMutationPending = forkingEntryId !== null || editingEntryId !== null;
     const view = (
@@ -334,7 +337,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
         onOpenFile={onOpenFile}
         entryId={entryIds[idx]}
         forkEntryId={forkTarget?.entryId}
-        forkEditsPrompt={forkTarget?.editPrompt}
+        forkPrefill={forkTarget?.prefill}
         onFork={canOfferFork ? handleFork : undefined}
         forking={forkingEntryId === forkTarget?.entryId}
         forkDisabled={historyMutationPending}
