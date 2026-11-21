@@ -40,6 +40,7 @@ import { normalizeLocalPath } from "@/lib/file-links";
 import type { WorkspaceFileSource } from "@/lib/workspace-types";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
 import { findSessionTarget, getInitialNavigation, sameSessionTarget, sessionNavigationUrl } from "@/lib/initial-navigation";
+import { buildAppUrl } from "@/lib/app-url";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { foldedHostProjectKey, hostProjectKey, LOCAL_HOST_ID, remoteHostId, projectIdentity, projectTargetId } from "@/lib/project-ordering";
 import { isClusterTarget } from "@/lib/hosts/cluster";
@@ -171,7 +172,7 @@ export function AppShell({ appName }: { appName: string }) {
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [archiveBrowserOpen, setArchiveBrowserOpen] = useState(false);
   const [modelsRefreshKey, setModelsRefreshKey] = useState(0);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(() => initialNavigation.sidebarOpen);
   const [mobileSidebarReady, setMobileSidebarReady] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(SIDEBAR_DEFAULT_WIDTH);
   const [toolCallsDefaultCollapsed, setToolCallsDefaultCollapsed] = useState(true);
@@ -1085,7 +1086,7 @@ export function AppShell({ appName }: { appName: string }) {
   // Right panel tabs: Explorer | Git changes | open files (Tauri parity).
   const [fileTabs, setFileTabs] = useState<Tab[]>([]);
   const [activeFileTabId, setActiveFileTabId] = useState<string | null>(null);
-  const [rightPanelOpen, setRightPanelOpen] = useState(false);
+  const [rightPanelOpen, setRightPanelOpen] = useState(() => initialNavigation.rightPanelOpen);
   const closeRightPanel = useCallback(() => {
     setRightPanelOpen(false);
     if (!isCompactOverlay) {
@@ -1155,6 +1156,24 @@ export function AppShell({ appName }: { appName: string }) {
   useEffect(() => {
     if (rightPanelOpen) setRightPanelHasOpened(true);
   }, [rightPanelOpen]);
+  // On a narrow viewport the right panel becomes a full-screen modal; it
+  // always starts closed there, the same way the left sidebar's overlay does
+  // on mobile (see the `isMobile` effect above) — a URL that opened it on a
+  // wide screen must not surface a stuck overlay on a reload at phone width.
+  useEffect(() => {
+    if (isCompactOverlay) setRightPanelOpen(false);
+  }, [isCompactOverlay]);
+  // Overlays the live sidebar/right-panel collapse state onto `base` — a
+  // session href from `sessionNavigationUrl`, or the bare "/" — for every
+  // `router.replace` below. Switching sessions this way never drops the
+  // panel params, and toggling a panel never drops the session or host.
+  // Mobile's sidebar overlay and the compact-overlay right panel are
+  // transient UI, not navigable state, so their params are never written
+  // from those viewports.
+  const buildUrl = useCallback((base: string) => buildAppUrl(base, {
+    left: !isMobile && !sidebarOpen,
+    right: !isCompactOverlay && rightPanelOpen,
+  }), [isMobile, isCompactOverlay, sidebarOpen, rightPanelOpen]);
   // Fetch the panel's code on the first interaction, so the first open rarely
   // waits for a download while pages nobody touches never fetch it. A failed
   // preload is retried by the first open.
@@ -1285,7 +1304,7 @@ export function AppShell({ appName }: { appName: string }) {
       setSystemPrompt(null);
       setSystemPromptLoading(false);
       setActiveTopPanel(null);
-      router.replace("/");
+      router.replace(buildUrl("/"));
       return;
     }
     // A standalone path is never a fallback for a pending pool placement.
@@ -1322,8 +1341,8 @@ export function AppShell({ appName }: { appName: string }) {
     setSystemPrompt(null);
     setSystemPromptLoading(false);
     setActiveTopPanel(null);
-    router.replace("/");
-  }, [router, selectedSession, newSessionPoolProject]);
+    router.replace(buildUrl("/"));
+  }, [router, selectedSession, newSessionPoolProject, buildUrl]);
 
   const handleSelectSession = useCallback((session: SessionInfo, isRestore = false) => {
     // Re-picking the already-open session (sidebar double-click, palette
@@ -1354,9 +1373,9 @@ export function AppShell({ appName }: { appName: string }) {
     }
     // Skip router.replace when restoring from the URL: the param is already correct.
     if (!isRestore) {
-      router.replace(sessionNavigationUrl(session));
+      router.replace(buildUrl(sessionNavigationUrl(session)));
     }
-  }, [router, isMobile, selectedSession]);
+  }, [router, isMobile, selectedSession, buildUrl]);
 
   const handleNewSession = useCallback((creationId: string, cwd: string | null, hostId?: string, project?: ManagedProject, initialization?: string) => {
     setSettingsTab(null);
@@ -1376,8 +1395,8 @@ export function AppShell({ appName }: { appName: string }) {
       setSidebarOpen(false);
       requestAnimationFrame(() => chatInputRef.current?.focus());
     }
-    router.replace("/");
-  }, [router, isMobile, activeCwd, activePoolProject]);
+    router.replace(buildUrl("/"));
+  }, [router, isMobile, activeCwd, activePoolProject, buildUrl]);
 
   // ---- In-app Navigate back / forward over visited chat views ----
   // Own stack, not the browser History API (that one belongs to the mobile
@@ -1509,8 +1528,8 @@ export function AppShell({ appName }: { appName: string }) {
     setSelectedSession(session);
     setRefreshKey((k) => k + 1);
     hydrateSelectedSession(session.id, session.hostId);
-    router.replace(sessionNavigationUrl(session));
-  }, [router, hydrateSelectedSession]);
+    router.replace(buildUrl(sessionNavigationUrl(session)));
+  }, [router, hydrateSelectedSession, buildUrl]);
 
   const handleSessionMoved = useCallback((oldId: string, newId: string) => {
     if (activeSessionIdRef.current !== oldId) return;
@@ -1522,8 +1541,8 @@ export function AppShell({ appName }: { appName: string }) {
     hydrateSelectedSession(newId, hostId);
     // This is the same conversation. Preserve ChatWindow's run/edit fences
     // and its mounted composer, including unfinished attachments and audio.
-    router.replace(sessionNavigationUrl({ id: newId, hostId }));
-  }, [router, hydrateSelectedSession, activeSelectedSessionHostId]);
+    router.replace(buildUrl(sessionNavigationUrl({ id: newId, hostId })));
+  }, [router, hydrateSelectedSession, activeSelectedSessionHostId, buildUrl]);
 
   const handleAgentEnd = useCallback(() => {
     setRefreshKey((k) => k + 1);
@@ -1618,8 +1637,8 @@ export function AppShell({ appName }: { appName: string }) {
       path: "",
     }));
     hydrateSelectedSession(newSessionId, hostId);
-    router.replace(sessionNavigationUrl({ id: newSessionId, hostId }));
-  }, [router, hydrateSelectedSession, activeSelectedSessionHostId]);
+    router.replace(buildUrl(sessionNavigationUrl({ id: newSessionId, hostId })));
+  }, [router, hydrateSelectedSession, activeSelectedSessionHostId, buildUrl]);
 
   const handleSessionDeleted = useCallback((sessionId: string) => {
     // The composer for this session can never be reopened, so its draft would
@@ -1638,12 +1657,29 @@ export function AppShell({ appName }: { appName: string }) {
       setBranchActiveLeafId(null);
       setSystemPrompt(null);
       setActiveTopPanel(null);
-      router.replace("/");
+      router.replace(buildUrl("/"));
     }
-  }, [selectedSession, router, workspaceOptions.projects]);
+  }, [selectedSession, router, workspaceOptions.projects, buildUrl]);
   const handleInitialRestoreDone = useCallback(() => {
     setInitialSessionRestored(true);
   }, []);
+  // Mirrors a panel toggle into the URL so a reload restores the same
+  // layout. Read through a ref rather than a dependency: the goal is to
+  // skip only while the ?session= restore above is still in flight (same
+  // Suspense remount risk as a redundant router.replace there), not to
+  // re-fire this effect the moment that restore finishes.
+  const initialSessionRestoredRef = useRef(initialSessionRestored);
+  initialSessionRestoredRef.current = initialSessionRestored;
+  const panelUrlMountedRef = useRef(false);
+  useEffect(() => {
+    if (!panelUrlMountedRef.current) {
+      panelUrlMountedRef.current = true;
+      return;
+    }
+    if (!initialSessionRestoredRef.current) return;
+    router.replace(buildUrl(selectedSession ? sessionNavigationUrl(selectedSession) : "/"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only sidebarOpen/rightPanelOpen should retrigger the replace; selectedSession/buildUrl/router are read at fire time via closure.
+  }, [sidebarOpen, rightPanelOpen]);
 
   const handleArchiveRestored = useCallback(async (sessionId: string) => {
     setArchiveBrowserOpen(false);
@@ -1675,12 +1711,12 @@ export function AppShell({ appName }: { appName: string }) {
       if (attemptsLeft > 0) {
         archiveRetryTimerRef.current = setTimeout(() => void selectRestoredSession(attemptsLeft - 1), 300);
       } else if (activeSessionIdRef.current === sessionAtRestoreStart) {
-        router.replace(`?session=${encodeURIComponent(sessionId)}`);
+        router.replace(buildUrl(`?session=${encodeURIComponent(sessionId)}`));
       }
     };
 
     void selectRestoredSession();
-  }, [handleSelectSession, router]);
+  }, [handleSelectSession, router, buildUrl]);
 
   const handleCloseFileTab = useCallback((tabId: string) => {
     // Compute everything from the current list outside the updaters: no side

@@ -2,6 +2,10 @@ export interface InitialNavigation {
   requestedCwd: string | null;
   sessionId: string | null;
   hostId?: string;
+  /** The left sidebar starts open unless the URL asks to collapse it (`left=0`). */
+  sidebarOpen: boolean;
+  /** The right panel starts closed unless the URL asks to open it (`right=1`). */
+  rightPanelOpen: boolean;
 }
 
 export function getInitialNavigation(searchParams: Pick<URLSearchParams, "get">): InitialNavigation {
@@ -12,6 +16,8 @@ export function getInitialNavigation(searchParams: Pick<URLSearchParams, "get">)
     requestedCwd,
     sessionId: requestedCwd ? null : searchParams.get("session"),
     ...(hostId !== null ? { hostId } : {}),
+    sidebarOpen: searchParams.get("left") !== "0",
+    rightPanelOpen: searchParams.get("right") === "1",
   };
 }
 
