@@ -6,6 +6,7 @@ import type {
   BashExecutionMessage,
   ExitedRpcSession,
   CustomMessage,
+  DeveloperMessage,
   ExtensionStatusItem,
   ExtensionWidgetItem,
   OutboxEntry,
@@ -21,6 +22,7 @@ import type {
   UserMessage,
 } from "@/lib/types";
 import { normalizeToolCalls } from "@/lib/normalize";
+import { DEVELOPER_MARKER_CUSTOM_TYPE } from "@/lib/message-display";
 import { hasVisibleAssistantContent } from "@/lib/assistant-response";
 import type { ThinkingModelMeta } from "@/lib/thinking-levels";
 import { HostOfflineError, TransportLostError, getOutboxScope, rememberOutboxScope, sendAgentCommand, setSessionAdvisorSpawn } from "@/lib/agent-client";
@@ -588,6 +590,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // Advisor is a per-chat toggle (composer Sparkles + /advisor command), not a
   // global setting: each session remembers its own choice in localStorage.
   const [advisorEnabled, setAdvisorEnabled] = useState(false);
+  /** True while a `continue`/advisor command from handleAddressAdvisor is
+   *  in flight — drives the advisor card's button label/disabled state only
+   *  (sessionBusy already covers hiding it once the resumed run starts). */
+  const [addressingAdvisor, setAddressingAdvisor] = useState(false);
   const activeSubagentCount = subagents.filter((subagent) => subagent.source !== "history" && subagent.status === "started").length;
 
   const eventSourceRef = useRef<EventStream | null>(null);
@@ -2835,16 +2841,33 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // (e.g. SSE data buffered while the tab was frozen, flushed after
         // reconcile) — they would resurrect a ghost streaming bubble.
         if (!agentRunningRef.current || catchUp.view().leafId) break;
-        const msg = event.message as Partial<AgentMessage> | undefined;
-        const messageError = readAgentError(msg);
+        const raw = event.message as Partial<AgentMessage> | undefined;
+        const messageError = readAgentError(raw);
         if (messageError) {
           lastRunErrorRef.current = messageError;
-          runErrorAssistantRef.current = msg?.role === "assistant" && msg.errorMessage?.trim() === messageError
-            && msg.timestamp !== undefined ? { error: messageError, timestamp: msg.timestamp } : null;
+          runErrorAssistantRef.current = raw?.role === "assistant" && raw.errorMessage?.trim() === messageError
+            && raw.timestamp !== undefined ? { error: messageError, timestamp: raw.timestamp } : null;
         }
-        if (msg?.role === "user") {
+        if (raw?.role === "user") {
           break;
         }
+        // omp's `continue` RPC resumes the agent via a hidden role:"developer"
+        // message carrying `synthetic`/`userInitiated` flags the wire frame
+        // adds but lib/types.ts's DeveloperMessage (mirrored from the on-disk
+        // format) does not declare. MessageView has no case for role
+        // "developer", so without converting it here it would be silently
+        // dropped from the live streaming bubble (session-reader.ts already
+        // converts the persisted entry the same way — DEVELOPER_MARKER_CUSTOM_TYPE).
+        const developerRaw = raw?.role === "developer" ? (raw as DeveloperMessage & { synthetic?: boolean }) : null;
+        const msg: Partial<AgentMessage> | undefined = developerRaw?.synthetic === true
+          ? {
+              role: "custom",
+              customType: DEVELOPER_MARKER_CUSTOM_TYPE,
+              content: developerRaw.content,
+              display: false,
+              timestamp: developerRaw.timestamp,
+            }
+          : raw;
         if (msg?.role === "custom" && (msg as CustomMessage).customType === "advisor") {
           // The advisor review streams in mid-run: light the composer thunder
           // while it works, not only once its message completes. Functional
@@ -4457,6 +4480,87 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [addNotice, holdMessage]);
 
+  /** Resumes the agent on the hidden `continue` directive so it acts on the
+   *  advisor notes already visible in the transcript. No optimistic user
+   *  bubble is created (the directive stays hidden), so this mirrors
+   *  handleSend's existing-session branch — same run-id bookkeeping reset,
+   *  same optimistic agentRunning before the network round-trip (so the UI
+   *  reacts exactly like a normal prompt instead of waiting on agent_start),
+   *  same ensureEventsConnected (an idle session's SSE stream is not
+   *  auto-connected — see the mount effect above — so without this the
+   *  resumed turn's frames would arrive on a connection nobody opened) —
+   *  minus the pieces that only exist to render a typed prompt
+   *  (buildOutgoingPrompt, the optimistic user bubble, new-session
+   *  bootstrapping, slash commands). */
+  const handleAddressAdvisor = useCallback(async () => {
+    const sid = sessionIdRef.current;
+    if (!sid || agentRunningRef.current || bashRunningRef.current || initialHydrationPendingRef.current) return;
+
+    const promptRunId = promptRunIdRef.current + 1;
+    clearTerminalReconcileTimer();
+    promptDispatchPendingRef.current = true;
+    if (catchUp.view().leafId) catchUp.select({ leafId: null, includePreCompaction: catchUp.view().includePreCompaction });
+    else catchUp.invalidate();
+    eventCoalescer.reset();
+    promptRunIdRef.current = promptRunId;
+    runHadContentRef.current = false;
+    lastQuotaErrorRef.current = null;
+    lastRunErrorRef.current = null;
+    runErrorAssistantRef.current = null;
+    independentRunErrorRef.current = null;
+    runPreviousEntryIdsRef.current = null;
+    agentRunningRef.current = true;
+    slashCommandRunRef.current = false;
+    reconcileGuardRef.current?.reset();
+    clearLiveToolResults();
+    setAddressingAdvisor(true);
+    setAgentRunning(true);
+    setAgentPhase({ kind: "waiting_model" });
+    setAdvisorActiveAt(0);
+    dispatch({ type: "start" });
+    pendingScrollToUserRef.current = true;
+    completionScrollAllowedRef.current = true;
+    userScrollIntentUntilRef.current = 0;
+
+    try {
+      await sendAgentCommand(sid, { type: "get_state" });
+      await ensureEventsConnected(sid);
+      void refreshSubagentRoster(sid);
+      void registerHostTools(sid);
+      void registerHostUriSchemes(sid);
+      const previousEntryIds = await snapshotRunEntries(sid);
+      if (promptRunIdRef.current === promptRunId && sessionIdRef.current === sid) {
+        runPreviousEntryIdsRef.current = previousEntryIds;
+      }
+      await sendAgentCommand(sid, { type: "continue", reason: "advisor" });
+      if (promptRunIdRef.current === promptRunId) promptDispatchPendingRef.current = false;
+    } catch (e) {
+      if (promptRunIdRef.current !== promptRunId) return;
+      promptDispatchPendingRef.current = false;
+      console.error("Failed to address advisor notes:", e);
+      const message = e instanceof Error ? e.message : String(e);
+      addNotice({
+        type: "error",
+        message: /unknown command|unsupported command/i.test(message)
+          ? translate("messageView.advisorContinueUnsupported")
+          : message,
+      });
+      agentRunningRef.current = false;
+      catchUp.invalidate();
+      eventCoalescer.reset();
+      setAgentRunning(false);
+      setAgentPhase(null);
+      clearLiveToolResults();
+      lastQuotaErrorRef.current = null;
+      lastRunErrorRef.current = null;
+      runErrorAssistantRef.current = null;
+      independentRunErrorRef.current = null;
+      dispatch({ type: "end" });
+    } finally {
+      setAddressingAdvisor(false);
+    }
+  }, [addNotice, catchUp, eventCoalescer, ensureEventsConnected, refreshSubagentRoster, registerHostTools, registerHostUriSchemes, snapshotRunEntries, clearLiveToolResults, clearTerminalReconcileTimer]);
+
   const handleAbortCompaction = useCallback(async () => {
     const sid = sessionIdRef.current;
     if (!sid) return;
@@ -4922,7 +5026,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     isCompacting, compactError, compactResult, tokensPerSecond, currentModel, displayModel, isAutoModelSelection: !displayModel, sessionStats, agentPhase,
     slashCommands, slashCommandsLoading, queuedMessages, hostStatus,
     notices: noticeState.visible, dismissNotice, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
-    advisorActive: advisorActiveAt > 0, advisorEnabled, handleAdvisorChange,
+    advisorActive: advisorActiveAt > 0, advisorEnabled, handleAdvisorChange, addressingAdvisor, handleAddressAdvisor,
     subagents, subagentEvents, subagentTranscriptVersions, activeSubagentCount, currentTodoPhase, todoPhases,
     activeGoal, activePlan,
     isNew,

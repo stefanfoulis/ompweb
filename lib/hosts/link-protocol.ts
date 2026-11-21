@@ -72,6 +72,7 @@ export const HISTORY_MUTATING_COMMANDS = new Set([
   "reload", "bash", "abort_bash", "handoff", "set_todos", "set_session_name",
   "set_model", "cycle_model", "set_thinking_level", "cycle_thinking_level",
   "set_fast_mode", "set_slow_mode", "set_auto_compaction", "set_auto_retry", "abort_retry",
+  "continue",
 ]);
 /** Commands whose user message a peer's identical echo could be mistaken for. */
 export const MESSAGE_COMMANDS = new Set(["prompt", "steer", "follow_up", "followUp", "abort_and_prompt"]);

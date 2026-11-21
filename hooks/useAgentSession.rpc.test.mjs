@@ -8581,3 +8581,81 @@ test("an offline send follows its held bubble when the worker list arrives befor
   assert.ok(followed > 0, "a committed Send follows the held bubble without waiting for another server frame");
 });
 
+
+test("handleAddressAdvisor posts continue/advisor and marks the run started exactly like a normal prompt", async () => {
+  resetWorld();
+  primeSession("s1", [
+    userMsg("u0", "question"),
+    assistantMsg("a1", "answer"),
+    { role: "custom", customType: "advisor", content: "Consider X.", display: true },
+  ]);
+  const w = await mountSession("s1");
+  assert.equal(w.latest.agentRunning, false);
+
+  // An idle session's SSE stream is not auto-connected on mount (see the
+  // mount effect in useAgentSession.ts) — handleAddressAdvisor must open one
+  // itself, same as handleSend's existing-session branch.
+  let addressPromise;
+  await act(async () => {
+    addressPromise = w.latest.handleAddressAdvisor();
+    await sleep(30); // let the pre-connect get_state POST settle
+  });
+  const es = lastEs();
+  assert.ok(es, "an EventSource must have been created");
+  await act(async () => {
+    es.open();
+    await addressPromise;
+  });
+
+  assert.equal(w.latest.agentRunning, true, "optimistic running state, same as a normal prompt");
+  const continueCalls = callsTo("POST", "/api/agent/s1").filter((c) => c.body?.type === "continue");
+  assert.equal(continueCalls.length, 1);
+  assert.deepEqual(continueCalls[0].body, { type: "continue", reason: "advisor" });
+
+  // The resumed turn reports agent_start/agent_end over that same stream,
+  // exactly like a normal prompt — not a second, parallel state machine.
+  await act(async () => {
+    es.emit({ type: "agent_start" });
+    es.emit({ type: "agent_end", isTerminal: true });
+  });
+  await settle();
+  assert.equal(w.latest.agentRunning, false);
+});
+
+test("handleAddressAdvisor surfaces a localized notice when this omp build does not support `continue`", async () => {
+  resetWorld();
+  primeSession("s1", [
+    userMsg("u0", "question"),
+    assistantMsg("a1", "answer"),
+    { role: "custom", customType: "advisor", content: "Consider X.", display: true },
+  ]);
+  const w = await mountSession("s1");
+  // Only the `continue` POST fails — the preceding get_state check (which
+  // also POSTs to the same URL) must keep succeeding via the default stub.
+  world.holds.push({
+    match: (method, url) => method === "POST" && url === "/api/agent/s1" && world.calls.at(-1)?.body?.type === "continue",
+    produce: async () => ({ status: 400, value: { error: "Unknown command: continue" } }),
+  });
+
+  let addressPromise;
+  await act(async () => {
+    addressPromise = w.latest.handleAddressAdvisor();
+    await sleep(30);
+  });
+  const es = lastEs();
+  await act(async () => {
+    es.open();
+    await addressPromise;
+  });
+
+  assert.ok(
+    w.latest.notices.some((n) => n.type === "error" && /can.?t resume/i.test(n.message)),
+    "a localized notice must explain this omp version cannot resume for advisor notes",
+  );
+  assert.equal(
+    w.latest.notices.some((n) => /Unknown command/i.test(n.message)),
+    false,
+    "the raw omp error text must not leak to the user",
+  );
+  assert.equal(w.latest.agentRunning, false, "a failed continue must roll back the optimistic running state");
+});

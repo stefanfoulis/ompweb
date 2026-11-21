@@ -1,7 +1,7 @@
 "use client";
 
 import { memo, useState, useId, useRef, useEffect, useLayoutEffect, useMemo, useCallback, useContext, type ComponentProps } from "react";
-import { Copy, Check, GitFork, CornerUpLeft, ChevronRight, ChevronDown, Brain, EyeOff, CircleAlert, CircleSlash, Clock, LoaderCircle, FileText, Search, FileEdit, Terminal, CheckSquare, Bot, Code2, Globe, MessagesSquare, Wrench, Volume2, Square, Trash2, Paperclip, RotateCcw } from "lucide-react";
+import { Copy, Check, GitFork, CornerUpLeft, CornerDownLeft, ChevronRight, ChevronDown, Brain, EyeOff, CircleAlert, CircleSlash, Clock, LoaderCircle, FileText, Search, FileEdit, Terminal, CheckSquare, Bot, Code2, Globe, MessagesSquare, Wrench, Volume2, Square, Trash2, Paperclip, RotateCcw } from "lucide-react";
 import { MarkdownBody } from "./MarkdownBody";
 import { WorkspaceFileContext } from "@/lib/workspace-file-context";
 import { AgentLinkContext, agentLinkIds } from "../lib/agent-links";
@@ -10,7 +10,7 @@ import { useSpeechContext } from "@/hooks/useSpeechSynthesis";
 import { ClickableImage } from "./ImageLightbox";
 import { translate, useI18n, type Locale } from "@/lib/i18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
-import { isEmptyThinkingBlock, isReplyBlock } from "@/lib/message-display";
+import { DEVELOPER_MARKER_CUSTOM_TYPE, isEmptyThinkingBlock, isReplyBlock } from "@/lib/message-display";
 import { isPassiveToolContext } from "@/lib/chat-transcript-plan";
 import { Tooltip, Collapsible, CollapsibleTrigger } from "./ui/primitives";
 import { ConfirmDialog } from "./ui/field";
@@ -189,6 +189,14 @@ interface Props {
   sourceBlockIndices?: number[];
   /** omp-reported output throughput (get_state.tokensPerSecond), live while streaming. */
   liveTokensPerSecond?: number | null;
+  /** True only for the one advisor card this should render the "Have the
+   *  agent address this" button on — ChatWindow computes the predicate
+   *  (lib/chat-transcript-plan.ts's lastUnaddressedAdvisorIndex) plus the
+   *  session-idle gate and passes it down per row, same pattern as onFork. */
+  canAddressAdvisor?: boolean;
+  onAddressAdvisor?: () => void;
+  /** True while a `continue` RPC triggered by this button is in flight. */
+  addressingAdvisor?: boolean;
 }
 
 function formatTime(ts: number | undefined, locale: Locale): string | null {
@@ -247,10 +255,13 @@ export function areMessageViewPropsEqual(prev: Props, next: Props): boolean {
     && Object.is(prev.expandThinkingByDefault, next.expandThinkingByDefault)
     && Object.is(prev.hideThinking, next.hideThinking)
     && prev.sourceBlockIndices?.join() === next.sourceBlockIndices?.join()
+    && Object.is(prev.canAddressAdvisor, next.canAddressAdvisor)
+    && Object.is(prev.onAddressAdvisor, next.onAddressAdvisor)
+    && Object.is(prev.addressingAdvisor, next.addressingAdvisor)
     && (!prev.isStreaming || Object.is(prev.liveTokensPerSecond, next.liveTokensPerSecond));
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkEditsPrompt, onFork, forking, forkDisabled, onEdit, editing, editDisabled, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond }: Props) {
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkEditsPrompt, onFork, forking, forkDisabled, onEdit, editing, editDisabled, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond, canAddressAdvisor, onAddressAdvisor, addressingAdvisor }: Props) {
   if (message.role === "user") {
     const user = message as UserMessage;
     if (user.origin) return <OriginMessageView message={user} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} entryId={entryId} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
@@ -274,7 +285,17 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     if (custom.display === false) {
       return <HiddenExtensionView message={custom} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} />;
     }
-    return <CustomMessageView message={custom} cwd={cwd} onOpenFile={onOpenFile} sessionId={sessionId} />;
+    return (
+      <CustomMessageView
+        message={custom}
+        cwd={cwd}
+        onOpenFile={onOpenFile}
+        sessionId={sessionId}
+        canAddressAdvisor={canAddressAdvisor}
+        onAddressAdvisor={onAddressAdvisor}
+        addressingAdvisor={addressingAdvisor}
+      />
+    );
   }
   if (message.role === "bashExecution") {
     return <BashExecutionView message={message as BashExecutionMessage} sessionId={sessionId} entryId={entryId} />;
@@ -351,6 +372,45 @@ function ForkSessionButton({ entryId, editPrompt, onFork, forking, forkDisabled 
       </button>
     </Tooltip>
     </>
+  );
+}
+
+/**
+ * Resumes the agent on the hidden `continue` RPC directive so it acts on the
+ * advisor notes above. ChatWindow only passes a truthy `onAddressAdvisor` to
+ * the one advisor card this should render on (lastUnaddressedAdvisorIndex +
+ * session-idle), so the card itself just renders when asked.
+ */
+function AddressAdvisorButton({ onAddressAdvisor, addressing }: {
+  onAddressAdvisor: () => void;
+  addressing?: boolean;
+}) {
+  const { t } = useI18n();
+  const label = addressing ? t("messageView.advisorAddressing") : t("messageView.advisorAddressButton");
+  return (
+    <Tooltip content={t("messageView.advisorAddressTooltip")}>
+      <button
+        onClick={onAddressAdvisor}
+        disabled={addressing}
+        aria-label={label}
+        style={{
+          display: "flex", alignItems: "center", gap: 4,
+          padding: "3px 8px", height: 24, minHeight: 24,
+          background: "none", border: "none",
+          borderRadius: 5,
+          color: addressing ? "var(--accent)" : "var(--text-dim)",
+          cursor: addressing ? "not-allowed" : "pointer",
+          fontSize: 11, fontWeight: 400,
+          whiteSpace: "nowrap",
+          transition: "color var(--dur-fast) var(--ease-out-warm)",
+        }}
+        onMouseEnter={(e) => { if (!addressing) e.currentTarget.style.color = "var(--accent)"; }}
+        onMouseLeave={(e) => { if (!addressing) e.currentTarget.style.color = "var(--text-dim)"; }}
+      >
+        <CornerDownLeft size={11} strokeWidth={1.8} />
+        {label}
+      </button>
+    </Tooltip>
   );
 }
 function UserMessageView({ message, cwd, onOpenFile, sessionId, entryId, onFork, forking, forkDisabled, onEdit, editing, editDisabled }: {
@@ -1566,6 +1626,10 @@ function contextLine(
 }
 
 function friendlyHiddenLabel(customType: string, t: (key: string) => string): string {
+  // The `continue` RPC's synthetic resume directive is the one hidden custom
+  // type with a localized label (messageView.advisorResumeMarker) rather than
+  // a static English string in the map below.
+  if (customType === DEVELOPER_MARKER_CUSTOM_TYPE) return t("messageView.advisorResumeMarker");
   const map: Record<string, string> = {
     "mid-run-todo-nudge": "Todo reminder",
     "todo-error-reminder": "Todo reminder",
@@ -1776,7 +1840,15 @@ function HiddenExtensionView({ message, cwd, onOpenFile, sessionId }: { message:
   );
 }
 
-function CustomMessageView({ message, cwd, onOpenFile, sessionId }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string) => void; sessionId?: string }) {
+function CustomMessageView({ message, cwd, onOpenFile, sessionId, canAddressAdvisor, onAddressAdvisor, addressingAdvisor }: {
+  message: CustomMessage;
+  cwd?: string;
+  onOpenFile?: (filePath: string) => void;
+  sessionId?: string;
+  canAddressAdvisor?: boolean;
+  onAddressAdvisor?: () => void;
+  addressingAdvisor?: boolean;
+}) {
   const { t, locale } = useI18n();
   // Reminders and job notices are activity, as in the TUI: start collapsed to
   // their first line; the header toggles them like a tool call.
@@ -1936,6 +2008,9 @@ function CustomMessageView({ message, cwd, onOpenFile, sessionId }: { message: C
               {copied ? t("messageView.copied") : t("messageView.copy")}
             </button>
           ) : null}
+          {message.customType === "advisor" && canAddressAdvisor && onAddressAdvisor && (
+            <AddressAdvisorButton onAddressAdvisor={onAddressAdvisor} addressing={addressingAdvisor} />
+          )}
           {hasDetails && (
             <button
               onClick={() => {

@@ -1,5 +1,5 @@
 import { stripAnsi } from "./ansi";
-import { getDisplayableAssistantBlocks, isReplyBlock } from "./message-display";
+import { DEVELOPER_MARKER_CUSTOM_TYPE, getDisplayableAssistantBlocks, isReplyBlock } from "./message-display";
 import type { AgentMessage, AssistantContentBlock, AssistantMessage, CustomMessage, ToolResultMessage } from "./types";
 
 /**
@@ -48,9 +48,17 @@ export interface PlanOptions {
 // producing tool calls and answers with no user message left to anchor them.
 // Treat a compaction summary as an anchor too, otherwise every
 // post-compaction message renders standalone and never folds.
+//
+// The `continue` RPC's synthetic developer-marker anchors a resumed turn the
+// same way: it is a hidden directive, not a user message, but omp still runs
+// a full turn in response to it. Anchoring keeps the marker itself visible as
+// the resumed turn's header instead of folding it — together with everything
+// the resume produced — into the preceding turn's activity group.
 export function isGroupAnchor(message: AgentMessage): boolean {
   if (message.role === "user") return true;
-  return message.role === "custom" && (message as CustomMessage).customType === "compaction";
+  if (message.role !== "custom") return false;
+  const customType = (message as CustomMessage).customType;
+  return customType === "compaction" || customType === DEVELOPER_MARKER_CUSTOM_TYPE;
 }
 
 /** Split one anchored turn into text and folded-activity segments. */
@@ -269,4 +277,28 @@ export function planTranscriptRows(messages: AgentMessage[], options: PlanOption
     idx = endIdx;
   }
   return rows;
+}
+
+/**
+ * Index of the advisor card ChatWindow's "Have the agent address this" button
+ * should appear on, or -1 if none qualifies. An advisor card is unaddressed
+ * only while it sits in the transcript tail after the last user, assistant,
+ * or developer-role message (plain "developer" or the `continue` directive's
+ * "developer-marker") — once any of those appear, every earlier advisor card
+ * in that run has already been seen/acted on. Scanning from the end, the
+ * first advisor card found before any closing message is the last one in the
+ * tail; other roles/custom types (toolResult, compaction, …) do not close it.
+ * Callers still gate on session idle separately — this only reads structure.
+ */
+export function lastUnaddressedAdvisorIndex(messages: AgentMessage[]): number {
+  for (let idx = messages.length - 1; idx >= 0; idx--) {
+    const message = messages[idx];
+    if (message.role === "user" || message.role === "assistant") return -1;
+    if (message.role === "custom") {
+      const customType = (message as CustomMessage).customType;
+      if (customType === "advisor") return idx;
+      if (customType === "developer" || customType === DEVELOPER_MARKER_CUSTOM_TYPE) return -1;
+    }
+  }
+  return -1;
 }

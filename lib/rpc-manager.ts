@@ -182,6 +182,7 @@ const PASSTHROUGH_COMMANDS = new Set([
   "btw_cancel",
   "get_btw_history",
   "get_client_message_status",
+  "continue",
 ]);
 
 // Outlasts omp's cold prediction-daemon start (up to 3 × 30s start rounds plus a

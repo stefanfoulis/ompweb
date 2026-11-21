@@ -27,6 +27,7 @@ import type {
 } from "./types";
 import { normalizeToolCalls } from "./normalize";
 import { isRecord } from "./type-guards";
+import { DEVELOPER_MARKER_CUSTOM_TYPE } from "./message-display";
 import { toolResultContentAsUrls } from "./media-cache";
 import { taskResultRetryFailure, taskResultStructuredOutput, taskResultUsageCost } from "./task-result-details";
 import type { TodoPhase } from "./pi-types";
@@ -1273,11 +1274,17 @@ export function entryToUiMessage(
         // Passive tool context is display-only: it rides on its tool card
         // (collectToolResults), never as a row or in copied transcripts.
         const passive = raw.passiveToolContext === true;
+        // omp's `continue` RPC command resumes the agent via a hidden,
+        // synthetic directive (the only client trigger is the advisor-card
+        // button) — render it as the collapsed "hidden" marker row instead of
+        // the full custom-message card other role:"developer" content (e.g.
+        // steering envelopes) still gets.
+        const synthetic = raw.synthetic === true;
         return {
           role: "custom",
-          customType: passive ? PASSIVE_TOOL_CONTEXT : "developer",
+          customType: passive ? PASSIVE_TOOL_CONTEXT : synthetic ? DEVELOPER_MARKER_CUSTOM_TYPE : "developer",
           content: raw.content,
-          display: !passive,
+          display: !passive && !synthetic,
           timestamp: normalizeMessageTimestamp(raw.timestamp),
         };
       }

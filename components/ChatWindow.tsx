@@ -5,7 +5,7 @@ import { Fragment, memo, useCallback, useEffect, useMemo, useReducer, useRef, us
 import { ArrowDown, ChevronDown, ChevronUp, Paperclip, Square } from "lucide-react";
 import type { AgentMessage, AssistantMessage, SessionInfo, SessionTreeNode, ToolResultMessage, UiCustomFrame } from "@/lib/types";
 import { translate, useI18n } from "@/lib/i18n";
-import { collectToolResults, isGroupAnchor, planTranscriptRows, type TranscriptRow } from "@/lib/chat-transcript-plan";
+import { collectToolResults, isGroupAnchor, lastUnaddressedAdvisorIndex, planTranscriptRows, type TranscriptRow } from "@/lib/chat-transcript-plan";
 import { isReplyBlock } from "@/lib/message-display";
 import { resolveForkTargets } from "@/lib/chat-fork";
 import { renderTranscriptGroupRow, type RenderMessage } from "./ChatWindow-transcript-group-row";
@@ -237,6 +237,11 @@ interface CommittedTranscriptProps {
   modelNames: Record<string, string>;
   messageCwd: string | undefined;
   onOpenFile?: (filePath: string) => void;
+  /** Handler for the advisor card's "Have the agent address this" button
+   *  (continue RPC, reason "advisor"); undefined hides the button entirely. */
+  onAddressAdvisor?: () => void;
+  /** True while a request started by onAddressAdvisor is in flight. */
+  addressingAdvisor?: boolean;
   sessionId: string | undefined;
   toolCallsDefaultCollapsed: boolean;
   /** Fold a running turn's tool calls; off restores the flat live tail. */
@@ -265,11 +270,17 @@ const CommittedTranscript = memo(function CommittedTranscript({
   messages, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, isCompacting, externalRunActive, isNew, forkingEntryId, editingEntryId,
   handleFork, handleEdit, modelNames, messageCwd, onOpenFile, sessionId,
   toolCallsDefaultCollapsed, hideToolActivity, neverFoldActivity, showToolCallsUnfolded, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
+  onAddressAdvisor, addressingAdvisor,
 }: CommittedTranscriptProps) {
   const { t } = useI18n();
   const { toolResultsMap, lastAnchorIdx, visibleRefIndexByMessage } = conversationMeta;
   // omp's `branch` command accepts a user entry only; see lib/chat-fork.ts.
   const forkTargets = useMemo(() => resolveForkTargets(messages, entryIds), [messages, entryIds]);
+  // The advisor-card button appears only on the single last advisor card
+  // still sitting unaddressed at the end of the transcript, and only while
+  // idle — a running/streaming turn means the agent is already acting (or
+  // about to), so address-again would race it.
+  const addressableAdvisorIdx = !sessionBusy && !isStreaming ? lastUnaddressedAdvisorIndex(messages) : -1;
 
   const attachVisibleRef = (idx: number, refIndex: number) => (el: HTMLDivElement | null) => {
     messageRefs.current[refIndex] = el;
@@ -315,6 +326,9 @@ const CommittedTranscript = memo(function CommittedTranscript({
         onFork={canOfferFork ? handleFork : undefined}
         forking={forkingEntryId === forkTarget?.entryId}
         forkDisabled={historyMutationPending}
+        canAddressAdvisor={idx === addressableAdvisorIdx}
+        onAddressAdvisor={onAddressAdvisor}
+        addressingAdvisor={addressingAdvisor}
         onEdit={canOfferEdit ? handleEdit : undefined}
         editing={editingEntryId === entryIds[idx]}
         editDisabled={historyMutationPending}
@@ -476,7 +490,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, newSessio
     liveModelMeta,
     retryInfo, contextUsage, forkingEntryId, editingEntryId,
     isCompacting, compactResult, tokensPerSecond, displayModel: displayModelValue, sessionStats,
-    slashCommands, slashCommandsLoading, queuedMessages, advisorActive, advisorEnabled, handleAdvisorChange,
+    slashCommands, slashCommandsLoading, queuedMessages, advisorActive, advisorEnabled, handleAdvisorChange, addressingAdvisor, handleAddressAdvisor,
     notices, dismissNotice, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
     isAutoModelSelection,
     agentPhase, activeGoal, activePlan,
@@ -1344,6 +1358,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, newSessio
               modelNames={modelNames}
               messageCwd={messageCwd}
               onOpenFile={onOpenFile}
+              onAddressAdvisor={handleAddressAdvisor}
+              addressingAdvisor={addressingAdvisor}
               sessionId={session?.id ?? sessionIdRef.current ?? undefined}
               toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
               hideToolActivity={hideToolActivity}
