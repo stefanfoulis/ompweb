@@ -1,8 +1,8 @@
 import "../tests/setup-dom.mjs";
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
+import test, { afterEach, before } from "node:test";
 import React from "react";
-const { cleanup, render, screen } = await import("@testing-library/react/pure.js");
+const { cleanup, render, screen, waitFor } = await import("@testing-library/react/pure.js");
 const { default: userEvent } = await import("@testing-library/user-event");
 
 // omp's `askDialog` is answered by the tabbed panel: one tab per question, a
@@ -10,6 +10,12 @@ const { default: userEvent } = await import("@testing-library/user-event");
 const { AskDialog } = await import("./AskDialog.tsx");
 
 afterEach(cleanup);
+before(() => {
+  // jsdom has no pointer capture; the resize handle calls it on every drag.
+  window.Element.prototype.setPointerCapture = () => {};
+  window.Element.prototype.hasPointerCapture = () => false;
+  window.Element.prototype.releasePointerCapture = () => {};
+});
 
 function makeRequest(questions, extra) {
   return { type: "ui_request", id: 1, method: "askDialog", args: [questions], ...extra };
@@ -300,4 +306,137 @@ test("the arrow keys walk the tab strip, and the title counts the timeout down",
   assert.equal(screen.getByRole("tab", { name: /Two/ }).getAttribute("aria-selected"), "true");
   await user.keyboard("{ArrowRight}{ArrowRight}");
   assert.equal(screen.getByRole("tab", { name: /One/ }).getAttribute("aria-selected"), "true", "the strip wraps around");
+});
+
+test("expand never remounts the panel: a formDialog's chosen radio, checkbox and notes survive expand and Escape-shrink, and submit carries them (not the HTML defaults)", async () => {
+  localStorage.clear();
+  const user = userEvent.setup();
+  let response;
+  const request = {
+    type: "ui_request",
+    id: 1,
+    method: "formDialog",
+    args: [`<form>
+      <p>Which database?</p>
+      <label><input type="radio" name="db" value="sqlite"> SQLite</label>
+      <label><input type="radio" name="db" value="pg" checked> Postgres</label>
+      <p>Which features?</p>
+      <label><input type="checkbox" name="features" value="auth"> Auth</label>
+      <label><input type="checkbox" name="features" value="search"> Search</label>
+      <label>Notes <textarea name="notes"></textarea></label>
+    </form>`],
+  };
+  const { container } = render(React.createElement(AskDialog, {
+    request,
+    onRespond: (_request, value) => { response = value; },
+    attached: true,
+  }));
+
+  // Picking SQLite overrides the HTML default (Postgres, `checked`) and moves
+  // on to Features, as a single-select radio does.
+  await user.click(screen.getByRole("radio", { name: "SQLite" }));
+  await user.click(screen.getByRole("tab", { name: /Which database/ }));
+  assert.equal(screen.getByRole("radio", { name: "SQLite" }).checked, true);
+
+  await user.click(screen.getByRole("tab", { name: /Which features/ }));
+  await user.click(screen.getByRole("checkbox", { name: "Auth" }));
+  await user.click(screen.getByRole("tab", { name: /Notes/ }));
+  await user.type(screen.getByRole("textbox", { name: /Notes/ }), "needs backups");
+
+  await user.click(screen.getByRole("button", { name: "Expand" }));
+  const expandedDialog = screen.getByRole("dialog");
+  assert.equal(container.contains(expandedDialog), true, "expanding keeps the panel in its own DOM subtree — never a remount");
+  assert.equal(screen.getByRole("textbox", { name: /Notes/ }).value, "needs backups", "the active tab's answer survives expand");
+
+  expandedDialog.focus();
+  await user.keyboard("{Escape}");
+  assert.equal(response, undefined, "Escape while expanded must not cancel or submit the dialog");
+  // Shrinking back hands focus to the panel on the next frame; wait for it so
+  // that focus move cannot land after the assertions below.
+  await waitFor(() => assert.equal(document.activeElement, screen.getByRole("dialog")));
+
+  // Still the same native controls, their values intact after shrinking back —
+  // nothing was ever recreated from the form's HTML defaults.
+  await user.click(screen.getByRole("tab", { name: /Which database/ }));
+  assert.equal(screen.getByRole("radio", { name: "SQLite" }).checked, true, "the radio answer survives expand and shrink");
+  await user.click(screen.getByRole("tab", { name: /Which features/ }));
+  assert.equal(screen.getByRole("checkbox", { name: "Auth" }).checked, true, "the checkbox answer survives expand and shrink");
+
+  await user.click(screen.getByRole("tab", { name: "Review" }));
+  await user.click(screen.getByRole("button", { name: "Submit" }));
+  assert.deepEqual(response, { data: { db: "sqlite", features: ["auth"], notes: "needs backups" } });
+  localStorage.clear();
+});
+
+test("expand moves the panel to a fixed, near-fullscreen view, Escape shrinks it back without responding, and the resize handle resizes and resets", async () => {
+  localStorage.clear();
+  const user = userEvent.setup();
+  let response;
+  const { container } = render(React.createElement(AskDialog, {
+    request: makeRequest([
+      { id: "q1", question: "Pick a color", options: [{ label: "Red" }, { label: "Blue" }] },
+      { id: "q2", question: "Pick a size", options: [{ label: "Small" }, { label: "Large" }] },
+    ]),
+    onRespond: (_request, value) => { response = value; },
+    attached: true,
+  }));
+
+  // A single-select pick advances to the next tab; come back so the chosen
+  // option is visible across the expand below.
+  await user.click(screen.getByRole("radio", { name: "Red" }));
+  await user.click(screen.getByRole("tab", { name: /Pick a color/ }));
+  assert.equal(screen.getByRole("radio", { name: "Red" }).checked, true);
+
+  await user.click(screen.getByRole("button", { name: "Expand" }));
+  const expandedDialog = screen.getByRole("dialog");
+  assert.equal(container.contains(expandedDialog), true, "the panel stays in place; only its CSS switches to fixed/near-fullscreen");
+  assert.equal(screen.getByRole("radio", { name: "Red" }).checked, true, "answers and tab state survive expanding");
+  assert.equal(screen.queryByRole("separator"), null, "the expanded view fills the screen: nothing to resize");
+
+  expandedDialog.focus();
+  await user.keyboard("{Escape}");
+  assert.equal(response, undefined, "Escape while expanded must not cancel or submit the dialog");
+  // Shrinking back hands focus to the panel on the next frame; wait for it so
+  // that focus move cannot land after the handle is focused below.
+  await waitFor(() => assert.equal(document.activeElement, screen.getByRole("dialog")));
+
+  const handle = screen.getByRole("separator", { name: "Resize (drag, double-click to reset)" });
+  handle.focus();
+  await user.keyboard("{ArrowUp}");
+  const panel = screen.getByRole("dialog");
+  // jsdom reports 0 for getBoundingClientRect, so the +24 step lands below
+  // the floor, and the floor itself is what the handle settles on.
+  assert.equal(panel.style.height, "160px");
+  assert.equal(localStorage.getItem("omp-web:ask-dialog-height"), "160");
+
+  await user.dblClick(handle);
+  assert.equal(screen.getByRole("dialog").style.height, "");
+
+  localStorage.clear();
+});
+
+test("a click on the expanded backdrop shrinks back too, and the choice is remembered", async () => {
+  localStorage.clear();
+  const user = userEvent.setup();
+  const responses = [];
+  const props = {
+    request: makeRequest([{ id: "q1", question: "Pick a color", options: [{ label: "Red" }, { label: "Blue" }] }]),
+    onRespond: (_request, value) => { responses.push(value); },
+    attached: true,
+  };
+  const { unmount } = render(React.createElement(AskDialog, props));
+
+  await user.click(screen.getByRole("button", { name: "Expand" }));
+  assert.equal(localStorage.getItem("omp-web:ask-dialog-expanded"), "1");
+  // The backdrop is the panel's own wrapper, grown fixed and near-fullscreen around it.
+  await user.click(screen.getByRole("dialog").parentElement);
+  assert.deepEqual(responses, [], "a stray click must not discard the answers");
+  assert.equal(screen.queryByRole("separator"), screen.getByRole("dialog").firstChild, "the grip is back on the attached panel");
+
+  // The next question opens the way the user left this one.
+  localStorage.setItem("omp-web:ask-dialog-expanded", "1");
+  unmount();
+  render(React.createElement(AskDialog, props));
+  assert.ok(screen.getByRole("button", { name: "Shrink back" }));
+  localStorage.clear();
 });

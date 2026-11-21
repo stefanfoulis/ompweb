@@ -97,6 +97,24 @@ test("answers survive moving between tabs, because every control stays mounted",
   assert.equal(response.data.replicas, 5);
 });
 
+test("a radio pick decides the question outright and moves on, as the plain askDialog radios do; a checkbox pick does not", async () => {
+  const user = userEvent.setup();
+  renderForm(`<form>
+    <p>Which database?</p>
+    <label><input type="radio" name="db" value="sqlite"> SQLite</label>
+    <label><input type="radio" name="db" value="pg"> Postgres</label>
+    <p>Which features?</p>
+    <label><input type="checkbox" name="features" value="auth"> Auth</label>
+    <label><input type="checkbox" name="features" value="search"> Search</label>
+  </form>`);
+
+  await user.click(screen.getByRole("radio", { name: /SQLite/ }));
+  assert.equal(screen.getByRole("tab", { name: /Which features/ }).getAttribute("aria-selected"), "true");
+
+  await user.click(screen.getByRole("checkbox", { name: /Auth/ }));
+  assert.equal(screen.getByRole("tab", { name: /Which features/ }).getAttribute("aria-selected"), "true", "a checkbox never decides the question alone, so it never moves the tab on its own");
+});
+
 test("form options preserve preformatted text and indentation", () => {
   renderForm(`<form><label><input type="radio" name="choice" value="one"> Example <pre>first line\n  indented second line</pre></label></form>`);
   const pre = screen.getByRole("radio", { name: /Example/ }).closest("label").querySelector("pre");
@@ -230,6 +248,8 @@ test("notes go out as omp's OptionNote list, only for answers that were given", 
   </form>`, (_request, value) => { response = value; });
 
   await user.click(screen.getByRole("radio", { name: /Postgres/ }));
+  // A radio pick advances to the next tab; come back to note the answer just given.
+  await user.click(screen.getByRole("tab", { name: /Which database/ }));
   await user.click(screen.getByRole("button", { name: "Add note" }));
   await user.type(screen.getByPlaceholderText("Add a note…"), "already running here");
   await user.keyboard("{Enter}");

@@ -2112,5 +2112,8 @@
   "askDialog.errorMaxLength": "最多 {count} 個字元",
   "askDialog.errorEmail": "請輸入電子郵件地址",
   "askDialog.errorUrl": "請輸入完整的 URL",
-  "askDialog.errorPattern": "必須符合 {pattern}"
+  "askDialog.errorPattern": "必須符合 {pattern}",
+  "askDialog.expand": "放大",
+  "askDialog.collapse": "還原",
+  "askDialog.resize": "調整大小（拖曳，按兩下重設）"
 }

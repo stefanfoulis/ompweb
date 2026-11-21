@@ -24,6 +24,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 - **Retry a failed turn with one click.** A turn that failed on an API problem (an expired key, a dropped connection) shows **Retry** in its error banner, which runs omp's `/retry` on that turn without retyping the prompt.
 - **Fork from any message, even while the agent is working.** The **Fork a new session from this point** button no longer waits for the run to finish: forking now writes a new session file cut at the chosen row, inclusive, without touching the live session, so the running turn keeps streaming and the fork opens right away. Forking an agent reply keeps that reply; forking one of your prompts keeps everything before it and puts the prompt back in the new session's message box, ready to edit and send again.
 - **Questions are answered in a tabbed panel.** omp's `ask` tool now opens one tab per question (or per named control of its form) plus a Review tab, so a long form is read one question at a time and nothing is submitted until Review. Each answer takes a note of its own, which travels to the agent beside the submission, and **Chat about this** asks the agent to discuss the question instead of answering it.
+- **Resizable ask panel.** Drag the top edge of the ask panel to give questions and previews more room (double-click resets), or expand it to a near-fullscreen overlay; Escape, a click beside it or the shrink button brings it back without losing answers. The size and expanded state are remembered per browser.
 
 ## [v0.7.4] - 2026-11-20
 

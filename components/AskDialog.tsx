@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { Maximize2, Minimize2 } from "lucide-react";
 import type { HtmlFormData, OptionNote, RpcAskDialogQuestion } from "@/lib/pi-types";
 import type { UiAskDialogResult, UiDialogRequest, UiDialogValue } from "@/lib/types";
 import { useI18n } from "@/lib/i18n";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { getAskDialogExpanded, getAskDialogHeight, setAskDialogExpanded, setAskDialogHeight } from "@/lib/composer-prefs";
 import { shouldDeferAttachedFocus, useKeyboardPressGuard, useMobileInputOpen, useViewportMaxHeight } from "./ExtensionDialog";
 import { planForm, planFormTabs, readFormData, syncOtherValidity, tabAnswers, tabControls, type FormPlan, type FormTab } from "./html-form";
 
@@ -35,6 +37,18 @@ const MAX_TAB_LABEL_CHARS = 24;
 // Layout-viewport cap for the composer panel. While the soft keyboard is up
 // the panel is capped to the visual viewport instead (see useViewportMaxHeight).
 const ATTACHED_PANEL_MAX_HEIGHT = "min(480px, 65dvh)";
+
+// Resize-handle bounds for the attached panel: short enough that a question
+// with little content is not forced tall, capped near the viewport so a drag
+// cannot push the footer off-screen.
+const ASK_DIALOG_MIN_HEIGHT = 160;
+const ASK_DIALOG_HEIGHT_STEP = 24;
+
+/** Clamps a dragged or stepped panel height to the handle's travel range. */
+function clampAskDialogHeight(px: number): number {
+  const max = typeof window !== "undefined" ? Math.round(window.innerHeight * 0.9) : px;
+  return Math.min(max, Math.max(ASK_DIALOG_MIN_HEIGHT, px));
+}
 
 /** Rows indent their secondary content under the option's checkbox/radio. */
 const ROW_INDENT = 24;
@@ -199,6 +213,11 @@ export function AskDialog({
   const noteInputRef = useRef<HTMLInputElement>(null);
   const viewportMaxHeight = useViewportMaxHeight();
   const pressGuard = useKeyboardPressGuard();
+  // Only meaningful while attached: the full-chat overlay keeps its single
+  // size. Both persist the user's last choice per browser.
+  const [expanded, setExpanded] = useState(() => getAskDialogExpanded());
+  const [customHeight, setCustomHeight] = useState<number | undefined>(() => getAskDialogHeight());
+  const resizeDragRef = useRef<{ startY: number; startHeight: number; height: number } | null>(null);
 
   const tabs = formTabs.length > 0
     // The question names the tab: fields of one fieldset would otherwise all carry its legend.
@@ -378,18 +397,84 @@ export function AskDialog({
       setNoteEditor(null);
       return;
     }
+    // Shrinking back is the safer default: a stray Escape while expanded must
+    // not also discard the answers underneath it.
+    if (attached && expanded) {
+      collapseExpanded();
+      return;
+    }
     cancel();
   };
 
   // A composer-attached request is a regular in-flow panel, not a modal, so
-  // useModalDialog's document-level Escape/Tab handling only applies to the
-  // full overlay.
-  const panelRef = useModalDialog<HTMLDivElement>({ onClose: resolveEscape, active: !attached });
-  const keyboardOpen = useMobileInputOpen(panelRef, attached);
+  // useModalDialog's document-level Escape/Tab handling applies to the full
+  // overlay and to the expanded view, which is one too.
+  const panelRef = useModalDialog<HTMLDivElement>({ onClose: resolveEscape, active: !attached || expanded });
+  const keyboardOpen = useMobileInputOpen(panelRef, attached && !expanded);
   // While the keyboard is up the panel fills the visible area instead of the
   // taller layout-viewport cap, so the footer with Cancel / Chat about this /
   // Submit stays in reach (#236).
-  const attachedMaxHeight = keyboardOpen && viewportMaxHeight !== undefined ? `${viewportMaxHeight}px` : ATTACHED_PANEL_MAX_HEIGHT;
+  const keyboardCapHeight = keyboardOpen && viewportMaxHeight !== undefined ? `${viewportMaxHeight}px` : undefined;
+  const attachedMaxHeight = keyboardCapHeight ?? ATTACHED_PANEL_MAX_HEIGHT;
+  // A resized panel grows past the default cap, up to the viewport — still
+  // shrinking for the on-screen keyboard like the default cap does.
+  const resizedMaxHeight = keyboardCapHeight ?? "90dvh";
+
+  const collapseExpanded = () => {
+    setExpanded(false);
+    setAskDialogExpanded(false);
+    requestAnimationFrame(() => panelRef.current?.focus());
+  };
+
+  const toggleExpanded = () => {
+    const next = !expanded;
+    setExpanded(next);
+    setAskDialogExpanded(next);
+    requestAnimationFrame(() => panelRef.current?.focus());
+  };
+
+  const handleResizePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const startHeight = panel.getBoundingClientRect().height;
+    resizeDragRef.current = { startY: event.clientY, startHeight, height: startHeight };
+  };
+
+  const handleResizePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = resizeDragRef.current;
+    if (!drag) return;
+    // The panel sits at the bottom of the chat column, so dragging the top
+    // edge up (a smaller clientY) must grow it.
+    const next = clampAskDialogHeight(drag.startHeight + (drag.startY - event.clientY));
+    drag.height = next;
+    setCustomHeight(next);
+  };
+
+  const endResizeDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = resizeDragRef.current;
+    if (!drag) return;
+    resizeDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    setAskDialogHeight(drag.height);
+  };
+
+  const handleResizeDoubleClick = () => {
+    resizeDragRef.current = null;
+    setCustomHeight(undefined);
+    setAskDialogHeight(undefined);
+  };
+
+  const handleResizeKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    // Claims the arrows before the tab strip, which moves between questions on the same keys.
+    event.preventDefault();
+    event.stopPropagation();
+    const current = customHeight ?? panelRef.current?.getBoundingClientRect().height ?? ASK_DIALOG_MIN_HEIGHT;
+    const next = clampAskDialogHeight(current + (event.key === "ArrowUp" ? ASK_DIALOG_HEIGHT_STEP : -ASK_DIALOG_HEIGHT_STEP));
+    setCustomHeight(next);
+    setAskDialogHeight(next);
+  };
 
   useEffect(() => {
     if (!attached) return;
@@ -681,7 +766,16 @@ export function AskDialog({
     <form
       key={request.id}
       ref={formRef}
-      onChange={(event) => refreshForm(event.currentTarget)}
+      onChange={(event) => {
+        refreshForm(event.currentTarget);
+        const target = event.target;
+        // A radio pick (not Other's free text) decides the question outright, so
+        // the tab strip advances exactly as the plain askDialog radios do.
+        if (target instanceof HTMLInputElement && target.type === "radio" && target.checked && target.name) {
+          const index = formTabs.findIndex((tab) => tab.key === `radio\0${target.name}`);
+          if (index >= 0) advanceAfterTab(index);
+        }
+      }}
       onSubmit={(event) => { event.preventDefault(); submit(); }}
       className="extension-dialog-form"
     >
@@ -702,141 +796,207 @@ export function AskDialog({
     </>
   );
 
-  return (
+  const panelNode = (
     <div
-      className={attached ? undefined : "animate-fade-in"}
-      onMouseDown={attached ? undefined : (event) => {
-        // Close when the pointer goes down on the backdrop itself (not when
-        // the press starts inside the panel and is dragged out).
-        if (event.target === event.currentTarget) cancel();
+      ref={panelRef}
+      role="dialog"
+      aria-modal={attached && !expanded ? undefined : "true"}
+      aria-label={titleText}
+      tabIndex={-1}
+      onKeyDown={(event) => {
+        // The overlay has useModalDialog's document-level Escape; an
+        // attached panel is not a modal, so it handles its own.
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        resolveEscape();
       }}
-      style={attached ? { width: "100%", flexShrink: 0 } : {
-        position: "absolute",
-        inset: 0,
-        zIndex: 90,
+      // Keeps the phone keyboard up while a text box of this panel has focus.
+      {...pressGuard}
+      className={attached && !expanded ? undefined : "animate-scale-in"}
+      style={{
+        width: attached ? (expanded ? "min(1200px, 100%)" : "100%") : "min(640px, 100%)",
+        boxSizing: "border-box",
+        // Grid/flex children below must be able to shrink: a min-content
+        // question, option or preview is wider than a phone, and without
+        // this the panel grows past its composer column and gets clipped
+        // (#234).
+        minWidth: 0,
         display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 20,
-        background: "var(--overlay-backdrop)",
+        flexDirection: "column",
+        border: "1px solid var(--border)",
+        borderRadius: attached && !expanded ? "var(--radius-card)" : "var(--radius-modal)",
+        background: "var(--bg)",
+        boxShadow: attached && !expanded ? "var(--shadow-card)" : "var(--shadow-modal)",
+        overflow: "hidden",
+        outline: "none",
+        height: attached && expanded ? "100%" : attached && customHeight !== undefined ? `${customHeight}px` : undefined,
+        maxHeight: attached
+          ? (expanded ? "100%" : customHeight !== undefined ? resizedMaxHeight : attachedMaxHeight)
+          : "min(640px, 85dvh)",
       }}
     >
-      <div
-        ref={panelRef}
-        role="dialog"
-        aria-modal={attached ? undefined : "true"}
-        aria-label={titleText}
-        tabIndex={-1}
-        onKeyDown={(event) => {
-          // The overlay has useModalDialog's document-level Escape; an
-          // attached panel is not a modal, so it handles its own.
-          if (event.key !== "Escape") return;
-          event.preventDefault();
-          event.stopPropagation();
-          resolveEscape();
-        }}
-        // Keeps the phone keyboard up while a text box of this panel has focus.
-        {...pressGuard}
-        className={attached ? undefined : "animate-scale-in"}
-        style={{
-          width: attached ? "100%" : "min(640px, 100%)",
-          boxSizing: "border-box",
-          // Grid/flex children below must be able to shrink: a min-content
-          // question, option or preview is wider than a phone, and without
-          // this the panel grows past its composer column and gets clipped
-          // (#234).
-          minWidth: 0,
-          display: "flex",
-          flexDirection: "column",
-          border: "1px solid var(--border)",
-          borderRadius: attached ? "var(--radius-card)" : "var(--radius-modal)",
-          background: "var(--bg)",
-          boxShadow: attached ? "var(--shadow-card)" : "var(--shadow-modal)",
-          overflow: "hidden",
-          outline: "none",
-          maxHeight: attached ? attachedMaxHeight : "min(640px, 85dvh)",
-        }}
-      >
-        <div className="ask-dialog-content" style={{ minWidth: 0, minHeight: 0, flex: "1 1 auto", overflowY: "auto", overflowX: "hidden", overflowWrap: "anywhere" }}>
-          <div className="extension-dialog-header">
-            <div style={{ color: "var(--text)", fontSize: 14, lineHeight: "20px", fontWeight: 650 }}>{titleText}</div>
-          </div>
-
-          <div
-            role="tablist"
-            aria-label={t("askDialog.title")}
-            onKeyDown={handleTabKeyDown}
-            style={{ display: "flex", gap: 4, minWidth: 0, padding: "6px 10px", borderBottom: "1px solid var(--border)", overflowX: "auto", background: "var(--bg-panel)" }}
-          >
-            {tabs.map((tab, index) => {
-              const selected = activeTab === index;
-              const answered = answeredAt(index);
-              return (
-                <button
-                  key={tab.key}
-                  type="button"
-                  role="tab"
-                  id={`ask-tab-${index}`}
-                  aria-selected={selected}
-                  aria-controls={`ask-panel-${index}`}
-                  aria-label={`${tab.label} (${answered ? t("askDialog.answered") : t("askDialog.unanswered")})`}
-                  tabIndex={selected ? 0 : -1}
-                  onClick={() => setActiveTab(index)}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 5,
-                    padding: "5px 9px",
-                    borderRadius: 999,
-                    border: `1px solid ${selected ? "var(--border)" : "transparent"}`,
-                    background: selected ? "var(--bg)" : "transparent",
-                    color: selected ? "var(--text)" : "var(--text-muted)",
-                    cursor: "pointer",
-                    fontSize: 12,
-                    whiteSpace: "nowrap",
-                    flexShrink: 0,
-                  }}
-                >
-                  <span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: 999, background: answered ? "var(--status-success)" : "var(--border)", flexShrink: 0 }} />
-                  {tab.label}
-                </button>
-              );
-            })}
+      {attached && !expanded && (
+        <div
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label={t("askDialog.resize")}
+          aria-valuenow={customHeight}
+          tabIndex={0}
+          onPointerDown={handleResizePointerDown}
+          onPointerMove={handleResizePointerMove}
+          onPointerUp={endResizeDrag}
+          onPointerCancel={endResizeDrag}
+          onDoubleClick={handleResizeDoubleClick}
+          onKeyDown={handleResizeKeyDown}
+          style={{ flexShrink: 0, height: 10, display: "flex", alignItems: "center", justifyContent: "center", cursor: "ns-resize", touchAction: "none" }}
+        >
+          <div aria-hidden="true" style={{ width: 32, height: 3, borderRadius: 2, background: "var(--border)" }} />
+        </div>
+      )}
+      <div className="ask-dialog-content" style={{ minWidth: 0, minHeight: 0, flex: "1 1 auto", overflowY: "auto", overflowX: "hidden", overflowWrap: "anywhere" }}>
+        <div className="extension-dialog-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+          <div style={{ minWidth: 0, color: "var(--text)", fontSize: 14, lineHeight: "20px", fontWeight: 650 }}>{titleText}</div>
+          {attached && (
             <button
               type="button"
-              role="tab"
-              id="ask-tab-review"
-              aria-selected={isReviewTab}
-              aria-controls="ask-panel-review"
-              tabIndex={isReviewTab ? 0 : -1}
-              onClick={() => setActiveTab(reviewTabIndex)}
-              style={{
-                padding: "5px 9px",
-                borderRadius: 999,
-                border: `1px solid ${isReviewTab ? "var(--border)" : "transparent"}`,
-                background: isReviewTab ? "var(--bg)" : "transparent",
-                color: isReviewTab ? "var(--text)" : "var(--text-muted)",
-                cursor: "pointer",
-                fontSize: 12,
-                whiteSpace: "nowrap",
-                flexShrink: 0,
-              }}
+              onClick={toggleExpanded}
+              aria-label={expanded ? t("askDialog.collapse") : t("askDialog.expand")}
+              title={expanded ? t("askDialog.collapse") : t("askDialog.expand")}
+              aria-pressed={expanded}
+              style={{ display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, padding: 4, border: "none", background: "transparent", color: "var(--text-muted)", cursor: "pointer" }}
             >
-              {t("askDialog.review")}
+              {expanded ? <Minimize2 size={14} aria-hidden="true" /> : <Maximize2 size={14} aria-hidden="true" />}
             </button>
-          </div>
-
-          <div style={{ padding: 14 }}>{panels}</div>
-        </div>
-
-        <div className="extension-dialog-footer" style={{ display: "flex", flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end", gap: 8, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-panel)" }}>
-          <button type="button" className="extension-dialog-button" onClick={cancel}>{t("askDialog.cancel")}</button>
-          <button type="button" className="extension-dialog-button" onClick={() => respond({ kind: "chat" })}>{t("askDialog.chatAboutThis")}</button>
-          {isReviewTab && (
-            <button type="button" className="extension-dialog-button extension-dialog-button-primary" onClick={submit}>{t("askDialog.submit")}</button>
           )}
         </div>
+
+        <div
+          role="tablist"
+          aria-label={t("askDialog.title")}
+          onKeyDown={handleTabKeyDown}
+          style={{ display: "flex", gap: 4, minWidth: 0, padding: "6px 10px", borderBottom: "1px solid var(--border)", overflowX: "auto", background: "var(--bg-panel)" }}
+        >
+          {tabs.map((tab, index) => {
+            const selected = activeTab === index;
+            const answered = answeredAt(index);
+            return (
+              <button
+                key={tab.key}
+                type="button"
+                role="tab"
+                id={`ask-tab-${index}`}
+                aria-selected={selected}
+                aria-controls={`ask-panel-${index}`}
+                aria-label={`${tab.label} (${answered ? t("askDialog.answered") : t("askDialog.unanswered")})`}
+                tabIndex={selected ? 0 : -1}
+                onClick={() => setActiveTab(index)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                  padding: "5px 9px",
+                  borderRadius: 999,
+                  border: `1px solid ${selected ? "var(--border)" : "transparent"}`,
+                  background: selected ? "var(--bg)" : "transparent",
+                  color: selected ? "var(--text)" : "var(--text-muted)",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
+                <span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: 999, background: answered ? "var(--status-success)" : "var(--border)", flexShrink: 0 }} />
+                {tab.label}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            role="tab"
+            id="ask-tab-review"
+            aria-selected={isReviewTab}
+            aria-controls="ask-panel-review"
+            tabIndex={isReviewTab ? 0 : -1}
+            onClick={() => setActiveTab(reviewTabIndex)}
+            style={{
+              padding: "5px 9px",
+              borderRadius: 999,
+              border: `1px solid ${isReviewTab ? "var(--border)" : "transparent"}`,
+              background: isReviewTab ? "var(--bg)" : "transparent",
+              color: isReviewTab ? "var(--text)" : "var(--text-muted)",
+              cursor: "pointer",
+              fontSize: 12,
+              whiteSpace: "nowrap",
+              flexShrink: 0,
+            }}
+          >
+            {t("askDialog.review")}
+          </button>
+        </div>
+
+        <div style={{ padding: 14 }}>{panels}</div>
       </div>
+
+      <div className="extension-dialog-footer" style={{ display: "flex", flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end", gap: 8, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--bg-panel)" }}>
+        <button type="button" className="extension-dialog-button" onClick={cancel}>{t("askDialog.cancel")}</button>
+        <button type="button" className="extension-dialog-button" onClick={() => respond({ kind: "chat" })}>{t("askDialog.chatAboutThis")}</button>
+        {isReviewTab && (
+          <button type="button" className="extension-dialog-button extension-dialog-button-primary" onClick={submit}>{t("askDialog.submit")}</button>
+        )}
+      </div>
+    </div>
+  );
+
+  // Expand/collapse must never remount the panel: `readFormData` reads a
+  // formDialog's answer straight from its DOM controls, so recreating them
+  // (as moving the subtree through a portal used to) would reset every
+  // control to its HTML default. This single wrapper is the one element
+  // that ever surrounds the panel; expanding only changes its own CSS.
+  const expandedBackdrop = attached && expanded;
+  return (
+    <div
+      className={!attached || expandedBackdrop ? "animate-fade-in" : undefined}
+      onMouseDown={!attached
+        ? (event) => {
+          // Close when the pointer goes down on the backdrop itself (not when
+          // the press starts inside the panel and is dragged out).
+          if (event.target === event.currentTarget) cancel();
+        }
+        : expandedBackdrop
+          ? (event) => {
+            // A click on the backdrop itself shrinks back rather than
+            // cancelling: a stray click must not discard the answers.
+            if (event.target === event.currentTarget) collapseExpanded();
+          }
+          : undefined}
+      style={!attached
+        ? {
+          position: "absolute",
+          inset: 0,
+          zIndex: 90,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 20,
+          background: "var(--overlay-backdrop)",
+        }
+        : expandedBackdrop
+          ? {
+            // No ChatWindow ancestor sets transform/filter/contain/will-change,
+            // so this anchors to the real viewport, not some scrolled column.
+            position: "fixed",
+            inset: 0,
+            zIndex: 1000,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            background: "var(--overlay-backdrop)",
+          }
+          : { width: "100%", flexShrink: 0 }}
+    >
+      {panelNode}
     </div>
   );
 }
