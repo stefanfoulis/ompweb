@@ -9,6 +9,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 ### Fixed
 
 - **A session that fails to start says why.** When omp exits during startup, "This machine" and linked hosts alike now show the reason from omp's own stderr (for example the model it could not restore) instead of only "omp exited during startup".
+- **The chat header follows `/move`.** After moving a session to another directory, the breadcrumb above the chat kept naming the old folder until the page was reloaded, while the sidebar already listed the session in its new workspace. The header now takes the session's current directory from the session list.
 
 ### Added
 

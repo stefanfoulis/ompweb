@@ -1553,6 +1553,23 @@ export function AppShell({ appName }: { appName: string }) {
       .catch(() => {});
   }, []);
 
+  // The sidebar's view of the open session, re-read from disk. `/move <path>`
+  // moves a session to another directory under the same id, and the chat holds
+  // the snapshot it was opened with — the breadcrumb would keep naming the old
+  // folder until a reload. Only the location is taken over: replacing the
+  // whole row on every list refresh would churn the chat's session identity.
+  const handleSelectedSessionInfo = useCallback((session: SessionInfo) => {
+    if (!selectedSession || !sameSessionTarget(selectedSession, session)) return;
+    if (selectedSession.cwd === session.cwd && selectedSession.projectRoot === session.projectRoot) return;
+    // The workspace follows the session here, not the other way round: the
+    // sidebar's cwd notification for this move must not be read as the user
+    // selecting another workspace, which would close the chat.
+    suppressCwdRef.current = session.cwd;
+    setSelectedSession((prev) => (prev && sameSessionTarget(prev, session)
+      ? { ...prev, cwd: session.cwd, projectRoot: session.projectRoot, projectKey: session.projectKey }
+      : prev));
+  }, [selectedSession]);
+
   // Called by ChatWindow when a new session gets its real id from pi
   const handleSessionCreated = useCallback((session: SessionInfo) => {
     setNewSessionCwd(null);
@@ -2104,6 +2121,7 @@ export function AppShell({ appName }: { appName: string }) {
       onSelectSession={handleSelectSession}
       onNewSession={handleNewSession}
       onNewChat={handleNewChat}
+      onSelectedSessionInfo={handleSelectedSessionInfo}
       initialSessionId={initialSessionId}
       initialSessionHostId={initialNavigation.hostId}
       skipInitialProjectSelection={initialNavigation.requestedCwd !== null}

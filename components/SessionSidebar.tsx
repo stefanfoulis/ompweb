@@ -16,7 +16,7 @@ import { isLinkUp } from "@/lib/hosts/host";
 import { useHostRows } from "@/hooks/useHostRows";
 import { HOST_STATUS_COLOR, hostName, hostStatusText } from "./host-status";
 import { comparableProjectPath } from "@/lib/comparable-path";
-import { initialSessionMatches } from "@/lib/initial-navigation";
+import { initialSessionMatches, sameSessionTarget } from "@/lib/initial-navigation";
 import type { SearchMatchTarget } from "./SessionSearchMatches";
 import { compileSearchQuery, FIRST_MESSAGE_WEIGHT, scoreSearchFields, searchField, TITLE_WEIGHT } from "@/lib/session-search";
 import { Archive, ArrowDownUp, ArrowLeft, ArrowRight, Check, ChevronRight, FileUp, Loader2, MessageSquarePlus, Plus, RefreshCw, Search, Settings2, SlidersHorizontal, X } from "lucide-react";
@@ -83,6 +83,8 @@ interface Props {
   onNewSession?: (sessionId: string, cwd: string | null, hostId?: string, project?: ManagedProject) => void;
   /** Start a chat that needs no workspace: a fresh directory of its own. */
   onNewChat?: () => void;
+  /** The selected session's row as the list has it (its cwd follows `/move`). */
+  onSelectedSessionInfo?: (session: SessionInfo) => void;
   initialSessionId?: string | null;
   initialSessionHostId?: string;
   skipInitialProjectSelection?: boolean;
@@ -152,7 +154,7 @@ function loadCollapsedHosts(): Set<string> {
   }
 }
 
-export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, onNewChat, initialSessionId, initialSessionHostId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, selectedHostId: selectedHostIdProp, selectedLogicalProjectKey, onCwdChange, onWorkspaceOptionsChange, onWorktreeContextChange, addProjectOpen, addProjectHostId = LOCAL_HOST_ID, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, navigation, updateAvailable, settingsOpen = false, onClose, onSearchQueryChange, onOpenSearchMatch }: Props) {
+export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, onNewChat, onSelectedSessionInfo, initialSessionId, initialSessionHostId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, selectedHostId: selectedHostIdProp, selectedLogicalProjectKey, onCwdChange, onWorkspaceOptionsChange, onWorktreeContextChange, addProjectOpen, addProjectHostId = LOCAL_HOST_ID, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, navigation, updateAvailable, settingsOpen = false, onClose, onSearchQueryChange, onOpenSearchMatch }: Props) {
 
 
   const { t } = useI18n();
@@ -642,6 +644,15 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     lastNotifiedCwdRef.current = notifyKey;
     onCwdChange?.(selectedPoolProject ? null : selectedCwd, selectedPoolProject ? selectedPoolKey : projectRootFor(selectedCwd, selectedHostId), selectedHostId, selectedPoolProject);
   }, [selectedCwd, selectedHostId, selectedPoolKey, selectedPoolProject, onCwdChange, projectRootFor]);
+
+  // `/move <path>` moves an open session to another directory under the same
+  // id. The chat holds the snapshot it was opened with, so the list — re-read
+  // from disk — is the authority on where the session is now.
+  useEffect(() => {
+    if (!selectedSessionId || !onSelectedSessionInfo) return;
+    const fresh = allSessions.find((session) => sameSessionTarget(session, { id: selectedSessionId, hostId: selectedHostIdProp ?? undefined }));
+    if (fresh) onSelectedSessionInfo(fresh);
+  }, [allSessions, selectedSessionId, selectedHostIdProp, onSelectedSessionInfo]);
 
   // Sync the worktree switcher to the selected session's cwd. Sessions of all
   // worktrees in a project share one list, so clicking a session from another

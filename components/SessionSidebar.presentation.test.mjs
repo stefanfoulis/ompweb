@@ -222,3 +222,38 @@ test("the sidebar refetches its projects and sessions when the loaded pools chan
     window.matchMedia = original.matchMedia;
   }
 });
+
+test("the open session's row is reported from the list, so a session moved to another directory is followed", async () => {
+  const original = { fetch: globalThis.fetch, Worker: globalThis.Worker, SharedWorker: globalThis.SharedWorker, matchMedia: window.matchMedia };
+  globalThis.Worker = FakeWorker;
+  globalThis.SharedWorker = undefined;
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  // What `/move /work/moved` leaves behind: the same session id, in another directory.
+  const moved = {
+    id: "s1", path: "/sessions/s1.jsonl", cwd: "/work/moved", projectRoot: "/work/moved", projectKey: "/work/moved",
+    created: "2026-11-21T10:00:00.000Z", modified: "2026-11-21T10:05:00.000Z", messageCount: 2, firstMessage: "hi",
+  };
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input), "http://localhost");
+    if (url.pathname === "/api/sessions") return Response.json({ sessions: [moved] });
+    if (url.pathname === "/api/projects") return Response.json({ projects: [{ path: "/work/old" }] });
+    return Response.json({});
+  };
+  const reported = [];
+  try {
+    render(React.createElement(SessionSidebar, {
+      // The chat still holds the session's old place, as it does until a reload.
+      selectedSessionId: "s1", selectedHostId: "local", selectedCwd: "/work/old", skipInitialProjectSelection: true,
+      onSelectSession() {}, onSelectedSessionInfo(session) { reported.push(session); },
+      addProjectOpen: false, setAddProjectOpen() {}, usageVisible: false,
+    }));
+    await waitFor(() => assert.equal(reported.at(-1)?.cwd, "/work/moved"));
+    assert.equal(reported.at(-1).projectRoot, "/work/moved");
+  } finally {
+    cleanup();
+    globalThis.fetch = original.fetch;
+    globalThis.Worker = original.Worker;
+    globalThis.SharedWorker = original.SharedWorker;
+    window.matchMedia = original.matchMedia;
+  }
+});
