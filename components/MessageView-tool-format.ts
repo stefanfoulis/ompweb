@@ -115,6 +115,11 @@ function formatToolPreviewValue(value: unknown): string {
 }
 
 function getAskPreview(input: Record<string, unknown>): string | null {
+  // The ask tool's only input is a single HTML form; strip markup for a
+  // one-line preview instead of parsing it — this is a preview, not a render.
+  if (typeof input.html === "string") {
+    return input.html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  }
   if (!Array.isArray(input.questions)) return null;
 
   const prompts = input.questions

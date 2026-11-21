@@ -1014,8 +1014,9 @@ function withNormalizedTimestamp(message: AgentMessage): AgentMessage {
  * allowlists those keys — extend the allowlist if MessageView ever reads more.
  * Task toolResults additionally keep a SIZE-BOUNDED subset of their
  * results/progress (telemetry, no full output) so the message flow can render
- * a per-subagent summary. On-disk parsing (loadSessionFile/getSessionEntries)
- * keeps full details.
+ * a per-subagent summary. Ask toolResults keep a bounded subset of their
+ * form answers (components/AskResultCard.tsx). On-disk parsing
+ * (loadSessionFile/getSessionEntries) keeps full details.
  */
 const TASK_DETAIL_MAX_TEXT = 240;
 const TASK_DETAIL_MAX_ROWS = 50;
@@ -1156,6 +1157,56 @@ function hubDetailTargets(value: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
+const ASK_FORM_ANSWER_STRING_KEYS = ["name", "question", "answer"] as const;
+
+/** A form-based ask answer row (omp's `FormAnswer`); `null` when the required question/answer are missing. */
+function keepAskFormAnswerRow(raw: unknown): Record<string, unknown> | null {
+  if (!isRecord(raw)) return null;
+  const out: Record<string, unknown> = {};
+  for (const key of ASK_FORM_ANSWER_STRING_KEYS) {
+    if (typeof raw[key] === "string") out[key] = truncateTaskDetailText(raw[key]);
+  }
+  if (typeof out.question !== "string" || typeof out.answer !== "string") return null;
+  if (typeof out.name !== "string") out.name = "";
+  return out;
+}
+
+const ASK_OPTION_NOTE_STRING_KEYS = ["name", "option", "text"] as const;
+
+/** A selected-option note row (omp's `OptionNote`); `null` when the required option/text are missing.
+ * Pasted images are never kept — `imageCount` is all components/AskResultCard.tsx renders. */
+function keepAskOptionNoteRow(raw: unknown): Record<string, unknown> | null {
+  if (!isRecord(raw)) return null;
+  const out: Record<string, unknown> = {};
+  for (const key of ASK_OPTION_NOTE_STRING_KEYS) {
+    if (typeof raw[key] === "string") out[key] = truncateTaskDetailText(raw[key]);
+  }
+  if (typeof out.option !== "string" || typeof out.text !== "string") return null;
+  if (typeof out.name !== "string") out.name = "";
+  if (Array.isArray(raw.images) && raw.images.length > 0) out.imageCount = raw.images.length;
+  return out;
+}
+
+/** Bounds the ask tool's result details — omp's `AskToolDetails`
+ * (`{ answers: FormAnswer[], notes?: OptionNote[], timedOut? }`, plus a `chatRedirect`
+ * our runner branch adds) — to what components/AskResultCard.tsx renders. */
+export function keepAskToolResultDetails(details: Record<string, unknown>): Record<string, unknown> {
+  const answerRows = Array.isArray(details.answers) ? details.answers.slice(0, TASK_DETAIL_MAX_ROWS) : [];
+  const kept: Record<string, unknown> = {
+    answers: answerRows.map((raw) => keepAskFormAnswerRow(raw)).filter((entry): entry is Record<string, unknown> => entry !== null),
+  };
+  if (Array.isArray(details.notes)) {
+    const notes = details.notes
+      .slice(0, TASK_DETAIL_MAX_ROWS)
+      .map((raw) => keepAskOptionNoteRow(raw))
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+    if (notes.length > 0) kept.notes = notes;
+  }
+  if (typeof details.timedOut === "boolean") kept.timedOut = details.timedOut;
+  if (typeof details.chatRedirect === "boolean") kept.chatRedirect = details.chatRedirect;
+  return kept;
+}
+
 function stripToolResultDetails(message: AgentMessage): AgentMessage {
   if (message.role !== "toolResult" || message.details === undefined) return message;
   const { details, ...rest } = message;
@@ -1170,6 +1221,9 @@ function stripToolResultDetails(message: AgentMessage): AgentMessage {
     if (message.toolName === "hub") {
       const hubDetails = keepHubToolResultDetails(details);
       if (hubDetails) Object.assign(kept, hubDetails);
+    }
+    if (message.toolName === "ask") {
+      Object.assign(kept, keepAskToolResultDetails(details));
     }
     if (Object.keys(kept).length > 0) return { ...rest, details: kept };
   }
