@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { browserLink, type BrowserLinkData } from "@/lib/browser-link";
+import { setServerBuild } from "@/lib/event-stream-hub";
 import { hostLinkSocket, type LinkSocketData } from "@/lib/hosts/hub";
 import { maintenanceSocket, type MaintenanceSocketData } from "@/lib/hosts/maintenance-hub";
 import { proxy } from "@/proxy";
@@ -128,6 +129,15 @@ export function startServer(options: { port: number; hostname: string; dev: bool
   const { dev, root, html, worker } = options;
   // Dev serves the SPA from the HTML import (`html`) and never reads dist/.
   const index = dev ? null : readFileSync(path.join(root, "dist", "index.html"), "utf8");
+  if (!dev) {
+    // dist/build-id (scripts/build-client.ts) names this deploy; missing (an older dist/) sends no build id, so a
+    // stale tab is never offered a reload it cannot act on.
+    let build: string | undefined;
+    try {
+      build = readFileSync(path.join(root, "dist", "build-id"), "utf8").trim();
+    } catch {}
+    setServerBuild(build);
+  }
 
   const routes: Record<string, Bun.HTMLBundle | ((request: Bun.BunRequest, server: Bun.Server<ServerSocketData>) => Promise<Response | undefined>)> = {};
   for (const [key, mod] of Object.entries(ROUTE_MODULES)) {

@@ -1,6 +1,8 @@
 // Bundles the SPA (app/index.html) into dist/: index.html plus hashed files under dist/assets/, and the event-stream
-// worker as dist/event-stream-worker.js (its content hash versions its URL). Lists the npm packages in the bundle in
-// build/client-packages.json, for the binary release's licenses (scripts/build-binary.ts); the worker bundles none.
+// worker as dist/event-stream-worker.js (its content hash versions its URL), plus a random build id in dist/build-id
+// (also inlined as OMP_WEB_PUBLIC_BUILD_ID) that a stale tab compares against a redeployed server's. Lists the npm
+// packages in the bundle in build/client-packages.json, for the binary release's licenses (scripts/build-binary.ts);
+// the worker bundles none.
 import { rmSync } from "node:fs";
 import path from "node:path";
 import type { BunPlugin } from "bun";
@@ -31,6 +33,9 @@ const emitFonts: BunPlugin = {
 };
 
 const worker = await buildEventStreamWorker(root);
+// Random per build: a tab compares it to a redeployed server's (server/app.ts reads dist/build-id) to offer a
+// reload instead of silently running a stale bundle.
+const buildId = crypto.randomUUID();
 const result = await Bun.build({
   entrypoints: [path.join(root, "app", "index.html")],
   outdir,
@@ -44,7 +49,7 @@ const result = await Bun.build({
   plugins: [tailwind, emitFonts],
   define: {
     "process.env.NODE_ENV": JSON.stringify("production"),
-    ...Object.fromEntries(Object.entries(clientEnv(root, worker)).map(([key, value]) => [`process.env.${key}`, JSON.stringify(value)])),
+    ...Object.fromEntries(Object.entries(clientEnv(root, worker, buildId)).map(([key, value]) => [`process.env.${key}`, JSON.stringify(value)])),
   },
   throw: false,
 });
@@ -53,6 +58,7 @@ for (const log of result.logs) console.log(log);
 if (!result.success) process.exit(1);
 for (const [url, source] of fonts) await Bun.write(path.join(outdir, url), Bun.file(source));
 await Bun.write(path.join(outdir, "event-stream-worker.js"), worker);
+await Bun.write(path.join(outdir, "build-id"), buildId);
 const indexPath = path.join(outdir, "index.html");
 await Bun.write(indexPath, stylesheetFirst(await Bun.file(indexPath).text()));
 // Tailwind's plugin writes its CSS (preflight included) into the bundle, so the metafile never names tailwindcss.

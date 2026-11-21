@@ -14,8 +14,9 @@ export async function buildEventStreamWorker(root: string): Promise<string> {
   return result.outputs[0].text();
 }
 
-// Build-time constants for the browser bundle; the build script and the dev server use the same values.
-export function clientEnv(root: string, worker: string) {
+// Build-time constants for the browser bundle; the build script and the dev server use the same values. Only a
+// build has a `buildId`: the dev server inlines an empty one, so a dev tab never offers a redeploy reload.
+export function clientEnv(root: string, worker: string, buildId = "") {
   const { version } = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as { version: string };
   let commitHash = "";
   let commitDate = "";
@@ -48,6 +49,7 @@ export function clientEnv(root: string, worker: string) {
     OMP_WEB_PUBLIC_APP_VERSION: version,
     OMP_WEB_PUBLIC_COMMIT_HASH: commitHash,
     OMP_WEB_PUBLIC_COMMIT_DATE: commitDate,
+    OMP_WEB_PUBLIC_BUILD_ID: buildId,
     OMP_WEB_PUBLIC_EVENT_STREAM_WORKER_VERSION: eventStreamWorkerVersion,
   };
 }

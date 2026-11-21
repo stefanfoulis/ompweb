@@ -50,3 +50,21 @@ export function UpdateToastBody({ currentVersion, availableVersion, target, link
     </div>
   );
 }
+
+/** The body of the "ompweb updated" toast: a redeployed server's build differs from this tab's, so its bundle is
+ * stale (silently ignoring anything added since, e.g. a new server-sent event type) until a reload. */
+export function ServerBuildToastBody() {
+  const small = { padding: "3px 7px", borderRadius: "var(--radius-control)", fontSize: 11 };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+      <div>{translate("appShell.newBuildDescription")}</div>
+      <button
+        type="button"
+        onClick={() => window.location.reload()}
+        style={{ ...small, border: "1px solid var(--accent-strong)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: "pointer", fontWeight: 600, alignSelf: "flex-start" }}
+      >
+        {translate("appShell.reloadPage")}
+      </button>
+    </div>
+  );
+}

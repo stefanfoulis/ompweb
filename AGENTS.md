@@ -109,7 +109,7 @@ server/
   app.ts              `startServer`: `Bun.serve` + route table + gate + SPA fallback; `startProduction` (listen, `register()`, Ready line); `parseListenArgs`
   routes.ts           the API route table (see "Adding an API route"); `routePattern`, `dispatch`
   http.ts             `finalizeResponse` (security headers, gzip for pages and static files, never `/api/`), `serveFile` (dist/, public/, KaTeX), `renderIndex`
-  client-env.ts       build-time constants for the browser bundle (app version, event-stream worker hash)
+  client-env.ts       build-time constants for the browser bundle (app version, commit, event-stream worker hash, build id: empty in dev)
 app/
   index.html          the SPA shell, the bundler entry; #root holds static copies of RouteLoadingFallback and (swapped in on /login by an inline script) LoginForm's first render, painted before the bundle runs
   client.tsx          browser entry: renders `LoginForm` on `/login`, else `AppShell` (a path check, no router)
@@ -303,7 +303,7 @@ bin/
   omp-web-host.js     `ompweb host [login]`: loads lib/hosts/host-cli.ts through jiti; token read from stdin, never argv. `omp-web.js host` requires it in-process (no child) so SIGTERM/SIGINT reach the daemon's stop
 
 scripts/
-  build-client.ts     `npm run build`: bundles app/index.html into dist/ (Bun.build + tailwind-plugin.ts; fonts emitted as /assets files)
+  build-client.ts     `npm run build`: bundles app/index.html into dist/ (Bun.build + tailwind-plugin.ts; fonts emitted as /assets files); writes a random id to dist/build-id, also inlined as OMP_WEB_PUBLIC_BUILD_ID
   tailwind-plugin.ts  bun-plugin-tailwind minus Tailwind's color-mix() polyfill (Bun 1.4.4 drops repeated @supports rules); build and dev
   smoke.ts            `npm run smoke`: starts the built server (or `--binary <path>`, or `--package <dir>`) with a throwaway HOME and the runner of the pinned fork release (`pinnedRunner`, downloaded to `release/runners/`; `--omp <path>` names another; a binary with its own `ompweb-omp` beside it uses that), verifies automatic local-host startup, the SPA, assets, session access, a live session and SSE, then stops its own processes
   transport-metrics.ts `bun scripts/transport-metrics.ts [--since 2h|<ISO>] [--until <ISO>] [--client <id>] [--session <id>] [--file <path>]`: per-transport summary of the browser transport samples and per host and direction of the host link samples (`--session`: link samples of one session; default: the last 24 h of the agent dir's file)
@@ -1409,6 +1409,12 @@ during the wait.
   CLOSED = fatal (e.g. 409 for a wrapper-less session; the chat hook then
   retries with backoff). Dead tabs are detected with a lifetime Web Lock —
   MessagePort has no close event.
+- **A redeployed server's build vs. a stale tab's.** `dist/build-id` (a random id per `npm run build`, also inlined
+  as `OMP_WEB_PUBLIC_BUILD_ID`) is read once at startup (`server/app.ts`) and held process-global
+  (`setServerBuild`/`serverBuild`, `lib/event-stream-hub.ts`, beside `serverId()`); every `hello` carries it
+  (`MuxControlFrame`), the worker remembers the latest and tells every attached and later-attaching tab
+  (`lib/event-stream.ts`'s `onServerBuild`). `AppShell` compares it to the bundle's own id and shows one sticky
+  "reload" toast per page load when they differ; dev and an unbuilt bundle have no id, so neither side ever prompts.
 - Channels (`lib/event-stream-hub.ts`): `running` (sidebar badges +
   session-list hints), `notifications` (one tab's toasts and in-page system
   notifications, keyed by its `clientId`), `hosts` (the `GET /api/hosts` body on
