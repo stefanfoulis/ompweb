@@ -36,6 +36,9 @@ type WorkerMessage =
 /** The worker's transport, on attach once known and on every change. */
 type TransportMessage = { transport: BrowserTransport };
 
+/** The server's build id, from a hello: on attach once known, and on every change (a redeploy). None in dev. */
+type ServerBuildMessage = { build: string };
+
 /** An agent command's answer: the server's (over the browser link or HTTP) or a local 413/503 from the worker. */
 export interface CommandReply {
   status: number;
@@ -132,9 +135,12 @@ class Transport {
 
   constructor(private readonly port: WorkerPort) {
     port.onmessage = (event) => {
-      const message = event.data as WorkerMessage | TransportMessage | CommandMessage | UploadMessage | DiagnosticsMessage | OutboxMessage;
+      const message = event.data as WorkerMessage | TransportMessage | ServerBuildMessage | CommandMessage | UploadMessage | DiagnosticsMessage | OutboxMessage;
       if ("transport" in message) this.mode = message.transport;
-      else if ("cmd" in message) this.answer(message);
+      else if ("build" in message) {
+        knownServerBuild = message.build;
+        for (const listener of serverBuildListeners) listener(message.build);
+      } else if ("cmd" in message) this.answer(message);
       else if ("up" in message) this.uploads.get(message.up)?.(message);
       else if ("diag" in message) this.diagnostics.get(message.diag)?.(message.data);
       else if ("outboxAdded" in message || "outboxDropped" in message) {
@@ -353,6 +359,9 @@ class MultiplexedEventStream implements EventStream {
 let transport: Transport | null = null;
 
 const outboxListeners = new Set<(event: OutboxEvent) => void>();
+const serverBuildListeners = new Set<(build: string) => void>();
+/** The worker's latest server build id; null until it has told this tab (always, in dev). */
+let knownServerBuild: string | null = null;
 /** The worker's latest list; null until it has told this tab. */
 let outboxEntries: LocalOutboxEntry[] | null = null;
 /** The worker's list may miss another worker's earlier entry: a keepalive from it could overtake that entry. */
@@ -524,6 +533,18 @@ export function subscribeOutbox(listener: (event: OutboxEvent) => void): () => v
   if (outboxEntries) listener({ entries: outboxEntries });
   return () => {
     outboxListeners.delete(listener);
+  };
+}
+
+/** The server's build id (server/app.ts's `dist/build-id`, carried by the worker's hello): at once if already known,
+ * then on every change (a redeploy). Never fires in dev, where the server has no build. Starts the transport if
+ * none, so the mismatch is detected without a chat view open. */
+export function onServerBuild(listener: (build: string) => void): () => void {
+  transport ??= connectTransport();
+  serverBuildListeners.add(listener);
+  if (knownServerBuild !== null) listener(knownServerBuild);
+  return () => {
+    serverBuildListeners.delete(listener);
   };
 }
 

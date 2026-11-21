@@ -104,7 +104,7 @@ export function isIdempotentCommand(type: string): boolean {
 }
 
 export type MuxControlFrame =
-  | ({ type: "hello"; connectionId: string; serverId: string } & BrowserTransportState)
+  | ({ type: "hello"; connectionId: string; serverId: string; build?: string } & BrowserTransportState)
   | { type: "open"; sub: string }
   | { type: "end"; sub: string }
   | { type: "refused"; sub: string; status: number; error: string; code: string }

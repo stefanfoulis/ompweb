@@ -31,6 +31,7 @@
 //                 { id, type: "message", data }   (raw JSON string)
 //                 { id, type: "error", readyState: 0 | 2 }  (EventSource semantics)
 //                 { transport: "sse" | "ws" }  (the mode in effect: on attach once known, and on every change)
+//                 { build: string }  (the server's build id, from a hello: on attach once known, and on every change)
 //                 { cmd: n, http: true }  (SSE mode: the tab POSTs the command itself)
 //                 { cmd: n, status, body, recvAt, repliedAt, attempts, deduped, behindBytes,
 //                   socket, behindSameBytes, behindOtherBytes, replyBehindOtherBytes }
@@ -266,6 +267,7 @@ interface ControlFrame {
   sub?: unknown;
   connectionId?: unknown;
   transport?: unknown;
+  build?: unknown;
   status?: unknown;
   code?: unknown;
 }
@@ -283,6 +285,8 @@ const subscriptions = new Map<string, Subscription>();
 let setting: BrowserTransport = "sse";
 /** The mode in effect: the setting, unless a refused upgrade put this worker on SSE for a while (fallbackTimer). */
 let mode: BrowserTransport = "sse";
+/** The server's build id, from a hello; null until known (always, in dev). */
+let serverBuild: string | null = null;
 let fallbackTimer: Timer | undefined;
 /** Why the last fallback put this worker on SSE (shown while it lasts). */
 let fallbackReason: FallbackReason = "refused";
@@ -438,6 +442,7 @@ function requestServer(body: Record<string, unknown>): Promise<Response> {
 /** A control frame from the EventSource or the link (`conn`): the setting, a hello, or a subscription's open/end/refused. */
 function handleControl(frame: ControlFrame, conn: Conn): void {
   if (frame.type === "transport" || frame.type === "hello") setTransport(frame.transport);
+  if (frame.type === "hello") setServerBuild(frame.build);
   if (frame.type === "transport") return;
   if (frame.type === "hello") {
     // The link's own hello (inside its first line) only carries the setting: its welcome did the rest.
@@ -482,6 +487,14 @@ function setTransport(transport: unknown): void {
   if (next === undefined || next === setting) return;
   setting = next;
   applyMode();
+}
+
+/** The server's build id from a hello; missing (dev, or an older server) or already known (unchanged) changes
+ * nothing. Told to every attached tab so a stale one (an older build) can offer a reload. */
+function setServerBuild(build: unknown): void {
+  if (typeof build !== "string" || build === serverBuild) return;
+  serverBuild = build;
+  for (const client of clients) post(client, { build });
 }
 
 /** Puts the mode in effect: SSE or the link, every subscription and command switching at once (spec B7). */
@@ -2016,6 +2029,7 @@ function attach(port: Port): void {
   clients.add(client);
   // Tabs assume SSE until told otherwise.
   if (mode !== "sse") post(client, { transport: mode });
+  if (serverBuild !== null) post(client, { build: serverBuild });
   tellOutbox(client, false);
   port.onmessage = (event) => {
     const message = event.data;
@@ -2026,6 +2040,7 @@ function attach(port: Port): void {
     if (data.op !== "bye" && !clients.has(client)) {
       clients.add(client);
       post(client, { transport: mode });
+      if (serverBuild !== null) post(client, { build: serverBuild });
       tellOutbox(client, true);
     }
     switch (data.op) {

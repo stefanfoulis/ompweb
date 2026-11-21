@@ -81,7 +81,7 @@ import {
 import type { CrossSessionHostToolCall, ManagedProject, SessionInfo, SessionTreeNode } from "@/lib/types";
 import { runHostTool } from "@/hooks/useAgentSession-stream";
 import { sendAgentCommand } from "@/lib/agent-client";
-import { openEventStream } from "@/lib/event-stream";
+import { onServerBuild, openEventStream } from "@/lib/event-stream";
 import type { ChatInputHandle } from "./ChatInput";
 import type { SessionStatsInfo, GenerationSpeedInfo } from "@/lib/pi-types";
 import type { SettingsTab } from "./SettingsTabs";
@@ -95,7 +95,7 @@ import {
   type AppUpdatePhase,
   type AppUpdateStage,
 } from "./AppUpdateDialog";
-import { UpdateToastBody } from "./UpdateToast";
+import { ServerBuildToastBody, UpdateToastBody } from "./UpdateToast";
 import { ArchiveBrowser } from "./ArchiveBrowser";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 // The settings shell is part of the app bundle so opening it does not fetch or compile a modal chunk. The right panel (viewer included) is a separate chunk, preloaded on the first pointerdown or keydown and mounted on first open.
@@ -588,6 +588,20 @@ export function AppShell({ appName }: { appName: string }) {
       })
       .catch(() => {});
   }, [advanceAppUpdateVisibleStage, handleTerminalAppUpdate, monitorAppUpdate, recoverPreparedAppUpdate, refreshAppUpdate, showAppUpdateStagesThrough, t]);
+
+  // A tab's bundle id (inlined at build time) vs. the server's (server/app.ts's dist/build-id, forwarded through
+  // the worker's hello): dev and an unbuilt bundle have no id, so neither side ever prompts. `serverBuildShownRef`
+  // keeps the toast to once per page load; the worker repeats the same build on every reconnect's hello.
+  const serverBuildShownRef = useRef(false);
+  useEffect(() => {
+    const bundleBuild = process.env.OMP_WEB_PUBLIC_BUILD_ID;
+    if (!bundleBuild) return;
+    return onServerBuild((build) => {
+      if (serverBuildShownRef.current || build === bundleBuild) return;
+      serverBuildShownRef.current = true;
+      toast.info(t("appShell.newBuildAvailable"), <ServerBuildToastBody />, { id: "server-build-updated", timeout: 0 });
+    });
+  }, [t]);
 
   const proceedWithAppUpdate = useCallback(async () => {
     if (appUpdateStartInFlightRef.current) return;

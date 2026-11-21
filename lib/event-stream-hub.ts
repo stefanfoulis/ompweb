@@ -60,11 +60,22 @@ interface SubscriptionHandle {
 declare global {
   var __ompEventStreamConnections: Map<string, EventStreamConnection> | undefined;
   var __ompServerId: string | undefined;
+  var __ompServerBuild: string | undefined;
 }
 
 /** Random per process: a reconnecting client compares it to learn whether the server restarted. */
 export function serverId(): string {
   return (globalThis.__ompServerId ??= randomUUID());
+}
+
+/** `dist/build-id` of the running production server (server/app.ts, startup only); undefined in dev, which has no
+ * build. Every hello carries it so a tab can compare it to its own bundle's and offer a reload after a redeploy. */
+export function setServerBuild(build: string | undefined): void {
+  globalThis.__ompServerBuild = build;
+}
+
+export function serverBuild(): string | undefined {
+  return globalThis.__ompServerBuild;
 }
 
 /** Tell every open connection the browser transport setting changed. */
@@ -160,7 +171,7 @@ export class EventStreamConnection {
       this.stream = sse.stream;
     }
     connections().set(this.id, this);
-    this.control({ type: "hello", connectionId: this.id, serverId: serverId(), ...browserTransportState() });
+    this.control({ type: "hello", connectionId: this.id, serverId: serverId(), build: serverBuild(), ...browserTransportState() });
     if (!this.closed) {
       this.heartbeat = setInterval(() => {
         if (this.flushAll() && !this.sink.heartbeat()) this.close();
