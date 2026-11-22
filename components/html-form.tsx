@@ -22,13 +22,15 @@ const FORM_TAGS: Record<string, true> = {
   input: true, select: true, option: true, optgroup: true, textarea: true,
 };
 const DROPPED_TAGS: Record<string, true> = {
-  script: true, style: true, template: true, noscript: true, button: true, iframe: true, object: true, embed: true, img: true, svg: true, math: true,
+  script: true, style: true, template: true, noscript: true, button: true, iframe: true, object: true, embed: true, math: true,
 };
 const INPUT_TYPES: Record<string, true> = {
   radio: true, checkbox: true, text: true, number: true, range: true, email: true, url: true, tel: true, search: true, date: true, time: true, hidden: true,
 };
 
 const CONTROL_SELECTOR = "input, select, textarea";
+
+const collapse = (text: string) => text.replace(/\s+/g, " ").trim();
 
 /** A radio/checkbox group that offers a free-text "Other" answer, as omp's html-form adds one. */
 interface OtherGroup { type: string; name: string; required: boolean }
@@ -134,9 +136,31 @@ export function formNode(node: ChildNode, ctx: FormCtx, key: string): ReactNode 
   return other ? createElement(Fragment, { key }, out, otherBox(other, ctx, `${key}.other`)) : out;
 }
 
+/**
+ * omp's picture contract: an `<img>` with a `data:` src draws (anything else is
+ * defence in depth against a src the runner's rewrite missed — it shows only the
+ * alt); an `<svg>` draws through a `data:image/svg+xml` `<img>` so nothing inside
+ * it ever runs. Inside a `<label>` either contributes only its alt text (an
+ * `<svg>`'s `<title>`, if any), the same as the control's own label text.
+ */
+function formImage(element: Element, tag: string, key: string): ReactNode {
+  if (element.closest("label")) {
+    return tag === "svg" ? collapse(element.querySelector("title")?.textContent ?? "") || null : element.getAttribute("alt") || null;
+  }
+  if (tag === "svg") {
+    const alt = collapse(element.querySelector("title")?.textContent ?? "");
+    return createElement("img", { key, src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(element.outerHTML)}`, alt, className: "extension-image" });
+  }
+  const src = element.getAttribute("src") ?? "";
+  const alt = element.getAttribute("alt") ?? "";
+  if (!src.startsWith("data:")) return alt ? createElement("span", { key, className: "extension-image-alt" }, alt) : null;
+  return createElement("img", { key, src, alt, className: "extension-image" });
+}
+
 function formElement(element: Element, ctx: FormCtx, key: string): ReactNode {
   const tag = element.localName;
   if (DROPPED_TAGS[tag]) return null;
+  if (tag === "img" || tag === "svg") return formImage(element, tag, key);
   const children = Array.from(element.childNodes, (child, index) => formNode(child, ctx, `${key}.${index}`));
   if (!FORM_TAGS[tag]) return createElement(Fragment, { key }, ...children);
   const attr = (name: string) => element.getAttribute(name) ?? undefined;
@@ -250,8 +274,6 @@ export interface FormPlan {
 
 /** Tags omp treats as blocks of their own rather than as the caption of the field below. */
 const CAPTION_BREAKS: Record<string, true> = { ul: true, ol: true, pre: true, table: true, img: true, svg: true, hr: true, fieldset: true };
-
-const collapse = (text: string) => text.replace(/\s+/g, " ").trim();
 
 /** `type\0name` of the group a control answers in; undefined for hidden and unnamed controls. */
 function groupKey(control: Element): string | undefined {

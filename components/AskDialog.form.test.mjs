@@ -68,7 +68,7 @@ test("a form submits its pre-checked and prefilled defaults untouched; checkbox 
   assert.deepEqual(response, { data: { db: "pg", extras: ["cache", "metrics"], region: "eu", replicas: 3, notes: "keep it" } });
 });
 
-test("agent markup never becomes live HTML: scripts, handlers and buttons are dropped", () => {
+test("agent markup never becomes live HTML: scripts, handlers and buttons are dropped, and an <img> with a non-data src is never drawn", () => {
   renderForm(deployHtml);
   const dialog = screen.getByRole("dialog");
   assert.equal(dialog.querySelector("script, img, [onerror], [onclick]"), null);
@@ -299,4 +299,48 @@ test("loose content between fields shows on the next tab, and what trails the la
   assert.match(panelText(), /Read the migration notes first/);
   await user.click(screen.getByRole("tab", { name: "Review" }));
   assert.match(panelText(), /Cancelling leaves the service as it is/);
+});
+
+// A 1x1 transparent PNG, the smallest valid payload omp's media loader could hand back.
+const PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+test("pictures: a data: img draws, a non-data src falls back to its alt, an inline svg draws via a data URL, and a label keeps only the alt", () => {
+  renderForm(`<form>
+    <p>Read the diagram below</p>
+    <img src="${PNG_DATA_URL}" alt="Deployment diagram">
+    <svg viewBox="0 0 10 10"><title>Flow</title><circle cx="5" cy="5" r="4"/></svg>
+    <img src="/etc/passwd" alt="Hidden chart">
+    <img src="https://example.com/x.png" alt="Remote chart">
+    <fieldset><legend>Region</legend>
+      <label><img src="${PNG_DATA_URL}" alt="US flag"> <input type="radio" name="region" value="us"> US</label>
+      <label><input type="radio" name="region" value="eu"> EU</label>
+    </fieldset>
+  </form>`);
+
+  const panel = screen.getByRole("tabpanel");
+  // The loadable picture draws as its own image, alt kept.
+  const picture = panel.querySelector(`img[src="${PNG_DATA_URL}"]`);
+  assert.ok(picture, "a data: src draws as an <img>");
+  assert.equal(picture.getAttribute("alt"), "Deployment diagram");
+
+  // Neither a local path nor a remote URL is ever loaded here (the runner's job): only the alt shows.
+  assert.equal(panel.querySelector('img[src="/etc/passwd"]'), null);
+  assert.equal(panel.querySelector('img[src="https://example.com/x.png"]'), null);
+  assert.ok(screen.getByText("Hidden chart"));
+  assert.ok(screen.getByText("Remote chart"));
+
+  // The inline svg draws only through a data:image/svg+xml <img>, never as a live <svg>.
+  assert.equal(panel.querySelector("svg"), null);
+  const svgImg = panel.querySelector('img[src^="data:image/svg+xml"]');
+  assert.ok(svgImg, "the svg draws as an <img> with a data:image/svg+xml src");
+  assert.equal(svgImg.getAttribute("alt"), "Flow");
+  assert.equal(decodeURIComponent(svgImg.getAttribute("src").slice("data:image/svg+xml;charset=utf-8,".length)), "<svg viewBox=\"0 0 10 10\"><title>Flow</title><circle cx=\"5\" cy=\"5\" r=\"4\"></circle></svg>");
+
+  // Inside the label, the picture that would otherwise draw contributes only its alt.
+  const usLabel = screen.getByRole("radio", { name: "US flag US" }).closest("label");
+  assert.equal(usLabel.querySelector("img"), null);
+  assert.match(usLabel.textContent, /US flag/);
+
+  // The standalone picture between fields is context for the field it introduces, like any other block.
+  assert.ok(screen.getByText("Read the diagram below").closest('[role="tabpanel"]'));
 });
