@@ -334,7 +334,7 @@ test("pictures: a data: img draws, a non-data src falls back to its alt, an inli
   const svgImg = panel.querySelector('img[src^="data:image/svg+xml"]');
   assert.ok(svgImg, "the svg draws as an <img> with a data:image/svg+xml src");
   assert.equal(svgImg.getAttribute("alt"), "Flow");
-  assert.equal(decodeURIComponent(svgImg.getAttribute("src").slice("data:image/svg+xml;charset=utf-8,".length)), "<svg viewBox=\"0 0 10 10\"><title>Flow</title><circle cx=\"5\" cy=\"5\" r=\"4\"></circle></svg>");
+  assert.equal(decodeURIComponent(svgImg.getAttribute("src").slice("data:image/svg+xml;charset=utf-8,".length)), "<svg viewBox=\"0 0 10 10\" xmlns=\"http://www.w3.org/2000/svg\"><title>Flow</title><circle cx=\"5\" cy=\"5\" r=\"4\"></circle></svg>");
 
   // Inside the label, the picture that would otherwise draw contributes only its alt.
   const usLabel = screen.getByRole("radio", { name: "US flag US" }).closest("label");

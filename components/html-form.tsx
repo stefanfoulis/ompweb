@@ -149,7 +149,10 @@ function formImage(element: Element, tag: string, key: string): ReactNode {
   }
   if (tag === "svg") {
     const alt = collapse(element.querySelector("title")?.textContent ?? "");
-    return createElement("img", { key, src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(element.outerHTML)}`, alt, className: "extension-image" });
+    // A standalone SVG image needs its namespace; markup parsed as HTML serialises without it.
+    const svg = element.cloneNode(true) as Element;
+    if (!svg.hasAttribute("xmlns")) svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    return createElement("img", { key, src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg.outerHTML)}`, alt, className: "extension-image" });
   }
   const src = element.getAttribute("src") ?? "";
   const alt = element.getAttribute("alt") ?? "";
